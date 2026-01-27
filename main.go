@@ -91,6 +91,7 @@ func main() {
 	if dbErr != nil {
 		logger.Fatal(dbErr)
 	}
+	db.Exec("PRAGMA journal_mode=WAL;")
 	db.Exec(schema)
 
 	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
@@ -164,44 +165,19 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 
 type fsHandler struct{ pubHash string }
 
-// securePath returns the relative path (for DB) and absolute path (for Disk)
-// while ensuring the user cannot escape the upload directory.
-func (f *fsHandler) securePath(requestedPath string) (rel string, full string, err error) {
-	// 1. Clean the path and make it look like an absolute path starting at /
-	// This handles ".." and "." internally.
-	safeRel := filepath.Join("/", requestedPath)
-
-	// 2. Remove the leading slash to make it relative to our uploadDir
-	rel = strings.TrimPrefix(filepath.Clean(safeRel), string(filepath.Separator))
+func (f *fsHandler) secure(p string) (string, string) {
+	rel := strings.TrimPrefix(filepath.Clean(filepath.Join("/", p)), string(filepath.Separator))
 	if rel == "" {
 		rel = "."
 	}
-
-	// 3. Create the full physical path
-	full = filepath.Join(*uploadDir, rel)
-
-	// 4. Final Security Check: Ensure the physical path is still inside uploadDir
-	absBase, _ := filepath.Abs(*uploadDir)
-	absTarget, _ := filepath.Abs(full)
-	if !strings.HasPrefix(absTarget, absBase) {
-		return "", "", errors.New("PERMISSION DENIED: Invalid path")
-	}
-
-	return rel, full, nil
+	return rel, filepath.Join(*uploadDir, rel)
 }
 
 func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	relPath, fullPath, err := f.securePath(r.Filepath)
-	if err != nil {
-		return nil, err
-	}
+	relPath, fullPath := f.secure(r.Filepath)
 
-	// Rule 6: README.txt access (Allow in root)
 	if relPath == "README.txt" {
-		data, err := embeddedSource.ReadFile("main.go")
-		if err != nil {
-			return nil, err
-		}
+		data, _ := embeddedSource.ReadFile("main.go")
 		return bytes.NewReader(data), nil
 	}
 
@@ -215,128 +191,104 @@ func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	relPath, fullPath, err := f.securePath(r.Filepath)
-	if err != nil {
-		return nil, err
-	}
-
+	rel, full := f.secure(r.Filepath)
 	var owner string
-	err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
-
-	if err == nil && owner != f.pubHash {
-		return nil, fmt.Errorf("DENIED: '%s' belongs to another user", relPath)
+	db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+	if owner != "" && owner != f.pubHash {
+		return nil, errors.New("PERMISSION DENIED: File owned by another")
 	}
-
-	file, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE, 0644)
+	file, err := os.OpenFile(full, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
-
 	if owner == "" {
-		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", relPath, f.pubHash)
+		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
 		db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
 	}
-
-	logger.Printf("User %s writing to %s", f.pubHash[:12], relPath)
-	return &statWriter{File: file, pubHash: f.pubHash}, nil
+	return &statWriter{file, f.pubHash}, nil
 }
 
 func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	relPath, fullPath, err := f.securePath(r.Filepath)
-	if err != nil {
-		return nil, err
-	}
-
+	rel, full := f.secure(r.Filepath)
 	switch r.Method {
 	case "List":
-		files, err := os.ReadDir(fullPath)
-		if err != nil {
-			return nil, err
-		}
-
+		items, _ := os.ReadDir(full)
 		res := make([]os.FileInfo, 0)
-
-		// Always show README.txt if we are in the root directory
-		if relPath == "." || relPath == "" {
+		if rel == "." {
 			data, _ := embeddedSource.ReadFile("main.go")
-			res = append(res, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
+			res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "anonymous-system"})
 		}
-
-		for _, fl := range files {
-			if info, err := fl.Info(); err == nil {
-				if info.Name() != "README.txt" {
-					res = append(res, info)
-				}
-			}
+		for _, item := range items {
+			info, _ := item.Info()
+			var owner string
+			db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", filepath.Join(rel, info.Name())).Scan(&owner)
+			res = append(res, newSftpFile(info.Name(), info, owner))
 		}
 		return listerAt(res), nil
-
 	case "Stat", "Lstat":
-		// This is what 'cd' and 'ls -d' use to verify a file/folder exists
-
-		// 1. Handle Virtual README
-		if relPath == "README.txt" {
+		if rel == "README.txt" {
 			data, _ := embeddedSource.ReadFile("main.go")
-			return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
+			return listerAt{&sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "anonymous-system"}}, nil
 		}
-
-		// 2. Handle Physical Files
-		fi, err := os.Stat(fullPath)
+		info, err := os.Stat(full)
 		if err != nil {
 			return nil, err
 		}
-
-		// Return a list containing exactly one item
-		return listerAt{fi}, nil
+		var owner string
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		return listerAt{newSftpFile(info.Name(), info, owner)}, nil
 	}
-
-	return nil, errors.New("unsupported method")
+	return nil, nil
 }
 
 func (f *fsHandler) Filecmd(r *sftp.Request) error {
-	relPath, fullPath, err := f.securePath(r.Filepath)
-	if err != nil {
-		return err
-	}
-
+	rel, full := f.secure(r.Filepath)
 	switch r.Method {
 	case "Mkdir":
 		if !mkdirLimiter.Allow() {
-			return errors.New("rate limit exceeded")
+			return errors.New("rate limited")
 		}
-		// Register ownership of the directory too
-		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", relPath, f.pubHash)
-		return os.MkdirAll(fullPath, 0755)
-
+		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
+		return os.MkdirAll(full, 0755)
 	case "Remove":
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != f.pubHash {
-			return errors.New("PERMISSION DENIED: You do not own this.")
+			return errors.New("PERMISSION DENIED")
 		}
-		db.Exec("DELETE FROM files WHERE path = ?", relPath)
-		return os.RemoveAll(fullPath) // RemoveAll handles directories and files
-
+		db.Exec("DELETE FROM files WHERE path = ?", rel)
+		return os.RemoveAll(full)
 	case "Rename":
-		relTarget, fullTarget, err := f.securePath(r.Target)
+		relT, fullT := f.secure(r.Target)
+
+		var sourceOwner string
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sourceOwner)
+		if sourceOwner != f.pubHash {
+			return errors.New("PERMISSION DENIED: You do not own the source file")
+		}
+
+		var targetOwner string
+		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relT).Scan(&targetOwner)
+		if err == nil && targetOwner != "" { // File exists in DB
+			if targetOwner != f.pubHash {
+				return errors.New("PERMISSION DENIED: Destination is occupied and owned by another user")
+			}
+		}
+
+		tx, err := db.Begin()
 		if err != nil {
 			return err
 		}
-
-		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
-		if owner != f.pubHash {
-			return errors.New("PERMISSION DENIED: You do not own the source file.")
+		tx.Exec("DELETE FROM files WHERE path = ?", relT)
+		tx.Exec("UPDATE files SET path = ? WHERE path = ?", relT, rel)
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 
-		// Update DB path
-		db.Exec("UPDATE files SET path = ? WHERE path = ?", relTarget, relPath)
-		return os.Rename(fullPath, fullTarget)
-
-	case "Setstat":
-		return errors.New("PERMISSION DENIED: Manual permission changes are disabled.")
+		return os.Rename(full, fullT)
 	}
 	return nil
+
 }
 
 // --- Helpers ---
@@ -417,17 +369,43 @@ func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
 	return n, nil
 }
 
-type virtualFileInfo struct {
-	name string
-	size int64
+type sftpFile struct {
+	name    string
+	size    int64
+	mode    fs.FileMode
+	modTime time.Time
+	isDir   bool
+	owner   string // Display name (anonymous-...)
 }
 
-func (v *virtualFileInfo) Name() string       { return v.name }
-func (v *virtualFileInfo) Size() int64        { return v.size }
-func (v *virtualFileInfo) Mode() fs.FileMode  { return 0444 }
-func (v *virtualFileInfo) ModTime() time.Time { return time.Now() }
-func (v *virtualFileInfo) IsDir() bool        { return false }
-func (v *virtualFileInfo) Sys() interface{}   { return nil }
+func (s *sftpFile) Name() string       { return s.name }
+func (s *sftpFile) Size() int64        { return s.size }
+func (s *sftpFile) Mode() fs.FileMode  { return s.mode }
+func (s *sftpFile) ModTime() time.Time { return s.modTime }
+func (s *sftpFile) IsDir() bool        { return s.isDir }
+func (s *sftpFile) Sys() interface{}   { return &sftp.FileStat{UID: 1000, GID: 1000} }
+
+func (s *sftpFile) LongString() string {
+	mode := s.mode.String()
+	modTime := s.modTime.Format("Jan _2 15:04")
+	return fmt.Sprintf("%s    1 %-16s %-16s %8d %s %s",
+		mode, s.owner, s.owner, s.size, modTime, s.name)
+}
+
+func newSftpFile(name string, info os.FileInfo, ownerHash string) *sftpFile {
+	owner := "anonymous-system"
+	if ownerHash != "" && ownerHash != "system" {
+		owner = "anonymous-" + ownerHash[:12]
+	}
+	return &sftpFile{
+		name:    name,
+		size:    info.Size(),
+		mode:    info.Mode(),
+		modTime: info.ModTime(),
+		isDir:   info.IsDir(),
+		owner:   owner,
+	}
+}
 
 // PlanetConfig holds the deterministic parameters
 type PlanetConfig struct {
