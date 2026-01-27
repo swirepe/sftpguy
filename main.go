@@ -148,7 +148,9 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 					req.Reply(true, nil)
 					sendBanner(ch.Stderr(), pubHash, stats)
 
-					handler := &fsHandler{pubHash: pubHash}
+					handler := &fsHandler{pubHash: pubHash,
+						stderr: ch.Stderr(),
+					}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet:  handler,
 						FilePut:  handler,
@@ -163,7 +165,10 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 	}
 }
 
-type fsHandler struct{ pubHash string }
+type fsHandler struct {
+	pubHash string
+	stderr  io.Writer
+}
 
 func (f *fsHandler) secure(p string) (string, string) {
 	rel := strings.TrimPrefix(filepath.Clean(filepath.Join("/", p)), string(filepath.Separator))
@@ -181,13 +186,19 @@ func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return bytes.NewReader(data), nil
 	}
 
-	// Rule 5: Download permissions
 	if !hasUploaded(f.pubHash) {
 		logger.Printf("User %s blocked from downloading %s", f.pubHash[:12], relPath)
-		return nil, fmt.Errorf("PERMISSION DENIED: You must upload at least one file first.")
+		return nil, f.permissionDenied("You must upload at least one file before you can download.")
 	}
 
 	return os.Open(fullPath)
+}
+
+func (f *fsHandler) permissionDenied(msg string) error {
+	errString := fmt.Sprintf("\r\n\033[1;31mPERMISSION DENIED:\033[0m %s\r\n", msg)
+	fmt.Fprintf(f.stderr, errString)
+	return sftp.ErrSshFxPermissionDenied
+
 }
 
 func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
@@ -195,7 +206,7 @@ func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	var owner string
 	db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 	if owner != "" && owner != f.pubHash {
-		return nil, errors.New("PERMISSION DENIED: File owned by another")
+		return nil, f.permissionDenied("File is owned by another user.")
 	}
 	file, err := os.OpenFile(full, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
@@ -254,7 +265,7 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 		var owner string
 		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != f.pubHash {
-			return errors.New("PERMISSION DENIED")
+			return f.permissionDenied("You can only delete files you uploaded.")
 		}
 		db.Exec("DELETE FROM files WHERE path = ?", rel)
 		return os.RemoveAll(full)
@@ -264,14 +275,14 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 		var sourceOwner string
 		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sourceOwner)
 		if sourceOwner != f.pubHash {
-			return errors.New("PERMISSION DENIED: You do not own the source file")
+			return f.permissionDenied("You do not own the source file")
 		}
 
 		var targetOwner string
 		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relT).Scan(&targetOwner)
 		if err == nil && targetOwner != "" { // File exists in DB
 			if targetOwner != f.pubHash {
-				return errors.New("PERMISSION DENIED: Destination is occupied and owned by another user")
+				return f.permissionDenied("Destination is occupied and owned by another user")
 			}
 		}
 
