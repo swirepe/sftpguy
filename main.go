@@ -220,22 +220,18 @@ func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	// Rule 7 & 13: Ownership logic
 	var owner string
 	err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 
-	// If file exists and you aren't the owner
 	if err == nil && owner != f.pubHash {
 		return nil, fmt.Errorf("DENIED: '%s' belongs to another user", relPath)
 	}
 
-	// Open file (O_RDWR for resuming)
 	file, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// If this is a new file or first time writing
 	if owner == "" {
 		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", relPath, f.pubHash)
 		db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
@@ -346,14 +342,15 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 // --- Helpers ---
 
 type userStats struct {
-	LastLogin  string
-	TotalBytes int64
+	FilesUploadedCount int64
+	LastLogin          string
+	TotalBytes         int64
 }
 
 func updateLoginStats(hash string) userStats {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	var stats userStats
-	err := db.QueryRow("SELECT last_login, total_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&stats.LastLogin, &stats.TotalBytes)
+	err := db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&stats.LastLogin, &stats.TotalBytes, &stats.FilesUploadedCount)
 	if err != nil {
 		db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes) VALUES (?, ?, 0)", hash, now)
 		stats.LastLogin = "First Login"
@@ -365,7 +362,7 @@ func updateLoginStats(hash string) userStats {
 
 func hasUploaded(hash string) bool {
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM files WHERE owner_hash = ?", hash).Scan(&count)
+	db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&count)
 	return count > 0
 }
 
