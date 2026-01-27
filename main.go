@@ -1,236 +1,326 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/time/rate"
+	_ "modernc.org/sqlite"
 )
 
-var db *sql.DB
+//go:embed main.go
+var embeddedSource embed.FS
 
-// Requirement 2: Hash public key to create the username
-func getUsername(pubKey ssh.PublicKey) string {
-	hash := sha256.Sum256(pubKey.Marshal())
-	return fmt.Sprintf("anonymous%x", hash[:8])
-}
+// Configuration
+var (
+	port        = flag.Int("port", 2222, "SSH port")
+	hostKeyFile = flag.String("hostkey", "id_rsa", "SSH private host key")
+	dbPath      = flag.String("db", "sftp.db", "Path to SQLite database")
+	logFile     = flag.String("logfile", "sftp.log", "Path to log file")
+	uploadDir   = flag.String("dir", "./uploads", "Directory to store uploads")
+	bannerFile  = flag.String("banner", "BANNER.txt", "Path to banner file")
+	mkdirLimit  = flag.Float64("rate", 10.0, "Global mkdir rate limit (folders/sec)")
+)
 
-// lister implements the sftp.ListerAt interface
-type lister []os.FileInfo
+const schema = `
+CREATE TABLE IF NOT EXISTS users (
+    pubkey_hash TEXT PRIMARY KEY,
+    last_login DATETIME,
+    upload_count INTEGER DEFAULT 0,
+    total_bytes INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    owner_hash TEXT
+);`
 
-func (l lister) ListAt(ls []os.FileInfo, offset int64) (int, error) {
-	if offset >= int64(len(l)) {
-		return 0, io.EOF
-	}
-	n := copy(ls, l[offset:])
-	if n < len(ls) {
-		return n, io.EOF
-	}
-	return n, nil
-}
+var (
+	db           *sql.DB
+	mkdirLimiter *rate.Limiter
+	logger       *log.Logger
+)
 
 func main() {
-	// Initialize Database
-	var err error
-	db, err = sql.Open("sqlite3", "./sftp_meta.db")
+	flag.Parse()
+
+	f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
-	setupDB()
+	logger = log.New(io.MultiWriter(os.Stdout, f), "[SFTP] ", log.LstdFlags)
 
-	// SSH Server Configuration
+	var dbErr error
+	db, dbErr = sql.Open("sqlite", *dbPath)
+	if dbErr != nil {
+		logger.Fatal(dbErr)
+	}
+	db.Exec(schema)
+
+	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
+	os.MkdirAll(*uploadDir, 0755)
+
 	config := &ssh.ServerConfig{
-		PublicKeyCallback: func(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-			user := getUsername(pubKey)
-
-			// Requirement 6: Get stats before updating login time
-			var lastLogin string
-			var totalBytes int64
-			err := db.QueryRow("SELECT last_login, bytes_uploaded FROM users WHERE username = ?", user).Scan(&lastLogin, &totalBytes)
-
-			if err == sql.ErrNoRows {
-				lastLogin = "Never (First login)"
-				_, _ = db.Exec("INSERT INTO users (username, last_login, bytes_uploaded) VALUES (?, ?, 0)", user, time.Now().Format(time.RFC3339))
-			} else {
-				_, _ = db.Exec("UPDATE users SET last_login = ? WHERE username = ?", time.Now().Format(time.RFC3339), user)
-			}
-
-			// Return stats in extensions to pass to the SFTP handler
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"pubkey-username": user,
-					"msg":             fmt.Sprintf("\nWelcome %s\nLast Login: %s\nTotal Uploaded: %d bytes\n", user, lastLogin, totalBytes),
-				},
-			}, nil
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 		},
 	}
 
-	// Load host key (generate with: ssh-keygen -t rsa -f host_key -N "")
-	privateBytes, err := os.ReadFile("host_key")
+	keyBytes, err := os.ReadFile(*hostKeyFile)
 	if err != nil {
-		log.Fatal("Failed to load private key (host_key)")
+		logger.Fatal("Host key not found. Generate one: ssh-keygen -f id_rsa -t rsa -N ''")
 	}
-	private, err := ssh.ParsePrivateKey(privateBytes)
-	if err != nil {
-		log.Fatal("Failed to parse private key")
-	}
-	config.AddHostKey(private)
+	key, _ := ssh.ParsePrivateKey(keyBytes)
+	config.AddHostKey(key)
 
-	// Start Listener
-	listener, err := net.Listen("tcp", "0.0.0.0:2222")
-	if err != nil {
-		log.Fatal("failed to listen on port 2222")
-	}
-	fmt.Println("SFTP Server running on port 2222...")
+	listener, _ := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	logger.Printf("Server listening on port %d", *port)
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			continue
-		}
+		conn, _ := listener.Accept()
 		go handleConn(conn, config)
 	}
 }
 
 func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
-	sshConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
+	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		return
 	}
+	defer sConn.Close()
 
-	// Requirement 6: Display banner
-	fmt.Print(sshConn.Permissions.Extensions["msg"])
+	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
+	stats := updateLoginStats(pubHash)
+	logger.Printf("User anonymous-%s (%s) logged in from %s", pubHash[:12], sConn.User(), nConn.RemoteAddr())
 
 	go ssh.DiscardRequests(reqs)
 
-	for newChann := range chans {
-		if newChann.ChannelType() != "session" {
-			newChann.Reject(ssh.UnknownChannelType, "unknown channel type")
+	for newCh := range chans {
+		if newCh.ChannelType() != "session" {
+			newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
 		}
-		channel, requests, _ := newChann.Accept()
+
+		ch, reqs, _ := newCh.Accept()
 		go func(in <-chan *ssh.Request) {
 			for req := range in {
 				if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
 
-					// Start SFTP handler
-					user := sshConn.Permissions.Extensions["pubkey-username"]
-					handler := &customHandler{username: user, root: "./sftp_data"}
-					server := sftp.NewRequestServer(channel, sftp.Handlers{
+					// RULE 8: Send banner/stats to Stderr to avoid corrupting the SFTP stream
+					sendBanner(ch.Stderr(), pubHash, stats)
+
+					handler := &fsHandler{pubHash: pubHash}
+					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet:  handler,
 						FilePut:  handler,
 						FileCmd:  handler,
 						FileList: handler,
 					})
-					if err := server.Serve(); err == io.EOF {
-						server.Close()
-					}
+					server.Serve()
 				}
 			}
-		}(requests)
+		}(reqs)
 	}
 }
 
-// --- SFTP Logic Implementation ---
+type fsHandler struct{ pubHash string }
 
-type customHandler struct {
-	username string
-	root     string
-}
+func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	// 1. Normalize path: remove leading slashes and dot-references
+	cleanPath := filepath.Base(filepath.Clean(r.Filepath))
 
-func (h *customHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	// Requirement 4: Only users that have uploaded can download
-	var count int
-	_ = db.QueryRow("SELECT COUNT(*) FROM files WHERE owner = ?", h.username).Scan(&count)
-	if count == 0 {
-		return nil, fmt.Errorf("permission denied: you must upload a file before you can download")
+	// Rule 6: README.txt access (Check base name only)
+	if cleanPath == "README.txt" {
+		data, err := embeddedSource.ReadFile("main.go")
+		if err != nil {
+			return nil, err
+		}
+		return bytes.NewReader(data), nil
 	}
-	return os.Open(filepath.Join(h.root, r.Filepath))
+
+	// Rule 5: Download permissions
+	if !hasUploaded(f.pubHash) {
+		// Log the attempt
+		logger.Printf("User %s blocked from downloading %s (no uploads yet)", f.pubHash[:12], cleanPath)
+		// We return a specific error message that the client will display
+		return nil, fmt.Errorf("PERMISSION DENIED: You must upload at least one file before you can download. Total bytes uploaded: 0")
+	}
+
+	// Join with the actual upload directory
+	fullPath := filepath.Join(*uploadDir, cleanPath)
+	return os.Open(fullPath)
 }
 
-func (h *customHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	// Requirement 3: Any user can upload
-	path := filepath.Join(h.root, r.Filepath)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	cleanPath := filepath.Base(filepath.Clean(r.Filepath))
+	fullPath := filepath.Join(*uploadDir, cleanPath)
+
+	// Rule 7 & 13: Ownership/Resume logic
+	var owner string
+	err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", cleanPath).Scan(&owner)
+
+	// If file exists and you aren't the owner
+	if err == nil && owner != f.pubHash {
+		return nil, fmt.Errorf("DENIED: File '%s' was uploaded by another user", cleanPath)
+	}
+
+	// Open file for writing (O_RDWR allows resuming/WriteAt)
+	file, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// Requirement 5: Track ownership for modifications/deletions
-	_, _ = db.Exec("INSERT OR REPLACE INTO files (filename, owner) VALUES (?, ?)", r.Filepath, h.username)
-
-	return &wrappedWriter{File: f, username: h.username}, nil
-}
-
-func (h *customHandler) Filecmd(r *sftp.Request) error {
-	// Requirement 5: Only owners can delete or rename
-	if r.Method == "Remove" || r.Method == "Rename" {
-		var owner string
-		err := db.QueryRow("SELECT owner FROM files WHERE filename = ?", r.Filepath).Scan(&owner)
-		if err != nil || owner != h.username {
-			return fmt.Errorf("permission denied: you do not own this file")
-		}
+	// If this is a new file, register ownership
+	if err != nil || owner == "" {
+		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", cleanPath, f.pubHash)
+		db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
 	}
 
-	// Standard OS operations
-	path := filepath.Join(h.root, r.Filepath)
+	logger.Printf("User %s writing to %s", f.pubHash[:12], cleanPath)
+	return &statWriter{File: file, pubHash: f.pubHash}, nil
+}
+
+func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	// Ensure we are reading the correct directory
+	targetDir := *uploadDir
+
+	files, err := os.ReadDir(targetDir)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]os.FileInfo, 0)
+
+	// Always show README.txt in the root listing
+	if r.Filepath == "/" || r.Filepath == "." || r.Filepath == "" {
+		data, _ := embeddedSource.ReadFile("main.go")
+		res = append(res, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
+	}
+
+	for _, fl := range files {
+		if info, err := fl.Info(); err == nil {
+			// Don't show the physical README if it exists in the folder to avoid confusion
+			if info.Name() != "README.txt" {
+				res = append(res, info)
+			}
+		}
+	}
+	return listerAt(res), nil
+}
+
+func (f *fsHandler) Filecmd(r *sftp.Request) error {
+	cleanPath := filepath.Clean(r.Filepath)
+	fullPath := filepath.Join(*uploadDir, cleanPath)
+
 	switch r.Method {
-	case "Remove":
-		return os.Remove(path)
-	case "Rename":
-		return os.Rename(path, filepath.Join(h.root, r.Target))
 	case "Mkdir":
-		return os.Mkdir(path, 0755)
+		if !mkdirLimiter.Allow() {
+			return errors.New("rate limit exceeded")
+		}
+		logger.Printf("User %s mkdir %s", f.pubHash[:12], cleanPath)
+		return os.MkdirAll(fullPath, 0755)
+	case "Remove", "Rename":
+		var owner string
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", cleanPath).Scan(&owner)
+		if owner != f.pubHash {
+			return errors.New("PERMISSION DENIED: You can only modify files you uploaded.")
+		}
+		if r.Method == "Remove" {
+			db.Exec("DELETE FROM files WHERE path = ?", cleanPath)
+			return os.Remove(fullPath)
+		}
+		target := filepath.Clean(r.Target)
+		db.Exec("UPDATE files SET path = ? WHERE path = ?", target, cleanPath)
+		return os.Rename(fullPath, filepath.Join(*uploadDir, target))
+	case "Setstat":
+		return errors.New("PERMISSION DENIED: Manual permission changes are disabled.")
 	}
 	return nil
 }
 
-func (h *customHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	// Requirement 3: Any user can list
-	path := filepath.Join(h.root, r.Filepath)
+// --- Helpers ---
 
-	files, err := os.ReadDir(path)
+type userStats struct {
+	LastLogin  string
+	TotalBytes int64
+}
+
+func updateLoginStats(hash string) userStats {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	var stats userStats
+	err := db.QueryRow("SELECT last_login, total_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&stats.LastLogin, &stats.TotalBytes)
 	if err != nil {
-		return nil, err
+		db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes) VALUES (?, ?, 0)", hash, now)
+		stats.LastLogin = "First Login"
+	} else {
+		db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
 	}
-
-	var infos []os.FileInfo
-	for _, f := range files {
-		info, err := f.Info()
-		if err != nil {
-			continue
-		}
-		infos = append(infos, info)
-	}
-
-	return lister(infos), nil
+	return stats
 }
 
-// Helper to track bytes uploaded
-type wrappedWriter struct {
+func hasUploaded(hash string) bool {
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM files WHERE owner_hash = ?", hash).Scan(&count)
+	return count > 0
+}
+
+func sendBanner(w io.Writer, hash string, stats userStats) {
+	banner, _ := os.ReadFile(*bannerFile)
+	fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
+	fmt.Fprintf(w, "ID: anonymous-%s\r\n", hash[:12])
+	fmt.Fprintf(w, "Last Login: %s\r\n", stats.LastLogin)
+	fmt.Fprintf(w, "Total Uploaded: %d bytes\r\n\r\n", stats.TotalBytes)
+}
+
+type statWriter struct {
 	*os.File
-	username string
+	pubHash string
 }
 
-func (w *wrappedWriter) WriteAt(p []byte, off int64) (int, error) {
-	n, err := w.File.WriteAt(p, off)
+func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
+	n, err := sw.File.WriteAt(p, off)
 	if n > 0 {
-		_, _ = db.Exec("UPDATE users SET bytes_uploaded = bytes_uploaded + ? WHERE username = ?", n, w.username)
+		db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", n, sw.pubHash)
 	}
 	return n, err
 }
 
-func setupDB() {
-	db.Exec(`CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, last_login TEXT, bytes_uploaded INTEGER)`)
-	db.Exec(`CREATE TABLE IF NOT EXISTS files (filename TEXT PRIMARY KEY, owner TEXT)`)
+type listerAt []os.FileInfo
+
+func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
+	if off >= int64(len(l)) {
+		return 0, io.EOF
+	}
+	n := copy(ls, l[off:])
+	if off+int64(n) == int64(len(l)) {
+		return n, io.EOF
+	}
+	return n, nil
 }
+
+type virtualFileInfo struct {
+	name string
+	size int64
+}
+
+func (v *virtualFileInfo) Name() string       { return v.name }
+func (v *virtualFileInfo) Size() int64        { return v.size }
+func (v *virtualFileInfo) Mode() fs.FileMode  { return 0444 }
+func (v *virtualFileInfo) ModTime() time.Time { return time.Now() }
+func (v *virtualFileInfo) IsDir() bool        { return false }
+func (v *virtualFileInfo) Sys() interface{}   { return nil }
