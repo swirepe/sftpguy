@@ -139,12 +139,12 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go func(in <-chan *ssh.Request) {
+
+		go func(in <-chan *ssh.Request, channel ssh.Channel) {
+			defer channel.Close()
 			for req := range in {
 				if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
-
-					// RULE 8: Send banner/stats to Stderr to avoid corrupting the SFTP stream
 					sendBanner(ch.Stderr(), pubHash, stats)
 
 					handler := &fsHandler{pubHash: pubHash}
@@ -155,9 +155,10 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 						FileList: handler,
 					})
 					server.Serve()
+					return
 				}
 			}
-		}(reqs)
+		}(reqs, ch)
 	}
 }
 
