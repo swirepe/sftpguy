@@ -164,12 +164,40 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 
 type fsHandler struct{ pubHash string }
 
-func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	// 1. Normalize path: remove leading slashes and dot-references
-	cleanPath := filepath.Base(filepath.Clean(r.Filepath))
+// securePath returns the relative path (for DB) and absolute path (for Disk)
+// while ensuring the user cannot escape the upload directory.
+func (f *fsHandler) securePath(requestedPath string) (rel string, full string, err error) {
+	// 1. Clean the path and make it look like an absolute path starting at /
+	// This handles ".." and "." internally.
+	safeRel := filepath.Join("/", requestedPath)
 
-	// Rule 6: README.txt access (Check base name only)
-	if cleanPath == "README.txt" {
+	// 2. Remove the leading slash to make it relative to our uploadDir
+	rel = strings.TrimPrefix(filepath.Clean(safeRel), string(filepath.Separator))
+	if rel == "" {
+		rel = "."
+	}
+
+	// 3. Create the full physical path
+	full = filepath.Join(*uploadDir, rel)
+
+	// 4. Final Security Check: Ensure the physical path is still inside uploadDir
+	absBase, _ := filepath.Abs(*uploadDir)
+	absTarget, _ := filepath.Abs(full)
+	if !strings.HasPrefix(absTarget, absBase) {
+		return "", "", errors.New("PERMISSION DENIED: Invalid path")
+	}
+
+	return rel, full, nil
+}
+
+func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	relPath, fullPath, err := f.securePath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rule 6: README.txt access (Allow in root)
+	if relPath == "README.txt" {
 		data, err := embeddedSource.ReadFile("main.go")
 		if err != nil {
 			return nil, err
@@ -179,98 +207,136 @@ func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 	// Rule 5: Download permissions
 	if !hasUploaded(f.pubHash) {
-		// Log the attempt
-		logger.Printf("User %s blocked from downloading %s (no uploads yet)", f.pubHash[:12], cleanPath)
-		// We return a specific error message that the client will display
-		return nil, fmt.Errorf("PERMISSION DENIED: You must upload at least one file before you can download. Total bytes uploaded: 0")
+		logger.Printf("User %s blocked from downloading %s", f.pubHash[:12], relPath)
+		return nil, fmt.Errorf("PERMISSION DENIED: You must upload at least one file first.")
 	}
 
-	// Join with the actual upload directory
-	fullPath := filepath.Join(*uploadDir, cleanPath)
 	return os.Open(fullPath)
 }
 
 func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	cleanPath := filepath.Base(filepath.Clean(r.Filepath))
-	fullPath := filepath.Join(*uploadDir, cleanPath)
+	relPath, fullPath, err := f.securePath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
 
-	// Rule 7 & 13: Ownership/Resume logic
+	// Rule 7 & 13: Ownership logic
 	var owner string
-	err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", cleanPath).Scan(&owner)
+	err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 
 	// If file exists and you aren't the owner
 	if err == nil && owner != f.pubHash {
-		return nil, fmt.Errorf("DENIED: File '%s' was uploaded by another user", cleanPath)
+		return nil, fmt.Errorf("DENIED: '%s' belongs to another user", relPath)
 	}
 
-	// Open file for writing (O_RDWR allows resuming/WriteAt)
+	// Open file (O_RDWR for resuming)
 	file, err := os.OpenFile(fullPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	// If this is a new file, register ownership
-	if err != nil || owner == "" {
-		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", cleanPath, f.pubHash)
+	// If this is a new file or first time writing
+	if owner == "" {
+		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", relPath, f.pubHash)
 		db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
 	}
 
-	logger.Printf("User %s writing to %s", f.pubHash[:12], cleanPath)
+	logger.Printf("User %s writing to %s", f.pubHash[:12], relPath)
 	return &statWriter{File: file, pubHash: f.pubHash}, nil
 }
 
 func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	// Ensure we are reading the correct directory
-	targetDir := *uploadDir
-
-	files, err := os.ReadDir(targetDir)
+	relPath, fullPath, err := f.securePath(r.Filepath)
 	if err != nil {
 		return nil, err
 	}
 
-	res := make([]os.FileInfo, 0)
+	switch r.Method {
+	case "List":
+		files, err := os.ReadDir(fullPath)
+		if err != nil {
+			return nil, err
+		}
 
-	// Always show README.txt in the root listing
-	if r.Filepath == "/" || r.Filepath == "." || r.Filepath == "" {
-		data, _ := embeddedSource.ReadFile("main.go")
-		res = append(res, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
-	}
+		res := make([]os.FileInfo, 0)
 
-	for _, fl := range files {
-		if info, err := fl.Info(); err == nil {
-			// Don't show the physical README if it exists in the folder to avoid confusion
-			if info.Name() != "README.txt" {
-				res = append(res, info)
+		// Always show README.txt if we are in the root directory
+		if relPath == "." || relPath == "" {
+			data, _ := embeddedSource.ReadFile("main.go")
+			res = append(res, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
+		}
+
+		for _, fl := range files {
+			if info, err := fl.Info(); err == nil {
+				if info.Name() != "README.txt" {
+					res = append(res, info)
+				}
 			}
 		}
+		return listerAt(res), nil
+
+	case "Stat", "Lstat":
+		// This is what 'cd' and 'ls -d' use to verify a file/folder exists
+
+		// 1. Handle Virtual README
+		if relPath == "README.txt" {
+			data, _ := embeddedSource.ReadFile("main.go")
+			return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
+		}
+
+		// 2. Handle Physical Files
+		fi, err := os.Stat(fullPath)
+		if err != nil {
+			return nil, err
+		}
+
+		// Return a list containing exactly one item
+		return listerAt{fi}, nil
 	}
-	return listerAt(res), nil
+
+	return nil, errors.New("unsupported method")
 }
 
 func (f *fsHandler) Filecmd(r *sftp.Request) error {
-	cleanPath := filepath.Clean(r.Filepath)
-	fullPath := filepath.Join(*uploadDir, cleanPath)
+	relPath, fullPath, err := f.securePath(r.Filepath)
+	if err != nil {
+		return err
+	}
 
 	switch r.Method {
 	case "Mkdir":
 		if !mkdirLimiter.Allow() {
 			return errors.New("rate limit exceeded")
 		}
-		logger.Printf("User %s mkdir %s", f.pubHash[:12], cleanPath)
+		// Register ownership of the directory too
+		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", relPath, f.pubHash)
 		return os.MkdirAll(fullPath, 0755)
-	case "Remove", "Rename":
+
+	case "Remove":
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", cleanPath).Scan(&owner)
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 		if owner != f.pubHash {
-			return errors.New("PERMISSION DENIED: You can only modify files you uploaded.")
+			return errors.New("PERMISSION DENIED: You do not own this.")
 		}
-		if r.Method == "Remove" {
-			db.Exec("DELETE FROM files WHERE path = ?", cleanPath)
-			return os.Remove(fullPath)
+		db.Exec("DELETE FROM files WHERE path = ?", relPath)
+		return os.RemoveAll(fullPath) // RemoveAll handles directories and files
+
+	case "Rename":
+		relTarget, fullTarget, err := f.securePath(r.Target)
+		if err != nil {
+			return err
 		}
-		target := filepath.Clean(r.Target)
-		db.Exec("UPDATE files SET path = ? WHERE path = ?", target, cleanPath)
-		return os.Rename(fullPath, filepath.Join(*uploadDir, target))
+
+		var owner string
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+		if owner != f.pubHash {
+			return errors.New("PERMISSION DENIED: You do not own the source file.")
+		}
+
+		// Update DB path
+		db.Exec("UPDATE files SET path = ? WHERE path = ?", relTarget, relPath)
+		return os.Rename(fullPath, fullTarget)
+
 	case "Setstat":
 		return errors.New("PERMISSION DENIED: Manual permission changes are disabled.")
 	}
@@ -307,7 +373,7 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 	banner, _ := os.ReadFile(*bannerFile)
 	fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
 
-	if stats.TotalBytes == 0 {
+	if !hasUploaded(hash) {
 		fmt.Fprint(w, boldAscii("Reminder:", "You must upload a file to download files."))
 	} else if stats.TotalBytes > 1024 {
 		fmt.Fprint(w, boldAscii("Thank you for uploading.", "Here is a cool planet to look at."))
