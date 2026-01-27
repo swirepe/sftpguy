@@ -32,7 +32,7 @@ import (
 /*
   1. users are identified internally by their public key.
   2. Usernames, keys, addresses, uploads, directory creations, etc. are logged to the console and to a configurable file.
-  3. all users are displayed as "anonymous-<hash of public key>" with UID 1000 and GID 1000.
+  3. UIDs/GIDs are generated from a hash of the user's public key
   4. any user can upload files, create directories, or list directories
   5. Only users that have uploaded a file can download files.  A user that has uploaded at least one file has permission to download any file.
   6. Any user can download README.txt, even if they have not uploaded a file.  Use go:embed to save the source code of this application as README.txt.
