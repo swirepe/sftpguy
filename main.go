@@ -173,44 +173,6 @@ func (f *fsHandler) secure(p string) (string, string) {
 	return rel, filepath.Join(*uploadDir, rel)
 }
 
-// Lstat implements sftp.NameLookupFileLister
-func (f *fsHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
-	return f.Stat(r) // In this app, we treat Lstat and Stat the same
-}
-
-// Stat implements sftp.NameLookupFileLister
-func (f *fsHandler) Stat(r *sftp.Request) (sftp.ListerAt, error) {
-	rel, full := f.secure(r.Filepath)
-
-	if rel == "README.txt" {
-		data, _ := embeddedSource.ReadFile("main.go")
-		return listerAt{&sftpFile{
-			name:      "README.txt",
-			size:      int64(len(data)),
-			mode:      0444,
-			modTime:   time.Now(),
-			isDir:     false,
-			ownerName: "anonymous",
-			ownerHash: "system",
-		}}, nil
-	}
-
-	// Handle real files/directories
-	info, err := os.Stat(full)
-	if err != nil {
-		return nil, err
-	}
-
-	var owner string
-	db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-	return listerAt{newSftpFile(info.Name(), info, owner)}, nil
-}
-
-// Readlink implements sftp.NameLookupFileLister
-func (f *fsHandler) Readlink(r *sftp.Request) (sftp.ListerAt, error) {
-	return nil, sftp.ErrSSHFxOpUnsupported
-}
-
 func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	relPath, fullPath := f.secure(r.Filepath)
 
@@ -248,31 +210,35 @@ func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := f.secure(r.Filepath)
-
-	if r.Method != "List" {
-		return nil, sftp.ErrSSHFxOpUnsupported
-	}
-
-	items, err := os.ReadDir(full)
-	if err != nil {
-		return nil, err
-	}
-
-	res := make([]os.FileInfo, 0)
-
-	// Virtual file for the root directory
-	if rel == "." {
-		data, _ := embeddedSource.ReadFile("main.go")
-		res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "anonymous", "system"})
-	}
-
-	for _, item := range items {
-		info, _ := item.Info()
+	switch r.Method {
+	case "List":
+		items, _ := os.ReadDir(full)
+		res := make([]os.FileInfo, 0)
+		if rel == "." {
+			data, _ := embeddedSource.ReadFile("main.go")
+			res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"})
+		}
+		for _, item := range items {
+			info, _ := item.Info()
+			var owner string
+			db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", filepath.Join(rel, info.Name())).Scan(&owner)
+			res = append(res, newSftpFile(info.Name(), info, owner))
+		}
+		return listerAt(res), nil
+	case "Stat", "Lstat":
+		if rel == "README.txt" {
+			data, _ := embeddedSource.ReadFile("main.go")
+			return listerAt{&sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"}}, nil
+		}
+		info, err := os.Stat(full)
+		if err != nil {
+			return nil, err
+		}
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", filepath.Join(rel, info.Name())).Scan(&owner)
-		res = append(res, newSftpFile(info.Name(), info, owner))
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		return listerAt{newSftpFile(info.Name(), info, owner)}, nil
 	}
-	return listerAt(res), nil
+	return nil, nil
 }
 
 func (f *fsHandler) Filecmd(r *sftp.Request) error {
@@ -320,8 +286,6 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 		}
 
 		return os.Rename(full, fullT)
-	default:
-		return sftp.ErrSSHFxOpUnsupported
 	}
 	return nil
 
@@ -369,8 +333,7 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 		fmt.Fprint(w, boldAscii("Thank you for uploading.", "You may now download files."))
 	}
 
-	fmt.Fprintf(w, "ID: anonymous-%s\r\n", hash[:12])
-	fmt.Fprintf(w, "UID: %d\r\n", ownerHashToUid(hash))
+	fmt.Fprintf(w, "ID: anonymous-%s (%v)\r\n", hash[:12], ownerHashToUid(hash))
 	fmt.Fprintf(w, "Last Login: %s\r\n", stats.LastLogin)
 	fmt.Fprintf(w, "Total Uploaded: %d bytes\r\n\r\n", stats.TotalBytes)
 
@@ -407,13 +370,12 @@ func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
 }
 
 type sftpFile struct {
-	name      string
-	size      int64
-	mode      fs.FileMode
-	modTime   time.Time
-	isDir     bool
-	ownerName string
-	ownerHash string // Full hash for extension data
+	name    string
+	size    int64
+	mode    fs.FileMode
+	modTime time.Time
+	isDir   bool
+	owner   string
 }
 
 func (s *sftpFile) Name() string       { return s.name }
@@ -422,61 +384,39 @@ func (s *sftpFile) Mode() fs.FileMode  { return s.mode }
 func (s *sftpFile) ModTime() time.Time { return s.modTime }
 func (s *sftpFile) IsDir() bool        { return s.isDir }
 func (s *sftpFile) Sys() interface{} {
-	// Convert the owner hash to a numeric UID/GID for display
-	// This makes the hash visible in ls -l output
-	uid := uint32(1000) // Default for system files
+	uid := uint32(1000)
 	gid := uint32(1000)
 
-	if s.ownerHash != "" && s.ownerHash != "system" {
-		// Use FNV hash of the first 12 chars to generate a unique numeric ID
-
-		uid = ownerHashToUid(s.ownerHash)
+	if s.owner != "" && s.owner != "system" {
+		uid = ownerHashToUid(s.owner)
 		gid = uid
 	}
 
 	return &sftp.FileStat{
 		UID: uid,
 		GID: gid,
-		Extended: []sftp.StatExtended{
-			{
-				ExtType: "owner-name",
-				ExtData: s.ownerName,
-			},
-			{
-				ExtType: "owner-hash",
-				ExtData: s.ownerHash,
-			},
-		},
 	}
 }
 
 func ownerHashToUid(hash string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(hash[:12]))
-	return h.Sum32()
-}
-
-func (s *sftpFile) LongName() string {
-	mode := s.mode.String()
-	modTime := s.modTime.Format("Jan _2 15:04")
-	// Standard Unix-style listing: mode, links, owner, group, size, date, name
-	return fmt.Sprintf("%s    1 %-16s %-16s %8d %s %s",
-		mode, s.ownerName, s.ownerName, s.size, modTime, s.name)
+	// Mask to 31 bits to avoid signed integer issues in some SFTP clients
+	return h.Sum32() & 0x7FFFFFFF
 }
 
 func newSftpFile(name string, info os.FileInfo, ownerHash string) *sftpFile {
-	displayName := "anonymous-system"
+	owner := "system"
 	if ownerHash != "" && ownerHash != "system" {
-		displayName = "anonymous-" + ownerHash[:12]
+		owner = ownerHash
 	}
 	return &sftpFile{
-		name:      name,
-		size:      info.Size(),
-		mode:      info.Mode(),
-		modTime:   info.ModTime(),
-		isDir:     info.IsDir(),
-		ownerName: displayName,
-		ownerHash: ownerHash,
+		name:    name,
+		size:    info.Size(),
+		mode:    info.Mode(),
+		modTime: info.ModTime(),
+		isDir:   info.IsDir(),
+		owner:   owner,
 	}
 }
 
