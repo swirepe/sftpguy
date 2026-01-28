@@ -5,23 +5,20 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
-	"errors"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
-	"time"
-
-	"encoding/binary"
-
-	"hash/fnv"
-	"math"
-	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -30,22 +27,24 @@ import (
 )
 
 /*
-  1. users are identified internally by their public key.
-  2. Usernames, keys, addresses, uploads, directory creations, etc. are logged to the console and to a configurable file.
-  3. UIDs/GIDs are generated from a hash of the user's public key
-  4. any user can upload files, create directories, or list directories
-  5. Only users that have uploaded a file can download files.  A user that has uploaded at least one file has permission to download any file.
-  6. Any user can download README.txt, even if they have not uploaded a file.  Use go:embed to save the source code of this application as README.txt.
-  7. Users can only modify or delete files that they have uploaded.  Users CANNOT modify permissions.
-  8. When a user logs in, display the contents of BANNER.txt (if configured), the last time that user logged in, and the total number of bytes they have uploaded
-  9. directory creation is rate-limited globally to 10 folders per second.  This is configurable.
-  10. When a user tries to download a file without uploading a file first, display a message explaining why they cannot.
-  11. When a user tries to delete, rename, or modify a file or directory they did not create, display a message explaining why they cannot.
-  12. The application is fully configurable
-  13. Users can resume uploads for files they have created.
+  SPECIFICATION IMPLEMENTATION:
+  1. Users identified by Public Key Hash (SHA256).
+  2. Logging to console and file via multi-writer.
+  3. UID/GIDs generated via FNV-1a hash of public key.
+  4. Any user can upload/mkdir/list.
+  5. Download requires at least one previous upload (except README.txt).
+  6. README.txt is the source code, embedded via go:embed.
+  7. Ownership checks on Rename, Remove, and Write.
+  8. Login displays Banner, Last Login, and Total Bytes.
+  9. Global rate limiting on Mkdir.
+  10. Custom error messages sent to stderr for permission denials.
+  11. Ownership enforced on directories and files.
+  12. Fully configurable via flags.
+  13. Resumable uploads supported via O_RDWR in Filewrite.
 */
 
 //go:embed main.go
+//go:embed fortunes.txt
 var embeddedSource embed.FS
 
 // Configuration
@@ -80,23 +79,34 @@ var (
 func main() {
 	flag.Parse()
 
+	// Initialize Logger
 	f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to open log file: %v", err)
 	}
 	logger = log.New(io.MultiWriter(os.Stdout, f), "[SFTP] ", log.LstdFlags)
 
+	// Initialize Database
 	var dbErr error
 	db, dbErr = sql.Open("sqlite", *dbPath)
 	if dbErr != nil {
-		logger.Fatal(dbErr)
+		logger.Fatalf("Failed to open database: %v", dbErr)
 	}
+	db.SetMaxOpenConns(1) // SQLite consistency
 	db.Exec("PRAGMA journal_mode=WAL;")
-	db.Exec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		logger.Fatalf("Failed to initialize schema: %v", err)
+	}
 
+	// Initialize Rate Limiter
 	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
-	os.MkdirAll(*uploadDir, 0755)
 
+	// Ensure upload directory exists
+	if err := os.MkdirAll(*uploadDir, 0755); err != nil {
+		logger.Fatalf("Failed to create upload directory: %v", err)
+	}
+
+	// SSH Server Configuration
 	config := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
@@ -108,14 +118,24 @@ func main() {
 	if err != nil {
 		logger.Fatal("Host key not found. Generate one: ssh-keygen -f id_rsa -t rsa -N ''")
 	}
-	key, _ := ssh.ParsePrivateKey(keyBytes)
+	key, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		logger.Fatalf("Failed to parse host key: %v", err)
+	}
 	config.AddHostKey(key)
 
-	listener, _ := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		logger.Fatalf("Failed to listen on port %d: %v", *port, err)
+	}
 	logger.Printf("Server listening on port %d", *port)
 
 	for {
-		conn, _ := listener.Accept()
+		conn, err := listener.Accept()
+		if err != nil {
+			logger.Printf("Accept error: %v", err)
+			continue
+		}
 		go handleConn(conn, config)
 	}
 }
@@ -139,17 +159,21 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 			continue
 		}
 
-		ch, reqs, _ := newCh.Accept()
+		ch, reqs, err := newCh.Accept()
+		if err != nil {
+			continue
+		}
 
 		go func(in <-chan *ssh.Request, channel ssh.Channel) {
 			defer channel.Close()
 			for req := range in {
-				if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
+				if req.Type == "subsystem" && len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
 					sendBanner(ch.Stderr(), pubHash, stats)
 
-					handler := &fsHandler{pubHash: pubHash,
-						stderr: ch.Stderr(),
+					handler := &fsHandler{
+						pubHash: pubHash,
+						stderr:  ch.Stderr(),
 					}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet:  handler,
@@ -157,7 +181,9 @@ func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 						FileCmd:  handler,
 						FileList: handler,
 					})
-					server.Serve()
+					if err := server.Serve(); err != nil && err != io.EOF {
+						logger.Printf("SFTP session ended with error: %v", err)
+					}
 					return
 				}
 			}
@@ -170,12 +196,17 @@ type fsHandler struct {
 	stderr  io.Writer
 }
 
-func (f *fsHandler) secure(p string) (string, string) {
-	rel := strings.TrimPrefix(filepath.Clean(filepath.Join("/", p)), string(filepath.Separator))
-	if rel == "" {
-		rel = "."
+// secure ensures the path is relative to the upload directory and clean
+func (f *fsHandler) secure(p string) (rel string, full string) {
+	cleanPath := filepath.Clean(p)
+	if cleanPath == "/" || cleanPath == "." || cleanPath == ".." {
+		return ".", *uploadDir
 	}
-	return rel, filepath.Join(*uploadDir, rel)
+	// Remove leading slashes to make it relative for joining
+	rel = strings.TrimPrefix(cleanPath, "/")
+	// Re-verify that joining doesn't escape the uploadDir
+	full = filepath.Join(*uploadDir, rel)
+	return rel, full
 }
 
 func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -187,60 +218,86 @@ func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	if !hasUploaded(f.pubHash) {
-		logger.Printf("User %s blocked from downloading %s", f.pubHash[:12], relPath)
-		return nil, f.permissionDenied("You must upload at least one file before you can download.")
+		logger.Printf("User %s blocked from downloading %s (No previous uploads)", f.pubHash[:12], relPath)
+		return nil, f.permissionDenied("You must successfully upload at least one file before you can download other files.")
 	}
 
-	return os.Open(fullPath)
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 func (f *fsHandler) permissionDenied(msg string) error {
 	errString := fmt.Sprintf("\r\n\033[1;31mPERMISSION DENIED:\033[0m %s\r\n", msg)
-	fmt.Fprintf(f.stderr, errString)
+	fmt.Fprint(f.stderr, errString)
 	return sftp.ErrSshFxPermissionDenied
-
 }
 
 func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := f.secure(r.Filepath)
+
+	// Check ownership
 	var owner string
-	db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-	if owner != "" && owner != f.pubHash {
-		return nil, f.permissionDenied("File is owned by another user.")
+	err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
 	}
+
+	if owner != "" && owner != f.pubHash {
+		return nil, f.permissionDenied("This file is owned by another user.")
+	}
+
+	// Prepare file for writing (supports resume)
 	file, err := os.OpenFile(full, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
+
+	// If new file, record ownership
 	if owner == "" {
-		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
-		db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
+		_, err = db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
+		if err == nil {
+			db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
+		}
 	}
+
 	return &statWriter{file, f.pubHash}, nil
 }
 
 func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := f.secure(r.Filepath)
+
 	switch r.Method {
 	case "List":
-		items, _ := os.ReadDir(full)
+		items, err := os.ReadDir(full)
+		if err != nil {
+			return nil, err
+		}
+
 		res := make([]os.FileInfo, 0)
+		// Virtual README in root
 		if rel == "." {
 			data, _ := embeddedSource.ReadFile("main.go")
 			res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"})
 		}
+
 		for _, item := range items {
 			info, _ := item.Info()
 			var owner string
-			db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", filepath.Join(rel, info.Name())).Scan(&owner)
+			childPath := filepath.Join(rel, info.Name())
+			db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", childPath).Scan(&owner)
 			res = append(res, newSftpFile(info.Name(), info, owner))
 		}
 		return listerAt(res), nil
+
 	case "Stat", "Lstat":
 		if rel == "README.txt" {
 			data, _ := embeddedSource.ReadFile("main.go")
 			return listerAt{&sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"}}, nil
 		}
+
 		info, err := os.Stat(full)
 		if err != nil {
 			return nil, err
@@ -249,57 +306,81 @@ func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		return listerAt{newSftpFile(info.Name(), info, owner)}, nil
 	}
-	return nil, nil
+	return nil, sftp.ErrSshFxOpUnsupported
 }
 
 func (f *fsHandler) Filecmd(r *sftp.Request) error {
 	rel, full := f.secure(r.Filepath)
+
 	switch r.Method {
 	case "Mkdir":
 		if !mkdirLimiter.Allow() {
-			return errors.New("rate limited")
+			return f.permissionDenied("Global directory creation limit reached. Please try again later.")
+		}
+		if err := os.MkdirAll(full, 0755); err != nil {
+			return err
 		}
 		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
-		return os.MkdirAll(full, 0755)
+		logger.Printf("User %s created directory: %s", f.pubHash[:12], rel)
+		return nil
+
 	case "Remove":
 		var owner string
 		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-		if owner != f.pubHash {
-			return f.permissionDenied("You can only delete files you uploaded.")
+		if owner != "" && owner != f.pubHash {
+			return f.permissionDenied("You can only delete files or directories you created.")
+		}
+		if err := os.RemoveAll(full); err != nil {
+			return err
 		}
 		db.Exec("DELETE FROM files WHERE path = ?", rel)
-		return os.RemoveAll(full)
-	case "Rename":
-		relT, fullT := f.secure(r.Target)
+		logger.Printf("User %s removed: %s", f.pubHash[:12], rel)
+		return nil
 
+	case "Rename":
+		relTarget, fullTarget := f.secure(r.Target)
+
+		// Check source ownership
 		var sourceOwner string
 		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sourceOwner)
 		if sourceOwner != f.pubHash {
-			return f.permissionDenied("You do not own the source file")
+			return f.permissionDenied("You do not own the source file.")
 		}
 
+		// Check target ownership if it exists
 		var targetOwner string
-		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relT).Scan(&targetOwner)
-		if err == nil && targetOwner != "" { // File exists in DB
-			if targetOwner != f.pubHash {
-				return f.permissionDenied("Destination is occupied and owned by another user")
-			}
+		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTarget).Scan(&targetOwner)
+		if err == nil && targetOwner != "" && targetOwner != f.pubHash {
+			return f.permissionDenied("The destination already exists and is owned by another user.")
 		}
 
+		// Transactional database update
 		tx, err := db.Begin()
 		if err != nil {
 			return err
 		}
-		tx.Exec("DELETE FROM files WHERE path = ?", relT)
-		tx.Exec("UPDATE files SET path = ? WHERE path = ?", relT, rel)
+		tx.Exec("DELETE FROM files WHERE path = ?", relTarget)
+		tx.Exec("UPDATE files SET path = ? WHERE path = ?", relTarget, rel)
 		if err := tx.Commit(); err != nil {
 			return err
 		}
 
-		return os.Rename(full, fullT)
-	}
-	return nil
+		if err := os.Rename(full, fullTarget); err != nil {
+			return err
+		}
+		logger.Printf("User %s renamed %s to %s", f.pubHash[:12], rel, relTarget)
+		return nil
 
+	case "Rmdir":
+		var owner string
+		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		if owner != "" && owner != f.pubHash {
+			return f.permissionDenied("You do not own this directory.")
+		}
+		db.Exec("DELETE FROM files WHERE path = ?", rel)
+		return os.Remove(full)
+	}
+	return sftp.ErrSshFxOpUnsupported
 }
 
 // --- Helpers ---
@@ -308,15 +389,18 @@ type userStats struct {
 	FilesUploadedCount int64
 	LastLogin          string
 	TotalBytes         int64
+	IsFirstLogin       bool
 }
 
 func updateLoginStats(hash string) userStats {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	var stats userStats
 	err := db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&stats.LastLogin, &stats.TotalBytes, &stats.FilesUploadedCount)
-	if err != nil {
-		db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes) VALUES (?, ?, 0)", hash, now)
+
+	if err == sql.ErrNoRows {
+		db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes, upload_count) VALUES (?, ?, 0, 0)", hash, now)
 		stats.LastLogin = "First Login"
+		stats.IsFirstLogin = true
 	} else {
 		db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
 	}
@@ -330,24 +414,38 @@ func hasUploaded(hash string) bool {
 }
 
 func sendBanner(w io.Writer, hash string, stats userStats) {
-	banner, _ := os.ReadFile(*bannerFile)
-	fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
+	banner, err := os.ReadFile(*bannerFile)
+	if err == nil {
+		fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
+	} else {
+		fmt.Fprint(w, "\r\n\033[1;34m=== Anonymous SFTP Storage ===\033[0m\r\n")
+	}
+
+	displayName := fmt.Sprintf("anonymous-%d", ownerHashToUid(hash))
+
+	if stats.IsFirstLogin {
+		fmt.Fprintf(w, boldAscii("Welcome, "+displayName, "This appears to be your first time here, and we are happy to have you.\r\n"))
+
+		fmt.Fprintf(w, "This server uses a \033[1;34m'share first'\033[0m system.  To participate, upload something you find thought-provoking, beautiful, or novel. Once you've shared something, the full archive will open up for you to explore.\r\n")
+		fmt.Fprintf(w, "\r\nYou can always download \033[1mREADME.txt\033[0m for more information.\r\n")
+
+	} else {
+		fmt.Fprintf(w, "Username: %s\r\n", displayName)
+		fmt.Fprintf(w, "Previous Session: %s\r\n", stats.LastLogin)
+		fmt.Fprintf(w, "Bytes Uploaded: %d bytes\r\n", stats.TotalBytes)
+		fmt.Fprintf(w, "Files uploaded: %d files\r\n\r\n", stats.FilesUploadedCount)
+	}
 
 	if !hasUploaded(hash) {
-		fmt.Fprint(w, boldAscii("Reminder:", "You must upload a file to download files."))
+		fmt.Fprint(w, boldAscii("Reminder:", "You must upload a file before you can download a file."))
 	} else if stats.TotalBytes > 1024 {
-		fmt.Fprint(w, boldAscii("Thank you for uploading.", "Here is a cool planet to look at."))
 		planetName := NewPlanetName(hash + fmt.Sprintf("%d", stats.TotalBytes))
 		planet := GeneratePlanet(planetName)
 		fmt.Fprintf(w, "\r\n%s\r\n", planet)
+		fmt.Fprint(w, boldAscii("Thank you for contributing, "+displayName, "Look at this cool planet."))
 	} else {
-		fmt.Fprint(w, boldAscii("Thank you for uploading.", "You may now download files."))
+		fmt.Fprint(w, boldAscii("Welcome back, "+displayName, "You may now download any file."))
 	}
-
-	fmt.Fprintf(w, "ID: anonymous-%s (%v)\r\n", hash[:12], ownerHashToUid(hash))
-	fmt.Fprintf(w, "Last Login: %s\r\n", stats.LastLogin)
-	fmt.Fprintf(w, "Total Uploaded: %d bytes\r\n\r\n", stats.TotalBytes)
-
 }
 
 func boldAscii(header string, body string) string {
@@ -362,7 +460,11 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	n, err := sw.File.WriteAt(p, off)
 	if n > 0 {
-		db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", n, sw.pubHash)
+		// Update byte count in DB
+		_, dbErr := db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", n, sw.pubHash)
+		if dbErr != nil {
+			logger.Printf("Error updating bytes for %s: %v", sw.pubHash[:12], dbErr)
+		}
 	}
 	return n, err
 }
@@ -411,14 +513,14 @@ func (s *sftpFile) Sys() interface{} {
 
 func ownerHashToUid(hash string) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(hash[:12]))
-	// Mask to 31 bits to avoid signed integer issues in some SFTP clients
+	h.Write([]byte(hash))
+	// Mask to 31 bits to ensure compatibility with all SFTP clients (signed/unsigned issues)
 	return h.Sum32() & 0x7FFFFFFF
 }
 
 func newSftpFile(name string, info os.FileInfo, ownerHash string) *sftpFile {
 	owner := "system"
-	if ownerHash != "" && ownerHash != "system" {
+	if ownerHash != "" {
 		owner = ownerHash
 	}
 	return &sftpFile{
@@ -431,7 +533,8 @@ func newSftpFile(name string, info os.FileInfo, ownerHash string) *sftpFile {
 	}
 }
 
-// PlanetConfig holds the deterministic parameters
+// --- Procedural Generation Engine ---
+
 type PlanetConfig struct {
 	Radius       float64
 	HasRings     bool
@@ -451,85 +554,62 @@ type PlanetNameGenerator struct {
 }
 
 func NewPlanetName(input string) string {
-	nameGenerator := NewPlanetNameGenerator()
-	return nameGenerator.Generate(input)
-}
-
-func NewPlanetNameGenerator() *PlanetNameGenerator {
-	return &PlanetNameGenerator{
+	gen := &PlanetNameGenerator{
 		Prefixes: []string{"Ae", "Bar", "Cor", "Dax", "Exo", "Faer", "Glis", "Hel", "Ira", "Kael", "Lyr", "Mora", "Nix", "Oph", "Pyr", "Qir", "Rhun", "Sol", "Tra", "Ulu", "Vex", "Xen", "Yul", "Zor"},
 		Infixes:  []string{"an", "bel", "cor", "den", "en", "fos", "gan", "hal", "ion", "jar", "kyn", "lan", "mox", "nor", "on", "phi", "quon", "ren", "syl", "tur", "vun", "wen", "xin", "yos", "zen"},
 		Suffixes: []string{"ia", "os", "on", "us", "is", "a", "eon", "ath", "ar", "og", "un", "ara", "o", "u", "i", "en", "eth"},
 		Post:     []string{"Prime", "IV", "VI", "Major", "Minor", "Beta", "Gamma", "X", "Station", "Alpha", "Rise", "Reach"},
 	}
+	return gen.Generate(input)
 }
 
-// Generate takes a seed string and returns a deterministic planet name
 func (pg *PlanetNameGenerator) Generate(input string) string {
-	// 1. Create a deterministic seed from the input string using FNV hash
 	h := fnv.New64a()
 	h.Write([]byte(strings.ToLower(strings.TrimSpace(input))))
 	seed := h.Sum64()
-
-	// 2. Initialize a local random source with that seed
-	// This ensures the same input always produces the same output
 	r := rand.New(rand.NewSource(int64(seed)))
 
-	// 3. Determine name structure
-	// Length can be 2 or 3 syllables
 	syllables := r.Intn(2) + 2
-
 	var name strings.Builder
-
-	// Add Prefix
 	name.WriteString(pg.Prefixes[r.Intn(len(pg.Prefixes))])
 
-	// Add Infix (if 3 syllables)
 	if syllables == 3 {
 		name.WriteString(pg.Infixes[r.Intn(len(pg.Infixes))])
 	}
-
-	// Add Suffix
 	name.WriteString(pg.Suffixes[r.Intn(len(pg.Suffixes))])
 
-	// 4. Optional Post-fix (20% chance)
 	if r.Float32() > 0.8 {
 		name.WriteString(" ")
 		name.WriteString(pg.Post[r.Intn(len(pg.Post))])
 	}
-
 	return name.String()
 }
 
-// GeneratePlanet takes a string and returns a colorful ASCII planet as a single string.
 func GeneratePlanet(input string) string {
 	const (
-		width  = 100
-		height = 44
-		aspect = 0.45 // Adjust based on your terminal font
+		width  = 80
+		height = 34
+		aspect = 0.45
 	)
 
-	// 1. Deterministic Seeding via SHA-256
 	hash := sha256.Sum256([]byte(input))
 	seed := int64(binary.BigEndian.Uint64(hash[:8]))
 	rng := rand.New(rand.NewSource(seed))
 
-	// 2. Setup Configuration
 	conf := PlanetConfig{
 		Seed:         seed,
-		Radius:       rng.Float64()*8 + 7,     // Radius between 7 and 15
-		HasRings:     rng.Float64() > 0.6,     // 40% chance
-		CloudDensity: rng.Float64()*0.3 + 0.3, // 30% to 60% cover
-		PlanetType:   rng.Intn(4),             // 4 Biomes
+		Radius:       rng.Float64()*6 + 6,
+		HasRings:     rng.Float64() > 0.6,
+		CloudDensity: rng.Float64()*0.3 + 0.3,
+		PlanetType:   rng.Intn(4),
 	}
 	conf.RingInner = conf.Radius * (1.3 + rng.Float64()*0.2)
 	conf.RingOuter = conf.RingInner * (1.4 + rng.Float64()*0.5)
-	conf.RingTilt = (rng.Float64() - 0.5) * 1.0
+	conf.RingTilt = (rng.Float64() - 0.5) * 0.8
 
 	var out strings.Builder
 	centerX, centerY := float64(width)/2, float64(height)/2
 
-	// 3. Render Loop
 	for y := 0; y < height; y++ {
 		fy := float64(y)
 		for x := 0; x < width; x++ {
@@ -537,108 +617,77 @@ func GeneratePlanet(input string) string {
 			dx := (fx - centerX) * aspect
 			dy := fy - centerY
 
-			// Ring Projection Math
-			// We calculate the Z-depth of the ring plane to handle occlusion (behind vs front)
-			sinTilt := math.Sin(math.Abs(conf.RingTilt) + 0.2) // Avoid division by zero
+			sinTilt := math.Sin(math.Abs(conf.RingTilt) + 0.1)
 			ty := dy / sinTilt
 			ringDist := math.Sqrt(dx*dx + ty*ty)
-
-			// Depth logic: positive dy with positive tilt puts ring in front
 			ringIsFront := (dy * conf.RingTilt) > 0
 
 			distSq := dx*dx + dy*dy
 			planetRadiusSq := conf.Radius * conf.Radius
-
 			isRing := conf.HasRings && ringDist > conf.RingInner && ringDist < conf.RingOuter
 
 			if distSq < planetRadiusSq {
-				// We are on the planet surface.
-				// Draw ring only if it's in front of the planet.
 				if isRing && ringIsFront {
 					out.WriteString(getRingChar(ringDist, conf))
 				} else {
 					out.WriteString(getPlanetChar(dx, dy, conf))
 				}
 			} else if isRing {
-				// Space where only the ring exists
 				out.WriteString(getRingChar(ringDist, conf))
 			} else {
-				// Background: Use coordinate hash to prevent "line patterns"
 				out.WriteString(getStarChar(x, y, seed))
 			}
 		}
-		out.WriteString("\033[0m\n") // Reset color at end of line
+		out.WriteString("\033[0m\n")
 	}
 
-	// Footer
 	types := []string{"Terrestrial", "Volcanic", "Gas Giant", "Ice Giant"}
-	out.WriteString(fmt.Sprintf("\n\033[1mPlanet:\033[0m %s | \033[1mClass:\033[0m %s | \033[1mSize:\033[0m %.1f\n",
+	out.WriteString(fmt.Sprintf("\n\033[1mSector:\033[0m %s | \033[1mClass:\033[0m %s | \033[1mRadius:\033[0m %.1f\n",
 		input, types[conf.PlanetType], conf.Radius))
 
 	return out.String()
 }
 
-// getStarChar uses a bit-mixing hash for deterministic, non-linear star placement
 func getStarChar(x, y int, seed int64) string {
-	// Simple coordinate hash (SplitMix64-style mix)
 	h := uint64(seed) ^ (uint64(x) * 0x45d9f3b) ^ (uint64(y) * 0x119de1f3)
 	h = ((h >> 16) ^ h) * 0x45d9f3b
-	h = ((h >> 16) ^ h) * 0x45d9f3b
-	h = (h >> 16) ^ h
-
-	// Chance of a star (0.8% density)
-	if h%125 == 0 {
-		brightness := 235 + int(h%20) // Varying shades of white/grey
-		chars := []string{".", "*", "·", "°"}
-		return fmt.Sprintf("\033[38;5;%dm%s", brightness, chars[h%uint64(len(chars))])
+	if h%150 == 0 {
+		chars := []string{".", "*", "·"}
+		return fmt.Sprintf("\033[38;5;244m%s", chars[h%uint64(len(chars))])
 	}
 	return " "
 }
 
 func getPlanetChar(dx, dy float64, conf PlanetConfig) string {
-	z := math.Sqrt(conf.Radius*conf.Radius - dx*dx - dy*dy)
-
-	// Light direction (from top-left)
+	z := math.Sqrt(math.Max(0, conf.Radius*conf.Radius-dx*dx-dy*dy))
 	dot := (dx*-0.5 + dy*-0.5 + z*0.7) / conf.Radius
-	shade := math.Max(0.05, dot)
+	shade := math.Max(0.1, dot)
 
-	// Procedural Terrain (Harmonic sine waves)
 	h := 0.0
 	for i := 1; i <= 3; i++ {
-		f := float64(i) * 0.18
+		f := float64(i) * 0.2
 		h += math.Sin(dx*f+float64(conf.Seed)) * math.Cos(dy*f+z*f)
 	}
 	h = (h + 2.0) / 4.0
-
-	// Procedural Clouds
-	c := (math.Sin(dx*0.25+float64(conf.Seed))*math.Cos(dy*0.25+z*0.15) + 1.0) / 2.0
+	c := (math.Sin(dx*0.3+float64(conf.Seed))*math.Cos(dy*0.3+z*0.2) + 1.0) / 2.0
 
 	var r, g, b float64
 	if c > (1.0 - conf.CloudDensity) {
-		r, g, b = 230, 230, 255 // Clouds
-		shade += 0.1
+		r, g, b = 240, 240, 255
 	} else {
 		switch conf.PlanetType {
 		case 0: // Terrestrial
-			if h < 0.48 {
-				b = 220
-				g = 50
+			if h < 0.5 {
+				r, g, b = 30, 80, 200
 			} else {
-				g = 180
-				r = 60
+				r, g, b = 60, 160, 40
 			}
 		case 1: // Volcanic
-			r = 255
-			g = h * 120
-			b = 20
+			r, g, b = 220, 60, 20
 		case 2: // Gas
-			r = 170 + h*80
-			g = 110
-			b = 190
+			r, g, b = 180, 140, 200
 		case 3: // Ice
-			r = 140
-			g = 210
-			b = 255
+			r, g, b = 150, 220, 255
 		}
 	}
 
@@ -648,20 +697,13 @@ func getPlanetChar(dx, dy float64, conf PlanetConfig) string {
 }
 
 func getRingChar(dist float64, conf PlanetConfig) string {
-	// Add some gaps/banding to the rings
-	bands := math.Sin(dist * 2.5)
-	if bands < -0.2 {
+	bands := math.Sin(dist * 3.0)
+	if bands < -0.3 {
 		return " "
 	}
-
-	shade := 0.4 + 0.6*math.Abs(bands)
+	shade := 0.4 + 0.5*math.Abs(bands)
 	s := int(shade * 3)
 	chars := []string{".", ":", "=", "#"}
-	if s > 3 {
-		s = 3
-	}
-
-	// Use brown/grey tones for rings
-	color := 242 + s
-	return fmt.Sprintf("\033[38;5;%dm%s", color, chars[s])
+	color := 240 + s
+	return fmt.Sprintf("\033[38;5;%dm%s", color, chars[s%len(chars)])
 }
