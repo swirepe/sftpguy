@@ -5,14 +5,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"io/fs"
 	"log"
-	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -443,9 +441,6 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 	if !hasUploaded(hash) {
 		fmt.Fprint(w, boldAscii("Reminder:", "You must upload a file before you can download a file."))
 	} else if stats.TotalBytes > 1024 {
-		planetName := NewPlanetName(hash + fmt.Sprintf("%d", stats.TotalBytes))
-		planet := GeneratePlanet(planetName)
-		fmt.Fprintf(w, "\r\n%s\r\n", planet)
 		fmt.Fprint(w, boldAscii("Thank you for contributing, "+displayName, "\r\nHere is your fortune:\r\n"))
 		fortune := getRandomFortune()
 		fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", fortune) // Italicized yellow text
@@ -569,179 +564,4 @@ func newSftpFile(name string, info os.FileInfo, ownerHash string) *sftpFile {
 		isDir:   info.IsDir(),
 		owner:   owner,
 	}
-}
-
-// --- Procedural Generation Engine ---
-
-type PlanetConfig struct {
-	Radius       float64
-	HasRings     bool
-	RingInner    float64
-	RingOuter    float64
-	RingTilt     float64
-	CloudDensity float64
-	PlanetType   int
-	Seed         int64
-}
-
-type PlanetNameGenerator struct {
-	Prefixes []string
-	Infixes  []string
-	Suffixes []string
-	Post     []string
-}
-
-func NewPlanetName(input string) string {
-	gen := &PlanetNameGenerator{
-		Prefixes: []string{"Ae", "Bar", "Cor", "Dax", "Exo", "Faer", "Glis", "Hel", "Ira", "Kael", "Lyr", "Mora", "Nix", "Oph", "Pyr", "Qir", "Rhun", "Sol", "Tra", "Ulu", "Vex", "Xen", "Yul", "Zor"},
-		Infixes:  []string{"an", "bel", "cor", "den", "en", "fos", "gan", "hal", "ion", "jar", "kyn", "lan", "mox", "nor", "on", "phi", "quon", "ren", "syl", "tur", "vun", "wen", "xin", "yos", "zen"},
-		Suffixes: []string{"ia", "os", "on", "us", "is", "a", "eon", "ath", "ar", "og", "un", "ara", "o", "u", "i", "en", "eth"},
-		Post:     []string{"Prime", "IV", "VI", "Major", "Minor", "Beta", "Gamma", "X", "Station", "Alpha", "Rise", "Reach"},
-	}
-	return gen.Generate(input)
-}
-
-func (pg *PlanetNameGenerator) Generate(input string) string {
-	h := fnv.New64a()
-	h.Write([]byte(strings.ToLower(strings.TrimSpace(input))))
-	seed := h.Sum64()
-	r := rand.New(rand.NewSource(int64(seed)))
-
-	syllables := r.Intn(2) + 2
-	var name strings.Builder
-	name.WriteString(pg.Prefixes[r.Intn(len(pg.Prefixes))])
-
-	if syllables == 3 {
-		name.WriteString(pg.Infixes[r.Intn(len(pg.Infixes))])
-	}
-	name.WriteString(pg.Suffixes[r.Intn(len(pg.Suffixes))])
-
-	if r.Float32() > 0.8 {
-		name.WriteString(" ")
-		name.WriteString(pg.Post[r.Intn(len(pg.Post))])
-	}
-	return name.String()
-}
-
-func GeneratePlanet(input string) string {
-	const (
-		width  = 80
-		height = 34
-		aspect = 0.45
-	)
-
-	hash := sha256.Sum256([]byte(input))
-	seed := int64(binary.BigEndian.Uint64(hash[:8]))
-	rng := rand.New(rand.NewSource(seed))
-
-	conf := PlanetConfig{
-		Seed:         seed,
-		Radius:       rng.Float64()*6 + 6,
-		HasRings:     rng.Float64() > 0.6,
-		CloudDensity: rng.Float64()*0.3 + 0.3,
-		PlanetType:   rng.Intn(4),
-	}
-	conf.RingInner = conf.Radius * (1.3 + rng.Float64()*0.2)
-	conf.RingOuter = conf.RingInner * (1.4 + rng.Float64()*0.5)
-	conf.RingTilt = (rng.Float64() - 0.5) * 0.8
-
-	var out strings.Builder
-	centerX, centerY := float64(width)/2, float64(height)/2
-
-	for y := 0; y < height; y++ {
-		fy := float64(y)
-		for x := 0; x < width; x++ {
-			fx := float64(x)
-			dx := (fx - centerX) * aspect
-			dy := fy - centerY
-
-			sinTilt := math.Sin(math.Abs(conf.RingTilt) + 0.1)
-			ty := dy / sinTilt
-			ringDist := math.Sqrt(dx*dx + ty*ty)
-			ringIsFront := (dy * conf.RingTilt) > 0
-
-			distSq := dx*dx + dy*dy
-			planetRadiusSq := conf.Radius * conf.Radius
-			isRing := conf.HasRings && ringDist > conf.RingInner && ringDist < conf.RingOuter
-
-			if distSq < planetRadiusSq {
-				if isRing && ringIsFront {
-					out.WriteString(getRingChar(ringDist, conf))
-				} else {
-					out.WriteString(getPlanetChar(dx, dy, conf))
-				}
-			} else if isRing {
-				out.WriteString(getRingChar(ringDist, conf))
-			} else {
-				out.WriteString(getStarChar(x, y, seed))
-			}
-		}
-		out.WriteString("\033[0m\n")
-	}
-
-	types := []string{"Terrestrial", "Volcanic", "Gas Giant", "Ice Giant"}
-	out.WriteString(fmt.Sprintf("\n\033[1mSector:\033[0m %s | \033[1mClass:\033[0m %s | \033[1mRadius:\033[0m %.1f\n",
-		input, types[conf.PlanetType], conf.Radius))
-
-	return out.String()
-}
-
-func getStarChar(x, y int, seed int64) string {
-	h := uint64(seed) ^ (uint64(x) * 0x45d9f3b) ^ (uint64(y) * 0x119de1f3)
-	h = ((h >> 16) ^ h) * 0x45d9f3b
-	if h%150 == 0 {
-		chars := []string{".", "*", "·"}
-		return fmt.Sprintf("\033[38;5;244m%s", chars[h%uint64(len(chars))])
-	}
-	return " "
-}
-
-func getPlanetChar(dx, dy float64, conf PlanetConfig) string {
-	z := math.Sqrt(math.Max(0, conf.Radius*conf.Radius-dx*dx-dy*dy))
-	dot := (dx*-0.5 + dy*-0.5 + z*0.7) / conf.Radius
-	shade := math.Max(0.1, dot)
-
-	h := 0.0
-	for i := 1; i <= 3; i++ {
-		f := float64(i) * 0.2
-		h += math.Sin(dx*f+float64(conf.Seed)) * math.Cos(dy*f+z*f)
-	}
-	h = (h + 2.0) / 4.0
-	c := (math.Sin(dx*0.3+float64(conf.Seed))*math.Cos(dy*0.3+z*0.2) + 1.0) / 2.0
-
-	var r, g, b float64
-	if c > (1.0 - conf.CloudDensity) {
-		r, g, b = 240, 240, 255
-	} else {
-		switch conf.PlanetType {
-		case 0: // Terrestrial
-			if h < 0.5 {
-				r, g, b = 30, 80, 200
-			} else {
-				r, g, b = 60, 160, 40
-			}
-		case 1: // Volcanic
-			r, g, b = 220, 60, 20
-		case 2: // Gas
-			r, g, b = 180, 140, 200
-		case 3: // Ice
-			r, g, b = 150, 220, 255
-		}
-	}
-
-	r, g, b = r*shade, g*shade, b*shade
-	ansi := 16 + int(r/255*5)*36 + int(g/255*5)*6 + int(b/255*5)
-	return fmt.Sprintf("\033[38;5;%dm@", ansi)
-}
-
-func getRingChar(dist float64, conf PlanetConfig) string {
-	bands := math.Sin(dist * 3.0)
-	if bands < -0.3 {
-		return " "
-	}
-	shade := 0.4 + 0.5*math.Abs(bands)
-	s := int(shade * 3)
-	chars := []string{".", ":", "=", "#"}
-	color := 240 + s
-	return fmt.Sprintf("\033[38;5;%dm%s", color, chars[s%len(chars)])
 }
