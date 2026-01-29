@@ -41,6 +41,10 @@ import (
   11. Ownership enforced on directories and files.
   12. Fully configurable via flags.
   13. Resumable uploads supported via O_RDWR in Filewrite.
+
+  Fortunes from:
+  	 https://github.com/JKirchartz/fortunes/tree/master
+	 https://github.com/ruanyf/fortunes
 */
 
 //go:embed main.go
@@ -442,7 +446,9 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 		planetName := NewPlanetName(hash + fmt.Sprintf("%d", stats.TotalBytes))
 		planet := GeneratePlanet(planetName)
 		fmt.Fprintf(w, "\r\n%s\r\n", planet)
-		fmt.Fprint(w, boldAscii("Thank you for contributing, "+displayName, "Look at this cool planet."))
+		fmt.Fprint(w, boldAscii("Thank you for contributing, "+displayName, "\r\nHere is your fortune:\r\n"))
+		fortune := getRandomFortune()
+		fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", fortune) // Italicized yellow text
 	} else {
 		fmt.Fprint(w, boldAscii("Welcome back, "+displayName, "You may now download any file."))
 	}
@@ -450,6 +456,38 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 
 func boldAscii(header string, body string) string {
 	return fmt.Sprintf("\r\n\033[1m%s\033[0m %s\r\n", header, body)
+}
+
+func getRandomFortune() string {
+	data, err := embeddedSource.ReadFile("fortunes.txt")
+	if err != nil {
+		return "Your future is yet to be written."
+	}
+
+	// Split by traditional fortune delimiter (%) or by newline
+	var fortunes []string
+	content := string(data)
+	if strings.Contains(content, "\n%\n") {
+		fortunes = strings.Split(content, "\n%\n")
+	} else {
+		fortunes = strings.Split(content, "\n")
+	}
+
+	// Filter out empty entries
+	var valid []string
+	for _, f := range fortunes {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			valid = append(valid, f)
+		}
+	}
+
+	if len(valid) == 0 {
+		return "A path of a thousand miles begins with a single upload."
+	}
+
+	// Use the global rand (already used in your planet generator)
+	return valid[rand.Intn(len(valid))]
 }
 
 type statWriter struct {
