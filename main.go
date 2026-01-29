@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
-    owner_hash TEXT
+    owner_hash TEXT,
+    size INTEGER DEFAULT 0
 );`
 
 var (
@@ -100,13 +101,15 @@ func main() {
 		logger.Fatalf("Failed to initialize schema: %v", err)
 	}
 
-	// Initialize Rate Limiter
-	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
-
 	// Ensure upload directory exists
 	if err := os.MkdirAll(*uploadDir, 0755); err != nil {
 		logger.Fatalf("Failed to create upload directory: %v", err)
 	}
+
+	reconcileOrphans()
+
+	// Initialize Rate Limiter
+	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
 
 	// SSH Server Configuration
 	config := &ssh.ServerConfig{
@@ -140,6 +143,76 @@ func main() {
 		}
 		go handleConn(conn, config)
 	}
+}
+
+func reconcileOrphans() {
+	dummyNames := []string{"archivist", "pioneer", "collector", "jessica", "legacy", "trogdor", "orphaneer", "hoarder"}
+	var dummies []string
+	for _, name := range dummyNames {
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte("dummy-key-"+name)))
+		dummies = append(dummies, hash)
+
+		db.Exec("INSERT OR IGNORE INTO users (pubkey_hash, last_login, upload_count, total_bytes) VALUES (?, '2020-01-01 00:00:00', 0, 0)", hash)
+	}
+
+	logger.Println("Scanning for orphaned files in upload directory...")
+
+	err := filepath.WalkDir(*uploadDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			logger.Printf("Error walking path %s: %v", path, err)
+			return err
+		}
+
+		if path == *uploadDir {
+			return nil
+		}
+
+		// Get the relative path (the format used in the DB)
+		rel, err := filepath.Rel(*uploadDir, path)
+		if err != nil {
+			logger.Printf("Error getting relative path for %s: %v", path, err)
+			return nil
+		}
+		rel = filepath.ToSlash(rel) // Normalize separators for DB consistency
+
+		var owner string
+		err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		if err == sql.ErrNoRows {
+			chosenDummy := dummies[rand.Intn(len(dummies))]
+
+			info, err := d.Info()
+			if err != nil {
+				logger.Printf("Error getting file info for %s: %v", rel, err)
+				return nil
+			}
+			size := info.Size()
+
+			_, err = db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, ?)", rel, chosenDummy, size)
+			if err == nil {
+				db.Exec("UPDATE users SET upload_count = upload_count + 1, total_bytes = total_bytes + ? WHERE pubkey_hash = ?", size, chosenDummy)
+				logger.Printf("Reconciled orphan: %s -> assigned to %s", rel, dummyNames[dummiesToIdx(chosenDummy, dummies)])
+			} else {
+				logger.Printf("Error inserting orphan %s: %v", rel, err)
+			}
+		} else if err != nil {
+			logger.Printf("Error querying owner for %s: %v", rel, err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		logger.Printf("Error during orphan reconciliation: %v", err)
+	}
+}
+
+// Helper for logging which name was used
+func dummiesToIdx(hash string, list []string) int {
+	for i, v := range list {
+		if v == hash {
+			return i
+		}
+	}
+	return 0
 }
 
 func handleConn(nConn net.Conn, config *ssh.ServerConfig) {
@@ -208,6 +281,8 @@ func (f *fsHandler) secure(p string) (rel string, full string) {
 	rel = strings.TrimPrefix(cleanPath, "/")
 	// Re-verify that joining doesn't escape the uploadDir
 	full = filepath.Join(*uploadDir, rel)
+	// Normalize to forward slashes for database consistency
+	rel = filepath.ToSlash(rel)
 	return rel, full
 }
 
@@ -215,7 +290,11 @@ func (f *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	relPath, fullPath := f.secure(r.Filepath)
 
 	if relPath == "README.txt" {
-		data, _ := embeddedSource.ReadFile("main.go")
+		data, err := embeddedSource.ReadFile("main.go")
+		if err != nil {
+			logger.Printf("Error reading embedded source: %v", err)
+			return nil, err
+		}
 		return bytes.NewReader(data), nil
 	}
 
@@ -240,32 +319,67 @@ func (f *fsHandler) permissionDenied(msg string) error {
 func (f *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := f.secure(r.Filepath)
 
-	// Check ownership
-	var owner string
-	err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-	if err != nil && err != sql.ErrNoRows {
+	// Ensure parent directory exists
+	parentDir := filepath.Dir(full)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		logger.Printf("Error creating parent directory %s: %v", parentDir, err)
 		return nil, err
 	}
 
-	if owner != "" && owner != f.pubHash {
+	// Use a transaction to atomically check and claim ownership
+	tx, err := db.Begin()
+	if err != nil {
+		logger.Printf("Error beginning transaction: %v", err)
+		return nil, err
+	}
+
+	var owner string
+	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+
+	if err == sql.ErrNoRows {
+		// File doesn't exist - claim ownership
+		_, err = tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, f.pubHash)
+		if err != nil {
+			tx.Rollback()
+			logger.Printf("Error inserting file ownership for %s: %v", rel, err)
+			return nil, err
+		}
+		_, err = tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
+		if err != nil {
+			tx.Rollback()
+			logger.Printf("Error updating upload count: %v", err)
+			return nil, err
+		}
+	} else if err != nil {
+		tx.Rollback()
+		logger.Printf("Error checking ownership for %s: %v", rel, err)
+		return nil, err
+	} else if owner != f.pubHash {
+		// File exists and owned by someone else
+		tx.Rollback()
 		return nil, f.permissionDenied("This file is owned by another user.")
+	}
+
+	if err := tx.Commit(); err != nil {
+		logger.Printf("Error committing transaction: %v", err)
+		return nil, err
+	}
+
+	// Get current file size before opening for writing
+	var oldSize int64
+	fileInfo, err := os.Stat(full)
+	if err == nil {
+		oldSize = fileInfo.Size()
 	}
 
 	// Prepare file for writing (supports resume)
 	file, err := os.OpenFile(full, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
+		logger.Printf("Error opening file %s for writing: %v", full, err)
 		return nil, err
 	}
 
-	// If new file, record ownership
-	if owner == "" {
-		_, err = db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
-		if err == nil {
-			db.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", f.pubHash)
-		}
-	}
-
-	return &statWriter{file, f.pubHash}, nil
+	return &statWriter{file, f.pubHash, rel, oldSize}, nil
 }
 
 func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
@@ -281,22 +395,37 @@ func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		res := make([]os.FileInfo, 0)
 		// Virtual README in root
 		if rel == "." {
-			data, _ := embeddedSource.ReadFile("main.go")
-			res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"})
+			data, err := embeddedSource.ReadFile("main.go")
+			if err != nil {
+				logger.Printf("Error reading embedded source for README: %v", err)
+			} else {
+				res = append(res, &sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"})
+			}
 		}
 
 		for _, item := range items {
-			info, _ := item.Info()
+			info, err := item.Info()
+			if err != nil {
+				logger.Printf("Error getting file info for %s: %v", item.Name(), err)
+				continue
+			}
 			var owner string
-			childPath := filepath.Join(rel, info.Name())
-			db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", childPath).Scan(&owner)
+			childPath := filepath.ToSlash(filepath.Join(rel, info.Name()))
+			err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", childPath).Scan(&owner)
+			if err != nil && err != sql.ErrNoRows {
+				logger.Printf("Error querying owner for %s: %v", childPath, err)
+			}
 			res = append(res, newSftpFile(info.Name(), info, owner))
 		}
 		return listerAt(res), nil
 
 	case "Stat", "Lstat":
 		if rel == "README.txt" {
-			data, _ := embeddedSource.ReadFile("main.go")
+			data, err := embeddedSource.ReadFile("main.go")
+			if err != nil {
+				logger.Printf("Error reading embedded source for README stat: %v", err)
+				return nil, err
+			}
 			return listerAt{&sftpFile{"README.txt", int64(len(data)), 0444, time.Now(), false, "system"}}, nil
 		}
 
@@ -305,7 +434,10 @@ func (f *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 			return nil, err
 		}
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Printf("Error querying owner for %s: %v", rel, err)
+		}
 		return listerAt{newSftpFile(info.Name(), info, owner)}, nil
 	}
 	return nil, sftp.ErrSshFxOpUnsupported
@@ -322,20 +454,47 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 		if err := os.MkdirAll(full, 0755); err != nil {
 			return err
 		}
-		db.Exec("INSERT OR IGNORE INTO files (path, owner_hash) VALUES (?, ?)", rel, f.pubHash)
+		_, err := db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, f.pubHash)
+		if err != nil {
+			logger.Printf("Error recording directory ownership for %s: %v", rel, err)
+		}
 		logger.Printf("User %s created directory: %s", f.pubHash[:12], rel)
 		return nil
 
 	case "Remove":
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Printf("Error checking ownership for removal of %s: %v", rel, err)
+			return err
+		}
 		if owner != "" && owner != f.pubHash {
 			return f.permissionDenied("You can only delete files or directories you created.")
 		}
+
+		// Check if it's a directory and get all nested paths
+		info, err := os.Stat(full)
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			// Delete all nested files from database
+			_, err = db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
+			if err != nil {
+				logger.Printf("Error deleting nested files from database for %s: %v", rel, err)
+			}
+		} else {
+			// Just delete the single file entry
+			_, err = db.Exec("DELETE FROM files WHERE path = ?", rel)
+			if err != nil {
+				logger.Printf("Error deleting file from database %s: %v", rel, err)
+			}
+		}
+
 		if err := os.RemoveAll(full); err != nil {
 			return err
 		}
-		db.Exec("DELETE FROM files WHERE path = ?", rel)
 		logger.Printf("User %s removed: %s", f.pubHash[:12], rel)
 		return nil
 
@@ -344,42 +503,133 @@ func (f *fsHandler) Filecmd(r *sftp.Request) error {
 
 		// Check source ownership
 		var sourceOwner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sourceOwner)
+		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sourceOwner)
+		if err == sql.ErrNoRows {
+			return f.permissionDenied("Source file does not exist.")
+		}
+		if err != nil {
+			logger.Printf("Error checking source ownership for rename: %v", err)
+			return err
+		}
 		if sourceOwner != f.pubHash {
 			return f.permissionDenied("You do not own the source file.")
 		}
 
 		// Check target ownership if it exists
 		var targetOwner string
-		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTarget).Scan(&targetOwner)
+		err = db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTarget).Scan(&targetOwner)
 		if err == nil && targetOwner != "" && targetOwner != f.pubHash {
 			return f.permissionDenied("The destination already exists and is owned by another user.")
+		}
+
+		// Check if source is a directory
+		info, err := os.Stat(full)
+		if err != nil {
+			return err
+		}
+
+		// Perform filesystem rename first
+		if err := os.Rename(full, fullTarget); err != nil {
+			return err
 		}
 
 		// Transactional database update
 		tx, err := db.Begin()
 		if err != nil {
-			return err
-		}
-		tx.Exec("DELETE FROM files WHERE path = ?", relTarget)
-		tx.Exec("UPDATE files SET path = ? WHERE path = ?", relTarget, rel)
-		if err := tx.Commit(); err != nil {
+			// Try to rollback filesystem change
+			os.Rename(fullTarget, full)
+			logger.Printf("Error beginning transaction for rename: %v", err)
 			return err
 		}
 
-		if err := os.Rename(full, fullTarget); err != nil {
+		// Delete target if it exists
+		_, err = tx.Exec("DELETE FROM files WHERE path = ?", relTarget)
+		if err != nil {
+			tx.Rollback()
+			os.Rename(fullTarget, full)
+			logger.Printf("Error deleting target in rename: %v", err)
 			return err
 		}
+
+		if info.IsDir() {
+			// Update all nested paths for directories
+			// First, get all paths that start with the old directory path
+			rows, err := tx.Query("SELECT path FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
+			if err != nil {
+				tx.Rollback()
+				os.Rename(fullTarget, full)
+				logger.Printf("Error querying nested paths for rename: %v", err)
+				return err
+			}
+
+			var pathsToUpdate []string
+			for rows.Next() {
+				var oldPath string
+				if err := rows.Scan(&oldPath); err != nil {
+					rows.Close()
+					tx.Rollback()
+					os.Rename(fullTarget, full)
+					logger.Printf("Error scanning path for rename: %v", err)
+					return err
+				}
+				pathsToUpdate = append(pathsToUpdate, oldPath)
+			}
+			rows.Close()
+
+			// Update each path
+			for _, oldPath := range pathsToUpdate {
+				var newPath string
+				if oldPath == rel {
+					newPath = relTarget
+				} else {
+					// Replace the prefix
+					newPath = relTarget + strings.TrimPrefix(oldPath, rel)
+				}
+				_, err = tx.Exec("UPDATE files SET path = ? WHERE path = ?", newPath, oldPath)
+				if err != nil {
+					tx.Rollback()
+					os.Rename(fullTarget, full)
+					logger.Printf("Error updating path %s to %s: %v", oldPath, newPath, err)
+					return err
+				}
+			}
+		} else {
+			// Just update the single file
+			_, err = tx.Exec("UPDATE files SET path = ? WHERE path = ?", relTarget, rel)
+			if err != nil {
+				tx.Rollback()
+				os.Rename(fullTarget, full)
+				logger.Printf("Error updating file path in rename: %v", err)
+				return err
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			os.Rename(fullTarget, full)
+			logger.Printf("Error committing rename transaction: %v", err)
+			return err
+		}
+
 		logger.Printf("User %s renamed %s to %s", f.pubHash[:12], rel, relTarget)
 		return nil
 
 	case "Rmdir":
 		var owner string
-		db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		err := db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Printf("Error checking ownership for rmdir of %s: %v", rel, err)
+			return err
+		}
 		if owner != "" && owner != f.pubHash {
 			return f.permissionDenied("You do not own this directory.")
 		}
-		db.Exec("DELETE FROM files WHERE path = ?", rel)
+
+		// Delete from database including nested files
+		_, err = db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
+		if err != nil {
+			logger.Printf("Error deleting directory from database %s: %v", rel, err)
+		}
+
 		return os.Remove(full)
 	}
 	return sftp.ErrSshFxOpUnsupported
@@ -400,18 +650,30 @@ func updateLoginStats(hash string) userStats {
 	err := db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&stats.LastLogin, &stats.TotalBytes, &stats.FilesUploadedCount)
 
 	if err == sql.ErrNoRows {
-		db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes, upload_count) VALUES (?, ?, 0, 0)", hash, now)
+		_, err = db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes, upload_count) VALUES (?, ?, 0, 0)", hash, now)
+		if err != nil {
+			logger.Printf("Error inserting new user: %v", err)
+		}
 		stats.LastLogin = "First Login"
 		stats.IsFirstLogin = true
+	} else if err != nil {
+		logger.Printf("Error querying user stats: %v", err)
 	} else {
-		db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
+		_, err = db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
+		if err != nil {
+			logger.Printf("Error updating last login: %v", err)
+		}
 	}
 	return stats
 }
 
 func hasUploaded(hash string) bool {
 	var count int
-	db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&count)
+	err := db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&count)
+	if err != nil {
+		logger.Printf("Error checking upload count for %s: %v", hash[:12], err)
+		return false
+	}
 	return count > 0
 }
 
@@ -420,6 +682,9 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 	if err == nil {
 		fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
 	} else {
+		if !os.IsNotExist(err) {
+			logger.Printf("Error reading banner file: %v", err)
+		}
 		fmt.Fprint(w, "\r\n\033[1;34m=== Anonymous SFTP Storage ===\033[0m\r\n")
 	}
 
@@ -456,6 +721,7 @@ func boldAscii(header string, body string) string {
 func getRandomFortune() string {
 	data, err := embeddedSource.ReadFile("fortunes.txt")
 	if err != nil {
+		logger.Printf("Error reading fortunes file: %v", err)
 		return "Your future is yet to be written."
 	}
 
@@ -488,18 +754,41 @@ func getRandomFortune() string {
 type statWriter struct {
 	*os.File
 	pubHash string
+	relPath string
+	oldSize int64
 }
 
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	n, err := sw.File.WriteAt(p, off)
-	if n > 0 {
-		// Update byte count in DB
-		_, dbErr := db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", n, sw.pubHash)
-		if dbErr != nil {
-			logger.Printf("Error updating bytes for %s: %v", sw.pubHash[:12], dbErr)
+	return n, err
+}
+
+func (sw *statWriter) Close() error {
+	// On close, recalculate the actual file size and update database
+	fileInfo, err := sw.File.Stat()
+	if err != nil {
+		logger.Printf("Error getting file info on close: %v", err)
+		return sw.File.Close()
+	}
+
+	newSize := fileInfo.Size()
+	sizeDelta := newSize - sw.oldSize
+
+	// Update the file size in the files table
+	_, err = db.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, sw.relPath)
+	if err != nil {
+		logger.Printf("Error updating file size for %s: %v", sw.relPath, err)
+	}
+
+	// Update user's total bytes (only add the delta, not the full size)
+	if sizeDelta != 0 {
+		_, err = db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", sizeDelta, sw.pubHash)
+		if err != nil {
+			logger.Printf("Error updating bytes for %s: %v", sw.pubHash[:12], err)
 		}
 	}
-	return n, err
+
+	return sw.File.Close()
 }
 
 type listerAt []os.FileInfo
