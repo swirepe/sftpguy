@@ -49,6 +49,9 @@ import (
 //go:embed fortunes.txt
 var embeddedSource embed.FS
 
+const version = "1.0.0"
+const applicationName = "curioarium-sftp"
+
 // Configuration
 var (
 	port        = flag.Int("port", 2222, "SSH port")
@@ -58,6 +61,8 @@ var (
 	uploadDir   = flag.String("dir", "./uploads", "Directory to store uploads")
 	bannerFile  = flag.String("banner", "BANNER.txt", "Path to banner file")
 	mkdirLimit  = flag.Float64("rate", 10.0, "Global mkdir rate limit (folders/sec)")
+	showVersion = flag.Bool("version", false, "Show version information")
+	showHelp    = flag.Bool("help", false, "Show help information")
 )
 
 const schema = `
@@ -82,12 +87,22 @@ var (
 func main() {
 	flag.Parse()
 
+	if *showVersion {
+		Version()
+		os.Exit(0)
+	}
+
+	if *showHelp {
+		Help()
+		os.Exit(0)
+	}
+
 	// Initialize Logger
 	f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
-	logger = log.New(io.MultiWriter(os.Stdout, f), "[SFTP] ", log.LstdFlags)
+	logger = log.New(io.MultiWriter(os.Stdout, f), fmt.Sprintf("[%s] ", applicationName), log.LstdFlags)
 
 	// Initialize Database
 	var dbErr error
@@ -101,17 +116,18 @@ func main() {
 		logger.Fatalf("Failed to initialize schema: %v", err)
 	}
 
-	// Ensure upload directory exists
 	if err := os.MkdirAll(*uploadDir, 0755); err != nil {
 		logger.Fatalf("Failed to create upload directory: %v", err)
 	}
 
 	reconcileOrphans()
 
-	// Initialize Rate Limiter
 	mkdirLimiter = rate.NewLimiter(rate.Limit(*mkdirLimit), 1)
 
-	// SSH Server Configuration
+	startServer()
+}
+
+func startServer() {
 	config := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
@@ -143,6 +159,38 @@ func main() {
 		}
 		go handleConn(conn, config)
 	}
+}
+
+func Help() {
+	fmt.Println("%s - A share-first SFTP server", applicationName)
+	fmt.Printf("Version: %s\n\n", version)
+	fmt.Println("DESCRIPTION:")
+	fmt.Println("  This SFTP server implements a 'share first' model where users must upload")
+	fmt.Println("  at least one file before they can download content from others. Users are")
+	fmt.Println("  identified by their SSH public key hash and have ownership over their files.")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Printf("  %s [options]\n\n", os.Args[0])
+	fmt.Println("OPTIONS:")
+	flag.PrintDefaults()
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  # Start server on default port 2222")
+	fmt.Printf("  %s\n\n", os.Args[0])
+	fmt.Println("  # Start server on custom port with custom upload directory")
+	fmt.Printf("  %s -port 2223 -dir /var/sftp/uploads\n\n", os.Args[0])
+	fmt.Println("  # Generate host key (required on first run)")
+	fmt.Println("  ssh-keygen -f id_rsa -t rsa -N ''")
+	fmt.Println()
+	fmt.Println("CLIENT CONNECTION:")
+	fmt.Println("  sftp -P 2222 user@localhost")
+	fmt.Println("  (any username works - authentication is by public key only)")
+	fmt.Println()
+}
+
+func Version() {
+	fmt.Printf("%s v%s\n", applicationName, version)
+	fmt.Println("A share-first SFTP server with public key authentication")
 }
 
 func reconcileOrphans() {
@@ -685,7 +733,7 @@ func sendBanner(w io.Writer, hash string, stats userStats) {
 		if !os.IsNotExist(err) {
 			logger.Printf("Error reading banner file: %v", err)
 		}
-		fmt.Fprint(w, "\r\n\033[1;34m=== Anonymous SFTP Storage ===\033[0m\r\n")
+		fmt.Fprintf(w, "\r\n\033[1;34m=== %s - Anonymous SFTP Storage ===\033[0m\r\n", applicationName)
 	}
 
 	displayName := fmt.Sprintf("anonymous-%d", ownerHashToUid(hash))
