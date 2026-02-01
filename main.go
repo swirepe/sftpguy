@@ -57,6 +57,7 @@ type Config struct {
 	BannerFile    string
 	MkdirRate     float64
 	IncludeSource bool
+	Verbose       bool // New Field
 }
 
 func LoadConfig() Config {
@@ -69,6 +70,7 @@ func LoadConfig() Config {
 	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
 	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
 	flag.Float64Var(&cfg.MkdirRate, "rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit")
+	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging") // New Flag
 
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
@@ -83,7 +85,6 @@ func LoadConfig() Config {
 		srcCode, _ := embeddedSource.ReadFile("main.go")
 		fmt.Printf("%s", srcCode)
 		os.Exit(0)
-
 	}
 	return cfg
 }
@@ -101,13 +102,36 @@ type Server struct {
 func main() {
 	cfg := LoadConfig()
 
-	// Logger setup
+	// Logger setup with level control
 	logWriter := io.MultiWriter(os.Stdout)
 	if f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 		logWriter = io.MultiWriter(os.Stdout, f)
 	}
-	logger := slog.New(slog.NewTextHandler(logWriter, nil))
 
+	logLevel := slog.LevelInfo
+	if cfg.Verbose {
+		logLevel = slog.LevelDebug
+
+	}
+
+	handler := slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel})
+
+	logger := slog.New(handler).With(
+		"app", cfg.Name,
+		"version", AppVersion,
+	)
+
+	logger.Debug("server configuration",
+		slog.Group("config",
+			"port", cfg.Port,
+			"db_path", cfg.DBPath,
+			"upload_dir", cfg.UploadDir,
+			"host_key", cfg.HostKeyFile,
+			"mkdir_rate", cfg.MkdirRate,
+			"log_file", cfg.LogFile,
+			"banner_file", cfg.BannerFile,
+		),
+	)
 	// Database setup
 	db, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
@@ -156,7 +180,7 @@ func (s *Server) Listen() {
 		s.logger.Error("failed to listen", "err", err)
 		os.Exit(1)
 	}
-	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir)
+	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir, "verbose", s.cfg.Verbose)
 
 	for {
 		conn, err := listener.Accept()
@@ -170,6 +194,7 @@ func (s *Server) Listen() {
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
+		s.logger.Debug("ssh handshake failed", "err", err)
 		return
 	}
 	defer sConn.Close()
@@ -217,28 +242,27 @@ type fsHandler struct {
 }
 
 func (h *fsHandler) securePath(p string) (rel string, full string) {
-	// Virtual cleanup
 	virt := path.Clean("/" + p)
 	rel = strings.TrimPrefix(virt, "/")
 	if rel == "" {
 		rel = "."
 	}
-	// Physical mapping
 	full = filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+	h.srv.logger.Debug("path resolution", "input", p, "rel", rel, "full", full)
 	return rel, full
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.securePath(r.Filepath)
+	h.srv.logger.Debug("fileread request", "path", rel, "user", h.pubHash[:12])
 
-	// Virtual files
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
 		return bytes.NewReader(data), nil
 	}
 
-	// Share-first policy
 	if !h.hasUploaded() {
+		h.srv.logger.Debug("fileread denied: share-first policy", "user", h.pubHash[:12])
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
@@ -247,6 +271,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := h.securePath(r.Filepath)
+	h.srv.logger.Debug("filewrite request", "path", rel, "user", h.pubHash[:12])
 
 	if rel == "README.txt" {
 		return nil, h.deny("README.txt is a protected system file.")
@@ -258,11 +283,11 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		var pOwner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
 		if pOwner != "" && pOwner != h.pubHash {
+			h.srv.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", pOwner)
 			return nil, h.deny("Cannot write to another user's directory.")
 		}
 	}
 
-	// Database ownership claim
 	tx, err := h.srv.db.Begin()
 	if err != nil {
 		return nil, err
@@ -272,6 +297,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	var currentOwner string
 	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
 	if err == sql.ErrNoRows {
+		h.srv.logger.Debug("claiming new file ownership", "path", rel, "user", h.pubHash[:12])
 		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
 			return nil, err
 		}
@@ -279,6 +305,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 			return nil, err
 		}
 	} else if currentOwner != h.pubHash {
+		h.srv.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
 		return nil, h.deny("This filename is already claimed.")
 	}
 
@@ -286,7 +313,6 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	// Filesystem prep
 	_ = os.MkdirAll(filepath.Dir(full), 0755)
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
@@ -308,8 +334,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := h.securePath(r.Filepath)
+	h.srv.logger.Debug("filelist request", "method", r.Method, "path", rel)
 
-	// 1. Handle "ls" (Directory Listing)
 	if r.Method == "List" {
 		entries, err := os.ReadDir(full)
 		if err != nil {
@@ -317,7 +343,6 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		}
 		var files []os.FileInfo
 
-		// Inject virtual README into the root directory listing
 		if rel == "." {
 			data, _ := embeddedSource.ReadFile("main.go")
 			files = append(files, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
@@ -332,14 +357,11 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return listerAt(files), nil
 	}
 
-	// 2. Handle "Stat" (File metadata lookup)
-	// Check if the client is asking about the virtual README
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
 		return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
 	}
 
-	// Fallback to physical disk for all other files
 	fi, err := os.Stat(full)
 	if err != nil {
 		return nil, err
@@ -351,9 +373,12 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	rel, full := h.securePath(r.Filepath)
+	h.srv.logger.Debug("filecmd request", "method", r.Method, "path", rel)
+
 	switch r.Method {
 	case "Mkdir":
 		if !h.srv.mkdirLimiter.Allow() {
+			h.srv.logger.Debug("mkdir rate limited", "user", h.pubHash[:12])
 			return h.deny("Rate limit exceeded.")
 		}
 		os.MkdirAll(full, 0755)
@@ -364,6 +389,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		var owner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != "" && owner != h.pubHash {
+			h.srv.logger.Debug("remove denied: not owner", "path", rel, "owner", owner)
 			return h.deny("You can only remove your own files.")
 		}
 		os.RemoveAll(full)
@@ -377,6 +403,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 
 		if sOwner != h.pubHash || (tOwner != "" && tOwner != h.pubHash) {
+			h.srv.logger.Debug("rename denied: permission issue", "src", rel, "srcOwner", sOwner, "tgt", relTgt, "tgtOwner", tOwner)
 			return h.deny("Rename permission denied.")
 		}
 
@@ -404,6 +431,7 @@ func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count)
 	if err == sql.ErrNoRows {
+		s.logger.Debug("registering new user", "hash", hash[:12])
 		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
 		st.FirstTimer = true
 		st.LastLogin = "Never"
@@ -431,6 +459,7 @@ func (s *Server) reconcileOrphans() {
 		s.db.QueryRow("SELECT 1 FROM files WHERE path = ?", rel).Scan(&exists)
 		if !exists {
 			fi, _ := d.Info()
+			s.logger.Debug("found orphan file, assigning to system", "path", rel)
 			s.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, 'system', ?)", rel, fi.Size())
 		}
 		return nil
@@ -472,6 +501,7 @@ func (sw *statWriter) Close() error {
 	fi, _ := sw.File.Stat()
 	newSize := fi.Size()
 	delta := newSize - sw.oldSize
+	sw.h.srv.logger.Debug("closing file write", "path", sw.rel, "newSize", newSize, "delta", delta)
 	sw.h.srv.db.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, sw.rel)
 	sw.h.srv.db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", delta, sw.h.pubHash)
 	return sw.File.Close()
