@@ -14,7 +14,9 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,99 +26,116 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-//go:embed main.go
-//go:embed fortunes.txt
+//go:embed main.go fortunes.txt
 var embeddedSource embed.FS
 
 const (
-	version         = "1.1.1"
-	applicationName = "curioarium-sftp"
+	AppVersion = "1.2.0"
+	Schema     = `
+		CREATE TABLE IF NOT EXISTS users (
+			pubkey_hash TEXT PRIMARY KEY,
+			last_login DATETIME,
+			upload_count INTEGER DEFAULT 0,
+			total_bytes INTEGER DEFAULT 0
+		);
+		CREATE TABLE IF NOT EXISTS files (
+			path TEXT PRIMARY KEY,
+			owner_hash TEXT,
+			size INTEGER DEFAULT 0
+		);`
 )
 
+// --- Configuration ---
+
 type Config struct {
-	Port        int
-	HostKeyFile string
-	DBPath      string
-	LogFile     string
-	UploadDir   string
-	BannerFile  string
-	MkdirRate   float64
+	Name          string
+	Port          int
+	HostKeyFile   string
+	DBPath        string
+	LogFile       string
+	UploadDir     string
+	BannerFile    string
+	MkdirRate     float64
+	IncludeSource bool
 }
+
+func LoadConfig() Config {
+	cfg := Config{}
+	flag.StringVar(&cfg.Name, "name", getEnv("ARCHIVE_NAME", "curioarium-sftp"), "Archive name")
+	flag.IntVar(&cfg.Port, "port", getEnvInt("SFTP_PORT", 2222), "SSH port")
+	flag.StringVar(&cfg.HostKeyFile, "hostkey", getEnv("HOST_KEY", "id_rsa"), "SSH host key")
+	flag.StringVar(&cfg.DBPath, "db", getEnv("DB_PATH", "sftp.db"), "SQLite path")
+	flag.StringVar(&cfg.LogFile, "logfile", getEnv("LOG_FILE", "sftp.log"), "Log file path")
+	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
+	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
+	flag.Float64Var(&cfg.MkdirRate, "rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit")
+
+	src := flag.Bool("src", false, "Show source code")
+	v := flag.Bool("version", false, "Show version")
+	flag.Parse()
+
+	if *v {
+		fmt.Printf("%s v%s\n", cfg.Name, AppVersion)
+		os.Exit(0)
+	}
+
+	if *src {
+		srcCode, _ := embeddedSource.ReadFile("main.go")
+		fmt.Printf("%s", srcCode)
+		os.Exit(0)
+
+	}
+	return cfg
+}
+
+// --- Server Core ---
 
 type Server struct {
 	db           *sql.DB
 	logger       *slog.Logger
 	mkdirLimiter *rate.Limiter
-	config       Config
+	cfg          Config
 	absUploadDir string
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS users (
-    pubkey_hash TEXT PRIMARY KEY,
-    last_login DATETIME,
-    upload_count INTEGER DEFAULT 0,
-    total_bytes INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS files (
-    path TEXT PRIMARY KEY,
-    owner_hash TEXT,
-    size INTEGER DEFAULT 0
-);`
-
 func main() {
-	cfg := Config{}
-	flag.IntVar(&cfg.Port, "port", 2222, "SSH port")
-	flag.StringVar(&cfg.HostKeyFile, "hostkey", "id_rsa", "SSH private host key")
-	flag.StringVar(&cfg.DBPath, "db", "sftp.db", "Path to SQLite database")
-	flag.StringVar(&cfg.LogFile, "logfile", "sftp.log", "Path to log file")
-	flag.StringVar(&cfg.UploadDir, "dir", "./uploads", "Directory to store uploads")
-	flag.StringVar(&cfg.BannerFile, "banner", "BANNER.txt", "Path to banner file")
-	flag.Float64Var(&cfg.MkdirRate, "rate", 10.0, "Global mkdir rate limit")
-	v := flag.Bool("version", false, "Show version")
-	flag.Parse()
+	cfg := LoadConfig()
 
-	if *v {
-		fmt.Printf("%s v%s\n", applicationName, version)
-		return
+	// Logger setup
+	logWriter := io.MultiWriter(os.Stdout)
+	if f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		logWriter = io.MultiWriter(os.Stdout, f)
 	}
+	logger := slog.New(slog.NewTextHandler(logWriter, nil))
 
-	// Logging
-	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		panic(err)
-	}
-	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, f), nil))
-
-	// Database
+	// Database setup
 	db, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
-		logger.Error("database connection failed", "err", err)
+		logger.Error("DB connection failed", "err", err)
 		os.Exit(1)
 	}
 	db.SetMaxOpenConns(1)
-	db.Exec("PRAGMA journal_mode=WAL;")
-	if _, err := db.Exec(schema); err != nil {
-		logger.Error("schema init failed", "err", err)
+	if _, err := db.Exec(Schema); err != nil {
+		logger.Error("Schema init failed", "err", err)
 		os.Exit(1)
 	}
 
 	absDir, _ := filepath.Abs(cfg.UploadDir)
-	os.MkdirAll(absDir, 0755)
+	_ = os.MkdirAll(absDir, 0755)
 
 	srv := &Server{
 		db:           db,
 		logger:       logger,
 		mkdirLimiter: rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1),
-		config:       cfg,
+		cfg:          cfg,
 		absUploadDir: absDir,
 	}
 
 	go srv.reconcileOrphans()
-	srv.start()
+	srv.Listen()
 }
 
-func (s *Server) start() {
+func (s *Server) Listen() {
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
@@ -124,31 +143,31 @@ func (s *Server) start() {
 		},
 	}
 
-	keyBytes, err := os.ReadFile(s.config.HostKeyFile)
+	keyBytes, err := os.ReadFile(s.cfg.HostKeyFile)
 	if err != nil {
-		s.logger.Error("host key missing", "cmd", "ssh-keygen -f id_rsa -t rsa -N ''")
+		s.logger.Error("Host key missing. Generate one: ssh-keygen -f id_rsa -t rsa -N ''")
 		os.Exit(1)
 	}
 	key, _ := ssh.ParsePrivateKey(keyBytes)
 	sshConfig.AddHostKey(key)
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.config.Port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
 	if err != nil {
 		s.logger.Error("failed to listen", "err", err)
 		os.Exit(1)
 	}
-	s.logger.Info("server listening", "port", s.config.Port)
+	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			continue
 		}
-		go s.handleConn(conn, sshConfig)
+		go s.handleSSH(conn, sshConfig)
 	}
 }
 
-func (s *Server) handleConn(nConn net.Conn, config *ssh.ServerConfig) {
+func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		return
@@ -156,8 +175,8 @@ func (s *Server) handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
-	stats := s.updateLoginStats(pubHash)
-	s.logger.Info("user logged in", "hash", pubHash[:12], "addr", nConn.RemoteAddr().String())
+	stats := s.updateUserSession(pubHash)
+	s.logger.Info("login", "user", sConn.User(), "id", pubHash[:12], "addr", nConn.RemoteAddr())
 
 	go ssh.DiscardRequests(reqs)
 
@@ -171,7 +190,7 @@ func (s *Server) handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 		go func(in <-chan *ssh.Request) {
 			defer ch.Close()
 			for req := range in {
-				if req.Type == "subsystem" && len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp" {
+				if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
 					s.sendBanner(ch.Stderr(), pubHash, stats)
 
@@ -179,13 +198,17 @@ func (s *Server) handleConn(nConn net.Conn, config *ssh.ServerConfig) {
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
 					})
-					server.Serve()
+					if err := server.Serve(); err != nil && err != io.EOF {
+						s.logger.Error("sftp session ended", "err", err)
+					}
 					return
 				}
 			}
 		}(reqs)
 	}
 }
+
+// --- SFTP Handlers ---
 
 type fsHandler struct {
 	srv     *Server
@@ -194,28 +217,29 @@ type fsHandler struct {
 }
 
 func (h *fsHandler) securePath(p string) (rel string, full string) {
-	clean := filepath.FromSlash(p)
-	full = filepath.Join(h.srv.absUploadDir, clean)
-
-	// Final verification that path is contained in upload dir
-	evalFull, err := filepath.Abs(full)
-	if err != nil || !strings.HasPrefix(evalFull, h.srv.absUploadDir) {
-		return ".", h.srv.absUploadDir
+	// Virtual cleanup
+	virt := path.Clean("/" + p)
+	rel = strings.TrimPrefix(virt, "/")
+	if rel == "" {
+		rel = "."
 	}
-
-	rel, _ = filepath.Rel(h.srv.absUploadDir, evalFull)
-	return filepath.ToSlash(rel), evalFull
+	// Physical mapping
+	full = filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+	return rel, full
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.securePath(r.Filepath)
+
+	// Virtual files
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
 		return bytes.NewReader(data), nil
 	}
 
+	// Share-first policy
 	if !h.hasUploaded() {
-		return nil, h.deny("You must share at least one file to participate in the archive.")
+		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
 	return os.Open(full)
@@ -224,32 +248,46 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := h.securePath(r.Filepath)
 
-	// Check Parent ownership (can't upload into someone else's folder)
-	parentRel := filepath.ToSlash(filepath.Dir(rel))
+	if rel == "README.txt" {
+		return nil, h.deny("README.txt is a protected system file.")
+	}
+
+	// Check folder ownership
+	parentRel := path.Dir(rel)
 	if parentRel != "." {
 		var pOwner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
 		if pOwner != "" && pOwner != h.pubHash {
-			return nil, h.deny("You do not have permission to write to this folder.")
+			return nil, h.deny("Cannot write to another user's directory.")
 		}
 	}
 
-	tx, _ := h.srv.db.Begin()
-	var owner string
-	err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-
-	if err == sql.ErrNoRows {
-		tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash)
-		tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash)
-	} else if owner != h.pubHash {
-		tx.Rollback()
-		return nil, h.deny("This file name is already claimed by another archivist.")
+	// Database ownership claim
+	tx, err := h.srv.db.Begin()
+	if err != nil {
+		return nil, err
 	}
-	tx.Commit()
+	defer tx.Rollback()
 
-	os.MkdirAll(filepath.Dir(full), 0755)
+	var currentOwner string
+	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
+	if err == sql.ErrNoRows {
+		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
+			return nil, err
+		}
+	} else if currentOwner != h.pubHash {
+		return nil, h.deny("This filename is already claimed.")
+	}
 
-	// Handle Truncate vs Resume
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	// Filesystem prep
+	_ = os.MkdirAll(filepath.Dir(full), 0755)
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
 		flags |= os.O_TRUNC
@@ -271,32 +309,44 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := h.securePath(r.Filepath)
 
+	// 1. Handle "ls" (Directory Listing)
 	if r.Method == "List" {
 		entries, err := os.ReadDir(full)
 		if err != nil {
 			return nil, err
 		}
 		var files []os.FileInfo
+
+		// Inject virtual README into the root directory listing
 		if rel == "." {
 			data, _ := embeddedSource.ReadFile("main.go")
-			files = append(files, &sftpFile{name: "README.txt", size: int64(len(data)), mode: 0444, modTime: time.Now()})
+			files = append(files, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
 		}
+
 		for _, e := range entries {
 			fi, _ := e.Info()
 			var owner string
-			h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", filepath.ToSlash(filepath.Join(rel, e.Name()))).Scan(&owner)
-			files = append(files, newSftpFile(fi, owner))
+			h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Join(rel, e.Name())).Scan(&owner)
+			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
 		}
 		return listerAt(files), nil
 	}
 
+	// 2. Handle "Stat" (File metadata lookup)
+	// Check if the client is asking about the virtual README
+	if rel == "README.txt" {
+		data, _ := embeddedSource.ReadFile("main.go")
+		return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
+	}
+
+	// Fallback to physical disk for all other files
 	fi, err := os.Stat(full)
 	if err != nil {
 		return nil, err
 	}
 	var owner string
 	h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-	return listerAt{newSftpFile(fi, owner)}, nil
+	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
@@ -304,15 +354,8 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	switch r.Method {
 	case "Mkdir":
 		if !h.srv.mkdirLimiter.Allow() {
-			return h.deny("Global mkdir rate limit reached.")
+			return h.deny("Rate limit exceeded.")
 		}
-		pRel := filepath.ToSlash(filepath.Dir(rel))
-		var pOwner string
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", pRel).Scan(&pOwner)
-		if pOwner != "" && pOwner != h.pubHash {
-			return h.deny("Cannot create directory inside another user's folder.")
-		}
-
 		os.MkdirAll(full, 0755)
 		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash)
 		return nil
@@ -321,7 +364,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		var owner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != "" && owner != h.pubHash {
-			return h.deny("You can only remove your own creations.")
+			return h.deny("You can only remove your own files.")
 		}
 		os.RemoveAll(full)
 		h.srv.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
@@ -334,42 +377,35 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 
 		if sOwner != h.pubHash || (tOwner != "" && tOwner != h.pubHash) {
-			return h.deny("Rename permission denied (ownership mismatch).")
+			return h.deny("Rename permission denied.")
 		}
 
 		if err := os.Rename(full, fullTgt); err != nil {
 			return err
 		}
 
-		h.srv.db.Exec(`
-			UPDATE files 
-			SET path = ? || substr(path, length(?) + 1)
-			WHERE path = ? OR path LIKE ?`,
+		h.srv.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
 			relTgt, rel, rel, rel+"/%")
 		return nil
 	}
 	return sftp.ErrSshFxOpUnsupported
 }
 
-// --- Helpers ---
+// --- DB & Metadata Helpers ---
 
-func (h *fsHandler) deny(msg string) error {
-	fmt.Fprintf(h.stderr, "\r\n\033[1;31mPERMISSION DENIED:\033[0m %s\r\n", msg)
-	return sftp.ErrSshFxPermissionDenied
+type userStats struct {
+	Count      int64
+	LastLogin  string
+	TotalBytes int64
+	FirstTimer bool
 }
 
-func (h *fsHandler) hasUploaded() bool {
-	var count int
-	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", h.pubHash).Scan(&count)
-	return count > 0
-}
-
-func (s *Server) updateLoginStats(hash string) (st userStats) {
+func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.FilesUploadedCount)
+	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count)
 	if err == sql.ErrNoRows {
-		s.db.Exec("INSERT INTO users (pubkey_hash, last_login, total_bytes, upload_count) VALUES (?, ?, 0, 0)", hash, now)
-		st.IsFirstLogin = true
+		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
+		st.FirstTimer = true
 		st.LastLogin = "Never"
 	} else {
 		s.db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
@@ -377,91 +413,53 @@ func (s *Server) updateLoginStats(hash string) (st userStats) {
 	return st
 }
 
-func (s *Server) sendBanner(w io.Writer, hash string, stats userStats) {
-	banner, err := os.ReadFile(s.config.BannerFile)
-	if err == nil {
-		fmt.Fprintf(w, "\r\n%s\r\n", string(banner))
-	} else {
-		fmt.Fprintf(w, "\r\n\033[1;34m=== %s - Anonymous SFTP Storage ===\033[0m\r\n", applicationName)
-	}
-
-	displayName := fmt.Sprintf("anonymous-%d", ownerHashToUid(hash))
-
-	if stats.IsFirstLogin {
-		fmt.Fprintf(w, boldAscii("Welcome, "+displayName, "This is a 'share-first' archive.\r\n"))
-		fmt.Fprintf(w, "Upload something meaningful to unlock access to the collections of others.\r\n")
-		fmt.Fprintf(w, "Download README.txt to view the server source code.\r\n")
-	} else {
-		fmt.Fprintf(w, "Username: %s\r\n", displayName)
-		fmt.Fprintf(w, "Last Seen: %s\r\n", stats.LastLogin)
-		fmt.Fprintf(w, "Contribution: %d bytes / %d files\r\n\r\n", stats.TotalBytes, stats.FilesUploadedCount)
-	}
-
-	if stats.FilesUploadedCount == 0 {
-		fmt.Fprint(w, boldAscii("Reminder:", "You must upload a file before you can download."))
-	} else if stats.TotalBytes > 1024 {
-		fmt.Fprint(w, boldAscii("Thank you for contributing, "+displayName, "\r\nYour fortune:\r\n"))
-		fortune := s.getRandomFortune()
-		fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n\r\n", fortune)
-	}
-}
-
 func (s *Server) getRandomFortune() string {
-	data, err := embeddedSource.ReadFile("fortunes.txt")
-	if err != nil {
-		return "A path begins with a single upload."
-	}
-	content := string(data)
-	var fortunes []string
-	if strings.Contains(content, "\n%\n") {
-		fortunes = strings.Split(content, "\n%\n")
-	} else {
-		fortunes = strings.Split(content, "\n")
-	}
-
-	var valid []string
-	for _, f := range fortunes {
-		f = strings.TrimSpace(f)
-		if f != "" {
-			valid = append(valid, f)
-		}
-	}
-	if len(valid) == 0 {
-		return "Fortune favors the bold archivist."
-	}
-	return valid[rand.Intn(len(valid))]
-}
-
-func boldAscii(header string, body string) string {
-	return fmt.Sprintf("\r\n\033[1m%s\033[0m %s\r\n", header, body)
+	data, _ := embeddedSource.ReadFile("fortunes.txt")
+	fortunes := strings.Split(string(data), "\n%\n")
+	return strings.TrimSpace(fortunes[rand.Intn(len(fortunes))])
 }
 
 func (s *Server) reconcileOrphans() {
-	s.logger.Info("scanning for orphans")
-	dummies := []string{"archivist", "pioneer", "collector", "jennifer", "trodgor", "oxide"}
-	var hashes []string
-	for _, d := range dummies {
-		h := fmt.Sprintf("%x", sha256.Sum256([]byte("dummy-"+d)))
-		s.db.Exec("INSERT OR IGNORE INTO users (pubkey_hash, last_login) VALUES (?, '2020-01-01')", h)
-		hashes = append(hashes, h)
-	}
-
-	filepath.WalkDir(s.absUploadDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || path == s.absUploadDir {
+	s.logger.Info("reconciling filesystem with database")
+	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == s.absUploadDir {
 			return nil
 		}
-		rel, _ := filepath.Rel(s.absUploadDir, path)
+		rel, _ := filepath.Rel(s.absUploadDir, p)
 		rel = filepath.ToSlash(rel)
-		var owner string
-		if err := s.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner); err == sql.ErrNoRows {
-			h := hashes[rand.Intn(len(hashes))]
+		var exists bool
+		s.db.QueryRow("SELECT 1 FROM files WHERE path = ?", rel).Scan(&exists)
+		if !exists {
 			fi, _ := d.Info()
-			s.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, ?)", rel, h, fi.Size())
+			s.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, 'system', ?)", rel, fi.Size())
 		}
 		return nil
 	})
-	s.logger.Info("orphan reconciliation finished")
 }
+
+// --- SFTP Glue ---
+
+type sftpFile struct {
+	os.FileInfo
+	owner string
+}
+
+func (s *sftpFile) Sys() interface{} {
+	uid := hashToUid(s.owner)
+	return &sftp.FileStat{UID: uid, GID: uid}
+}
+
+type virtualFileInfo struct {
+	name string
+	size int64
+}
+
+func (v *virtualFileInfo) Name() string       { return v.name }
+func (v *virtualFileInfo) Size() int64        { return v.size }
+func (v *virtualFileInfo) Mode() fs.FileMode  { return 0444 }
+func (v *virtualFileInfo) ModTime() time.Time { return time.Now() }
+func (v *virtualFileInfo) IsDir() bool        { return false }
+func (v *virtualFileInfo) Sys() interface{}   { return &sftp.FileStat{UID: 1000, GID: 1000} }
 
 type statWriter struct {
 	*os.File
@@ -479,36 +477,66 @@ func (sw *statWriter) Close() error {
 	return sw.File.Close()
 }
 
-type userStats struct {
-	FilesUploadedCount int64
-	LastLogin          string
-	TotalBytes         int64
-	IsFirstLogin       bool
+func (h *fsHandler) deny(msg string) error {
+	fmt.Fprintf(h.stderr, "\r\n\033[1;31mDENIED:\033[0m %s\r\n", msg)
+	return sftp.ErrSshFxPermissionDenied
 }
 
-type sftpFile struct {
-	name    string
-	size    int64
-	mode    fs.FileMode
-	modTime time.Time
-	owner   string
+func (h *fsHandler) hasUploaded() bool {
+	var count int
+	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", h.pubHash).Scan(&count)
+	return count > 0
 }
 
-func (s *sftpFile) Name() string       { return s.name }
-func (s *sftpFile) Size() int64        { return s.size }
-func (s *sftpFile) Mode() fs.FileMode  { return s.mode }
-func (s *sftpFile) ModTime() time.Time { return s.modTime }
-func (s *sftpFile) IsDir() bool        { return s.mode.IsDir() }
-func (s *sftpFile) Sys() interface{} {
-	uid := ownerHashToUid(s.owner)
-	return &sftp.FileStat{UID: uid, GID: uid}
+func (s *Server) sendBanner(w io.Writer, hash string, stats userStats) {
+	fmt.Fprintf(w, "\r\n\033[1;34m=== %s ===\033[0m\r\n", s.cfg.Name)
+	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
+
+	if stats.FirstTimer {
+		fmt.Fprintf(w, "\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
+		fmt.Fprintf(w, "Upload a file to unlock downloads.\r\n")
+	} else {
+		fmt.Fprintf(w, "ID: %s | Last: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
+		if stats.TotalBytes > 1024*1024 {
+			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
+		}
+		if stats.Count == 0 {
+			fmt.Fprintf(w, "\033[1mReminder:\033[0m upload a file to download a file.\r\n")
+		}
+	}
 }
 
-func newSftpFile(fi os.FileInfo, owner string) *sftpFile {
-	return &sftpFile{name: fi.Name(), size: fi.Size(), mode: fi.Mode(), modTime: fi.ModTime(), owner: owner}
+// --- Utilities ---
+
+func getEnv(k, f string) string {
+	if v, ok := os.LookupEnv(k); ok {
+		return v
+	}
+	return f
 }
 
-func ownerHashToUid(hash string) uint32 {
+func getEnvInt(k string, f int) int {
+	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return f
+}
+
+func getEnvFloat(k string, f float64) float64 {
+	if v, err := strconv.ParseFloat(os.Getenv(k), 64); err == nil {
+		return v
+	}
+	return f
+}
+
+func getEnvBool(k string, f bool) bool {
+	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
+		return v
+	}
+	return f
+}
+
+func hashToUid(hash string) uint32 {
 	if hash == "" || hash == "system" {
 		return 1000
 	}
