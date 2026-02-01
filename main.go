@@ -89,19 +89,7 @@ func LoadConfig() Config {
 	return cfg
 }
 
-// --- Server Core ---
-
-type Server struct {
-	db           *sql.DB
-	logger       *slog.Logger
-	mkdirLimiter *rate.Limiter
-	cfg          Config
-	absUploadDir string
-}
-
-func main() {
-	cfg := LoadConfig()
-
+func setupLogger(cfg Config) *slog.Logger {
 	// Logger setup with level control
 	logWriter := io.MultiWriter(os.Stdout)
 	if f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
@@ -111,15 +99,17 @@ func main() {
 	logLevel := slog.LevelInfo
 	if cfg.Verbose {
 		logLevel = slog.LevelDebug
-
 	}
 
 	handler := slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel})
 
-	logger := slog.New(handler).With(
-		"app", cfg.Name,
-		"version", AppVersion,
-	)
+	logger := slog.New(handler)
+	if cfg.Verbose {
+		logger = logger.With(
+			"app", cfg.Name,
+			"version", AppVersion,
+		)
+	}
 
 	logger.Debug("server configuration",
 		slog.Group("config",
@@ -132,6 +122,23 @@ func main() {
 			"banner_file", cfg.BannerFile,
 		),
 	)
+	return logger
+}
+
+// --- Server Core ---
+
+type Server struct {
+	db           *sql.DB
+	logger       *slog.Logger
+	mkdirLimiter *rate.Limiter
+	cfg          Config
+	absUploadDir string
+}
+
+func main() {
+	cfg := LoadConfig()
+	logger := setupLogger(cfg)
+
 	// Database setup
 	db, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
