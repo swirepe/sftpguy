@@ -88,6 +88,7 @@ type Config struct {
 	IncludeSource bool
 	Verbose       bool
 	AutoKey       bool
+	MaxFileSize   int64
 }
 
 func LoadConfig() Config {
@@ -104,6 +105,9 @@ func LoadConfig() Config {
 	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
 	flag.BoolVar(&cfg.AutoKey, "autokey", getEnvBool("AUTO_KEY", false), "Auto-generate host key if missing")
 
+	var maxSizeRaw string
+	flag.StringVar(&maxSizeRaw, "maxsize", getEnv("MAX_FILE_SIZE", "8gb"), "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
+
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
 	flag.Parse()
@@ -118,6 +122,14 @@ func LoadConfig() Config {
 		fmt.Printf("%s", srcCode)
 		os.Exit(0)
 	}
+
+	limit, err := parseSize(maxSizeRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing maxsize: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.MaxFileSize = limit
+
 	return cfg
 }
 
@@ -152,6 +164,9 @@ func setupLogger(cfg Config) *slog.Logger {
 			"mkdir_rate", cfg.MkdirRate,
 			"log_file", cfg.LogFile,
 			"banner_file", cfg.BannerFile,
+			"banner_stats", cfg.BannerStats,
+			"autokey", cfg.AutoKey,
+			"max_file_size", cfg.MaxFileSize,
 		),
 	)
 	return logger
@@ -221,7 +236,7 @@ func (s *Server) Listen() {
 
 			if s.cfg.BannerStats {
 				st := s.getFileStats()
-				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n. Files: %d\r\n  Bytes: %d\r\n", st.Contributors, st.Count, st.Size)
+				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n  Files: %d\r\n  Bytes: %d\r\n", st.Contributors, st.Count, st.Size)
 			}
 
 			return fmt.Sprintf("%s\r\n%s", banner, stats)
@@ -445,7 +460,13 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		oldSize = fi.Size()
 	}
 
-	return &statWriter{File: f, h: h, rel: rel, oldSize: oldSize}, nil
+	return &statWriter{
+		File:        f,
+		h:           h,
+		rel:         rel,
+		oldSize:     oldSize,
+		maxFileSize: h.srv.cfg.MaxFileSize,
+	}, nil
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
@@ -570,6 +591,10 @@ type userStats struct {
 	FirstTimer bool
 }
 
+// func (us *userStats) Contributor() bool {
+// 	return us.TotalBytes  > ContributorThresholdBytes
+// }
+
 func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count)
@@ -639,9 +664,26 @@ func (v *virtualFileInfo) Sys() interface{}   { return &sftp.FileStat{UID: 1000,
 
 type statWriter struct {
 	*os.File
-	h       *fsHandler
-	rel     string
-	oldSize int64
+	h           *fsHandler
+	rel         string
+	oldSize     int64
+	maxFileSize int64
+}
+
+func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
+	// If limit is set (non-zero) and the write would go past the limit
+	if sw.maxFileSize > 0 && off+int64(len(p)) > sw.maxFileSize {
+		sw.h.srv.logger.Warn("upload blocked: size limit exceeded",
+			"path", sw.rel,
+			"user", sw.h.pubHash[:12],
+			"limit", sw.maxFileSize)
+
+		// Inform the user via stderr
+		sw.h.deny(fmt.Sprintf("File size limit exceeded. Maximum allowed: %d bytes", sw.maxFileSize))
+
+		return 0, sftp.ErrSshFxFailure // Generic failure or connection break
+	}
+	return sw.File.WriteAt(p, off)
 }
 
 func (sw *statWriter) Close() error {
@@ -665,24 +707,57 @@ func (h *fsHandler) hasUploaded() bool {
 	return count > 0
 }
 
+const (
+	bold   = "\033[1m"
+	blue   = "\033[1;34m"
+	yellow = "\033[1;33m"
+	green  = "\033[0;32m"
+)
+
+func Blue(s string) string {
+	return fmt.Sprintf("%s%s\033[0m", blue, s)
+}
+
+func Yellow(s string) string {
+	return fmt.Sprintf("%s%s\033[0m", yellow, s)
+}
+
+func Green(s string) string {
+	return fmt.Sprintf("%s%s\033[0m", green, s)
+}
+
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
 
+	readme := func() {
+		fmt.Fprintf(w, "\033[1mReminder:\033[0m upload a file to download a file.\r\n")
+		fmt.Fprintf(w, "  See \033[1mREADME.txt\033[0m for more information.\r\n")
+		fmt.Fprintf(w, "  You may always download \033[1mREADME.txt\033[0m\r\n")
+	}
+
 	if stats.FirstTimer {
 		fmt.Fprintf(w, "\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
-		fmt.Fprintf(w, "Upload a file to unlock downloads.\r\n")
-		fmt.Fprintf(w, "See \033[1mREADME.txt\033[0m for more information.\r\n")
+		readme()
 	} else {
-		fmt.Fprintf(w, "\r\n\033[1;34mWelcome, %s\033[0m\r\n", userLabel)
-		fmt.Fprintf(w, "ID: %s | Last: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
-		if stats.TotalBytes > 1024*1024 {
+		isContributor := stats.TotalBytes > 1024
+		color := Blue
+		if isContributor {
+			color = Yellow
+		}
+
+		fmt.Fprintf(w, "\r\nWelcome, %s\033[0m\r\n", color(userLabel))
+
+		if stats.Count == 0 {
+			fmt.Fprintf(w, "\033[31;1mDownloads are restricted.\033[0m\r\n")
+			readme()
+		} else {
+			fmt.Fprintf(w, Green("Downloading is unlocked.\r\n"))
+		}
+		if isContributor {
 			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
 		}
-		if stats.Count == 0 {
-			fmt.Fprintf(w, "\033[1mReminder:\033[0m upload a file to download a file.\r\n")
-			fmt.Fprintf(w, "See \033[1mREADME.txt\033[0m for more information.\r\n")
-		}
 	}
+	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
 }
 
 // --- Utilities ---
@@ -713,6 +788,37 @@ func getEnvBool(k string, f bool) bool {
 		return v
 	}
 	return f
+}
+
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+
+	var multiplier int64 = 1
+	suffix := ""
+
+	if strings.HasSuffix(s, "gb") {
+		multiplier = 1024 * 1024 * 1024
+		suffix = "gb"
+	} else if strings.HasSuffix(s, "mb") {
+		multiplier = 1024 * 1024
+		suffix = "mb"
+	} else if strings.HasSuffix(s, "kb") {
+		multiplier = 1024
+		suffix = "kb"
+	} else if strings.HasSuffix(s, "b") {
+		multiplier = 1
+		suffix = "b"
+	}
+
+	valStr := strings.TrimSuffix(s, suffix)
+	val, err := strconv.ParseInt(valStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format: %v", err)
+	}
+	return val * multiplier, nil
 }
 
 func hashToUid(hash string) uint32 {
