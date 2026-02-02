@@ -221,7 +221,7 @@ func (s *Server) Listen() {
 
 			if s.cfg.BannerStats {
 				st := s.getFileStats()
-				stats = fmt.Sprintf("Serving:\r\n  Files: %d\r\n  Bytes: %d\r\n", st.Count, st.Size)
+				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n. Files: %d\r\n  Bytes: %d\r\n", st.Contributors, st.Count, st.Size)
 			}
 
 			return fmt.Sprintf("%s\r\n%s", banner, stats)
@@ -543,14 +543,20 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 }
 
 type fileStats struct {
-	Count uint64
-	Size  uint64
+	Contributors uint64
+	Count        uint64
+	Size         uint64
 }
 
 func (s *Server) getFileStats() (st fileStats) {
 	err := s.db.QueryRow("SELECT count(*), sum(size) from files").Scan(&st.Count, &st.Size)
 	if err != nil {
 		s.logger.Debug("Could not get file statistics", err)
+	}
+
+	err = s.db.QueryRow("SELECT count(*) from users where upload_count > 0").Scan(&st.Contributors)
+	if err != nil {
+		s.logger.Debug("Could not get user statistics", err)
 	}
 	return st
 }
