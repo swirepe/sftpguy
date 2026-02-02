@@ -58,7 +58,7 @@ import (
 var embeddedSource embed.FS
 
 const (
-	AppVersion = "1.2.0"
+	AppVersion = "1.2.1"
 	Schema     = `
 		CREATE TABLE IF NOT EXISTS users (
 			pubkey_hash TEXT PRIMARY KEY,
@@ -83,6 +83,7 @@ type Config struct {
 	LogFile       string
 	UploadDir     string
 	BannerFile    string
+	BannerStats   bool
 	MkdirRate     float64
 	IncludeSource bool
 	Verbose       bool
@@ -93,13 +94,14 @@ func LoadConfig() Config {
 	cfg := Config{}
 	flag.StringVar(&cfg.Name, "name", getEnv("ARCHIVE_NAME", "curioarium-sftp"), "Archive name")
 	flag.IntVar(&cfg.Port, "port", getEnvInt("SFTP_PORT", 2222), "SSH port")
-	flag.StringVar(&cfg.HostKeyFile, "hostkey", getEnv("HOST_KEY", "id_rsa"), "SSH host key")
+	flag.StringVar(&cfg.HostKeyFile, "hostkey", getEnv("HOST_KEY", "id_ed25519"), "SSH host key")
 	flag.StringVar(&cfg.DBPath, "db", getEnv("DB_PATH", "sftp.db"), "SQLite path")
 	flag.StringVar(&cfg.LogFile, "logfile", getEnv("LOG_FILE", "sftp.log"), "Log file path")
 	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
 	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
+	flag.BoolVar(&cfg.BannerStats, "stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
 	flag.Float64Var(&cfg.MkdirRate, "rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit")
-	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging") // New Flag
+	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
 	flag.BoolVar(&cfg.AutoKey, "autokey", getEnvBool("AUTO_KEY", false), "Auto-generate host key if missing")
 
 	src := flag.Bool("src", false, "Show source code")
@@ -206,6 +208,24 @@ func (s *Server) Listen() {
 	}
 
 	sshConfig := &ssh.ServerConfig{
+		BannerCallback: func(conn ssh.ConnMetadata) string {
+			banner := ""
+			stats := ""
+			b, err := embeddedSource.ReadFile(s.cfg.BannerFile)
+			if err != nil {
+				s.logger.Debug("Banner file not readable, using default banner", err)
+				banner = fmt.Sprintf("=== %s v%s - anonymous share-first sftp server ===", s.cfg.Name, AppVersion)
+			} else {
+				banner = string(b)
+			}
+
+			if s.cfg.BannerStats {
+				st := s.getFileStats()
+				stats = fmt.Sprintf("Serving:\r\n  Files: %d\r\n  Bytes: %d\r\n", st.Count, st.Size)
+			}
+
+			return fmt.Sprintf("%s\r\n%s", banner, stats)
+		},
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
@@ -214,7 +234,7 @@ func (s *Server) Listen() {
 
 	keyBytes, err := os.ReadFile(s.cfg.HostKeyFile)
 	if err != nil {
-		s.logger.Error("Host key missing. Generate one: ssh-keygen -f id_rsa -t rsa -N ''")
+		s.logger.Error("Host key missing. Generate: ssh-keygen -t ed25519 -f id_ed25519 -N ''")
 		os.Exit(1)
 	}
 	key, _ := ssh.ParsePrivateKey(keyBytes)
@@ -303,7 +323,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 			for req := range in {
 				if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 					req.Reply(true, nil)
-					s.sendBanner(ch.Stderr(), pubHash, stats)
+					s.Welcome(ch.Stderr(), pubHash, stats)
 
 					handler := &fsHandler{srv: s, pubHash: pubHash, stderr: ch.Stderr()}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
@@ -522,6 +542,19 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	return sftp.ErrSshFxOpUnsupported
 }
 
+type fileStats struct {
+	Count uint64
+	Size  uint64
+}
+
+func (s *Server) getFileStats() (st fileStats) {
+	err := s.db.QueryRow("SELECT count(*), sum(size) from files").Scan(&st.Count, &st.Size)
+	if err != nil {
+		s.logger.Debug("Could not get file statistics", err)
+	}
+	return st
+}
+
 // --- DB & Metadata Helpers ---
 
 type userStats struct {
@@ -626,20 +659,22 @@ func (h *fsHandler) hasUploaded() bool {
 	return count > 0
 }
 
-func (s *Server) sendBanner(w io.Writer, hash string, stats userStats) {
-	fmt.Fprintf(w, "\r\n\033[1;34m=== %s ===\033[0m\r\n", s.cfg.Name)
+func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
 
 	if stats.FirstTimer {
 		fmt.Fprintf(w, "\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
 		fmt.Fprintf(w, "Upload a file to unlock downloads.\r\n")
+		fmt.Fprintf(w, "See \033[1mREADME.txt\033[0m for more information.\r\n")
 	} else {
+		fmt.Fprintf(w, "\r\n\033[1;34mWelcome, %s\033[0m\r\n", userLabel)
 		fmt.Fprintf(w, "ID: %s | Last: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
 		if stats.TotalBytes > 1024*1024 {
 			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
 		}
 		if stats.Count == 0 {
 			fmt.Fprintf(w, "\033[1mReminder:\033[0m upload a file to download a file.\r\n")
+			fmt.Fprintf(w, "See \033[1mREADME.txt\033[0m for more information.\r\n")
 		}
 	}
 }
