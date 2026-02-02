@@ -157,6 +157,7 @@ func setupLogger(cfg Config) *slog.Logger {
 			"banner_stats", cfg.BannerStats,
 			"autokey", cfg.AutoKey,
 			"max_file_size", cfg.MaxFileSize,
+			"verbose", cfg.Verbose,
 		),
 	)
 	return logger
@@ -251,7 +252,7 @@ func (s *Server) Listen() {
 		s.logger.Error("failed to listen", "err", err)
 		os.Exit(1)
 	}
-	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir, "verbose", s.cfg.Verbose)
+	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir)
 
 	for {
 		conn, err := listener.Accept()
@@ -313,7 +314,19 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
 	stats := s.updateUserSession(pubHash)
-	s.logger.Info("login", "user", sConn.User(), "id", pubHash[:12], "addr", nConn.RemoteAddr())
+	s.logger.Info("handling login",
+		slog.Group("user",
+			"id", pubHash[:12],
+		),
+		slog.Group("conn",
+			"user", sConn.User(),
+			"session", fmt.Sprintf("%x", sConn.SessionID()),
+			"client_version", sConn.ClientVersion(),
+			"remote_address", sConn.RemoteAddr(),
+			"local_address", sConn.LocalAddr(),
+		),
+	)
+	//s.logger.Info("login", "user", sConn.User(), "id", pubHash[:12], "addr", nConn.RemoteAddr())
 
 	go ssh.DiscardRequests(reqs)
 
@@ -373,7 +386,6 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return bytes.NewReader(data), nil
 	}
 
-	// Forbid reading if it's a symlink
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return nil, h.deny("Symlinks are prohibited.")
 	}
@@ -383,14 +395,12 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
-	// Get file info for size tracking
 	fi, err := os.Stat(full)
 	if err != nil {
 		return nil, err
 	}
 	fileSize := fi.Size()
 
-	// Track the download
 	h.srv.logger.Debug("tracking download", "path", rel, "size", fileSize, "user", h.pubHash[:12])
 	h.srv.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", fileSize, h.pubHash)
 
