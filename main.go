@@ -25,15 +25,20 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
 	"embed"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"io/fs"
 	"log/slog"
+
 	"math/rand"
 	"net"
 	"os"
@@ -80,7 +85,8 @@ type Config struct {
 	BannerFile    string
 	MkdirRate     float64
 	IncludeSource bool
-	Verbose       bool // New Field
+	Verbose       bool
+	AutoKey       bool
 }
 
 func LoadConfig() Config {
@@ -94,6 +100,7 @@ func LoadConfig() Config {
 	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
 	flag.Float64Var(&cfg.MkdirRate, "rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit")
 	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging") // New Flag
+	flag.BoolVar(&cfg.AutoKey, "autokey", getEnvBool("AUTO_KEY", false), "Auto-generate host key if missing")
 
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
@@ -168,7 +175,7 @@ func main() {
 		logger.Error("DB connection failed", "err", err)
 		os.Exit(1)
 	}
-	db.SetMaxOpenConns(1)
+	db.Exec("PRAGMA journal_mode=WAL;")
 	if _, err := db.Exec(Schema); err != nil {
 		logger.Error("Schema init failed", "err", err)
 		os.Exit(1)
@@ -190,6 +197,14 @@ func main() {
 }
 
 func (s *Server) Listen() {
+	if err := s.ensureHostKey(); err != nil {
+		s.logger.Error("host key error", "err", err)
+		if !s.cfg.AutoKey {
+			s.logger.Info("Hint: use -autokey to generate one automatically")
+		}
+		os.Exit(1)
+	}
+
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
@@ -219,6 +234,47 @@ func (s *Server) Listen() {
 		}
 		go s.handleSSH(conn, sshConfig)
 	}
+}
+
+func (s *Server) ensureHostKey() error {
+	_, err := os.Stat(s.cfg.HostKeyFile)
+	if err == nil {
+		return nil // Key already exists
+	}
+
+	if !s.cfg.AutoKey {
+		return fmt.Errorf("host key missing and -autokey not set")
+	}
+
+	s.logger.Info("generating new Ed25519 host key", "path", s.cfg.HostKeyFile)
+
+	_, priv, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to generate key: %w", err)
+	}
+
+	bytes, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("failed to marshal key: %w", err)
+	}
+
+	pemBlock := &pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: bytes,
+	}
+
+	// 4. Write to file with restrictive permissions (0600)
+	keyFile, err := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open key file for writing: %w", err)
+	}
+	defer keyFile.Close()
+
+	if err := pem.Encode(keyFile, pemBlock); err != nil {
+		return fmt.Errorf("failed to encode pem: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
@@ -291,6 +347,11 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return bytes.NewReader(data), nil
 	}
 
+	// Forbid reading if it's a symlink
+	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, h.deny("Symlinks are prohibited.")
+	}
+
 	if !h.hasUploaded() {
 		h.srv.logger.Debug("fileread denied: share-first policy", "user", h.pubHash[:12])
 		return nil, h.deny("Archive access locked. You must share a file first.")
@@ -305,6 +366,11 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 	if rel == "README.txt" {
 		return nil, h.deny("README.txt is a protected system file.")
+	}
+
+	// Forbid overwriting or interacting with symlinks
+	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, h.deny("Symlinks are prohibited.")
 	}
 
 	// Check folder ownership
@@ -392,10 +458,14 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
 	}
 
-	fi, err := os.Stat(full)
+	fi, err := os.Lstat(full)
 	if err != nil {
 		return nil, err
 	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, h.deny("Access to symlinks is forbidden.")
+	}
+
 	var owner string
 	h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
@@ -406,6 +476,10 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	h.srv.logger.Debug("filecmd request", "method", r.Method, "path", rel)
 
 	switch r.Method {
+	case "Symlink", "Link":
+		h.srv.logger.Warn("blocked symlink creation attempt", "user", h.pubHash[:12], "path", rel)
+		return h.deny("Symbolic links are not permitted on this server.")
+
 	case "Mkdir":
 		if !h.srv.mkdirLimiter.Allow() {
 			h.srv.logger.Debug("mkdir rate limited", "user", h.pubHash[:12])
@@ -480,7 +554,11 @@ func (s *Server) getRandomFortune() string {
 func (s *Server) reconcileOrphans() {
 	s.logger.Info("reconciling filesystem with database")
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
+
 		if err != nil || p == s.absUploadDir {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 		rel, _ := filepath.Rel(s.absUploadDir, p)
