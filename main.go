@@ -59,8 +59,21 @@ import (
 var embeddedSource embed.FS
 
 const (
-	AppVersion = "1.2.1"
-	Schema     = `CREATE TABLE IF NOT EXISTS users ( pubkey_hash TEXT PRIMARY KEY, last_login DATETIME, upload_count INTEGER DEFAULT 0, total_bytes INTEGER DEFAULT 0, download_count INTEGER DEFAULT 0, download_bytes INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS files ( path TEXT PRIMARY KEY, owner_hash TEXT, size INTEGER DEFAULT 0 );`
+	AppVersion = "1.4.2"
+	Schema     = `CREATE TABLE IF NOT EXISTS users ( 
+		pubkey_hash TEXT PRIMARY KEY, 
+		last_login DATETIME, 
+		upload_count INTEGER DEFAULT 0, 
+		upload_bytes INTEGER DEFAULT 0,
+		download_count INTEGER DEFAULT 0,
+		download_bytes INTEGER DEFAULT 0 
+	);
+	
+	CREATE TABLE IF NOT EXISTS files ( 
+		path TEXT PRIMARY KEY,
+		owner_hash TEXT,
+		size INTEGER DEFAULT 0
+	);`
 )
 
 // --- Configuration ---
@@ -90,8 +103,8 @@ func LoadConfig() Config {
 	flag.StringVar(&cfg.LogFile, "logfile", getEnv("LOG_FILE", "sftp.log"), "Log file path")
 	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
 	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
-	flag.BoolVar(&cfg.BannerStats, "stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
-	flag.Float64Var(&cfg.MkdirRate, "rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit")
+	flag.BoolVar(&cfg.BannerStats, "banner.stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
+	flag.Float64Var(&cfg.MkdirRate, "mkdir.rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
 	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
 	flag.BoolVar(&cfg.AutoKey, "autokey", getEnvBool("AUTO_KEY", false), "Auto-generate host key if missing")
 
@@ -290,7 +303,6 @@ func (s *Server) ensureHostKey() error {
 		Bytes: bytes,
 	}
 
-	// 4. Write to file with restrictive permissions (0600)
 	keyFile, err := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open key file for writing: %w", err)
@@ -607,9 +619,9 @@ func (s Server) getFileStats() (st fileStats) {
 // --- DB & Metadata Helpers ---
 
 type userStats struct {
-	Count         int64
+	UploadCount   int64
 	LastLogin     string
-	TotalBytes    int64
+	UploadBytes   int64
 	DownloadCount int64
 	DownloadBytes int64
 	FirstTimer    bool
@@ -617,7 +629,7 @@ type userStats struct {
 
 func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count, download_count, download_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count, &st.DownloadCount, &st.DownloadBytes)
+	err := s.db.QueryRow("SELECT last_login, upload_count, upload_bytes, download_count, download_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.UploadCount, &st.UploadBytes, &st.DownloadCount, &st.DownloadBytes)
 	if err == sql.ErrNoRows {
 		s.logger.Debug("registering new user", "hash", hash[:12])
 		st.FirstTimer = true
@@ -711,7 +723,7 @@ func (sw *statWriter) Close() error {
 	delta := newSize - sw.oldSize
 	sw.h.srv.logger.Debug("closing file write", "path", sw.rel, "newSize", newSize, "delta", delta)
 	sw.h.srv.db.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, sw.rel)
-	sw.h.srv.db.Exec("UPDATE users SET total_bytes = total_bytes + ? WHERE pubkey_hash = ?", delta, sw.h.pubHash)
+	sw.h.srv.db.Exec("UPDATE users SET upload_bytes = upload_bytes + ? WHERE pubkey_hash = ?", delta, sw.h.pubHash)
 	return sw.File.Close()
 }
 
@@ -755,28 +767,29 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	}
 
 	if stats.FirstTimer {
-		fmt.Fprintf(w, "\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
+		fmt.Fprintf(w, "\r\n\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
 		readme()
 	} else {
-		isContributor := stats.TotalBytes > 1024*1024
+		isContributor := stats.UploadBytes > 1024*1024
 		color := Blue
 		if isContributor {
 			color = Yellow
 		}
 
 		fmt.Fprintf(w, "\r\nWelcome, %s\033[0m\r\n", color(userLabel))
+		if isContributor {
+			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
+		}
 
-		if stats.Count == 0 {
+		if stats.UploadCount == 0 {
 			fmt.Fprintf(w, "\033[31;1mDownloads are restricted.\033[0m\r\n")
 			readme()
 		} else {
 			fmt.Fprintf(w, Green("Downloading is unlocked.\r\n"))
 		}
-		if isContributor {
-			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
-		}
+
 	}
-	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
+	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes", userLabel, stats.LastLogin, stats.UploadCount, stats.UploadBytes)
 	if stats.DownloadCount > 0 {
 		fmt.Fprintf(w, " |  Downloaded: %d files, %d bytes", stats.DownloadCount, stats.DownloadBytes)
 	}
