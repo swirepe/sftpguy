@@ -1,27 +1,29 @@
 package main
 
 /*
- * curioarium-sftp - anonymous share-first SFTP server
- * Copyright (C) 2026 台湾独立运动
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+
+curioarium-sftp - anonymous share-first SFTP server
+Copyright (C) 2026 台湾独立运动
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
 
 import (
 	"bytes"
@@ -38,7 +40,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-
 	"math/rand"
 	"net"
 	"os"
@@ -59,18 +60,7 @@ var embeddedSource embed.FS
 
 const (
 	AppVersion = "1.2.1"
-	Schema     = `
-		CREATE TABLE IF NOT EXISTS users (
-			pubkey_hash TEXT PRIMARY KEY,
-			last_login DATETIME,
-			upload_count INTEGER DEFAULT 0,
-			total_bytes INTEGER DEFAULT 0
-		);
-		CREATE TABLE IF NOT EXISTS files (
-			path TEXT PRIMARY KEY,
-			owner_hash TEXT,
-			size INTEGER DEFAULT 0
-		);`
+	Schema     = `CREATE TABLE IF NOT EXISTS users ( pubkey_hash TEXT PRIMARY KEY, last_login DATETIME, upload_count INTEGER DEFAULT 0, total_bytes INTEGER DEFAULT 0, download_count INTEGER DEFAULT 0, download_bytes INTEGER DEFAULT 0 ); CREATE TABLE IF NOT EXISTS files ( path TEXT PRIMARY KEY, owner_hash TEXT, size INTEGER DEFAULT 0 );`
 )
 
 // --- Configuration ---
@@ -155,7 +145,7 @@ func setupLogger(cfg Config) *slog.Logger {
 		)
 	}
 
-	logger.Debug("server configuration",
+	logger.Info("server configuration",
 		slog.Group("config",
 			"port", cfg.Port,
 			"db_path", cfg.DBPath,
@@ -236,7 +226,8 @@ func (s *Server) Listen() {
 
 			if s.cfg.BannerStats {
 				st := s.getFileStats()
-				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n  Files: %d\r\n  Bytes: %d\r\n", st.Contributors, st.Count, st.Size)
+				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n  Files: %d\r\n  Bytes: %d\r\nMaximum upload size permitted per file: %s\r\n",
+					st.Contributors, st.Count, st.Size, st.MaxAllowed())
 			}
 
 			return fmt.Sprintf("%s\r\n%s", banner, stats)
@@ -391,6 +382,17 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		h.srv.logger.Debug("fileread denied: share-first policy", "user", h.pubHash[:12])
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
+
+	// Get file info for size tracking
+	fi, err := os.Stat(full)
+	if err != nil {
+		return nil, err
+	}
+	fileSize := fi.Size()
+
+	// Track the download
+	h.srv.logger.Debug("tracking download", "path", rel, "size", fileSize, "user", h.pubHash[:12])
+	h.srv.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", fileSize, h.pubHash)
 
 	return os.Open(full)
 }
@@ -567,10 +569,18 @@ type fileStats struct {
 	Contributors uint64
 	Count        uint64
 	Size         uint64
+	maxAllowed   int64
 }
 
-func (s *Server) getFileStats() (st fileStats) {
-	err := s.db.QueryRow("SELECT count(*), sum(size) from files").Scan(&st.Count, &st.Size)
+func (fs *fileStats) MaxAllowed() string {
+	if fs.maxAllowed <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d bytes", fs.maxAllowed)
+}
+
+func (s Server) getFileStats() (st fileStats) {
+	err := s.db.QueryRow("SELECT count(), sum(size) from files").Scan(&st.Count, &st.Size)
 	if err != nil {
 		s.logger.Debug("Could not get file statistics", err)
 	}
@@ -579,30 +589,30 @@ func (s *Server) getFileStats() (st fileStats) {
 	if err != nil {
 		s.logger.Debug("Could not get user statistics", err)
 	}
+
+	st.maxAllowed = s.cfg.MaxFileSize
 	return st
 }
 
 // --- DB & Metadata Helpers ---
 
 type userStats struct {
-	Count      int64
-	LastLogin  string
-	TotalBytes int64
-	FirstTimer bool
+	Count         int64
+	LastLogin     string
+	TotalBytes    int64
+	DownloadCount int64
+	DownloadBytes int64
+	FirstTimer    bool
 }
-
-// func (us *userStats) Contributor() bool {
-// 	return us.TotalBytes  > ContributorThresholdBytes
-// }
 
 func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count)
+	err := s.db.QueryRow("SELECT last_login, total_bytes, upload_count, download_count, download_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.TotalBytes, &st.Count, &st.DownloadCount, &st.DownloadBytes)
 	if err == sql.ErrNoRows {
 		s.logger.Debug("registering new user", "hash", hash[:12])
-		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
 		st.FirstTimer = true
 		st.LastLogin = "Never"
+		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
 	} else {
 		s.db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
 	}
@@ -618,7 +628,6 @@ func (s *Server) getRandomFortune() string {
 func (s *Server) reconcileOrphans() {
 	s.logger.Info("reconciling filesystem with database")
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
-
 		if err != nil || p == s.absUploadDir {
 			return nil
 		}
@@ -739,7 +748,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 		fmt.Fprintf(w, "\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
 		readme()
 	} else {
-		isContributor := stats.TotalBytes > 1024
+		isContributor := stats.TotalBytes > 1024*1024
 		color := Blue
 		if isContributor {
 			color = Yellow
@@ -757,7 +766,12 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
 		}
 	}
-	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
+	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes", userLabel, stats.LastLogin, stats.Count, stats.TotalBytes)
+	if stats.DownloadCount > 0 {
+		fmt.Fprintf(w, " |  Downloaded: %d files, %d bytes", stats.DownloadCount, stats.DownloadBytes)
+	}
+	fmt.Fprintf(w, "\r\n")
+
 }
 
 // --- Utilities ---
