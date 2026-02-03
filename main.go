@@ -356,7 +356,6 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 			"local_address", sConn.LocalAddr(),
 		),
 	)
-	//s.logger.Info("login", "user", sConn.User(), "id", pubHash[:12], "addr", nConn.RemoteAddr())
 
 	go ssh.DiscardRequests(reqs)
 
@@ -610,8 +609,6 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
 			relTgt, rel, rel, rel+"/%")
 		return nil
-	case "Fortune":
-		h.srv.logger.Info("testing the fortune command", h.srv.getRandomFortune())
 	}
 	return sftp.ErrSshFxOpUnsupported
 }
