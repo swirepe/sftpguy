@@ -99,7 +99,9 @@ const (
 		path TEXT PRIMARY KEY,
 		owner_hash TEXT,
 		size INTEGER DEFAULT 0
-	);`
+	);
+	
+	INSERT OR REPLACE INTO files(path, owner_hash) VALUES ("README.txt", "system");`
 )
 
 // --- Configuration ---
@@ -508,8 +510,9 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	defer tx.Rollback()
 
-	var currentOwner string
-	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
+	// var currentOwner string
+	// err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
+	currentOwner, err := h.srv.GetOwnerTX(tx, rel)
 	if err == sql.ErrNoRows {
 		h.logger.Debug("claiming new file ownership", "path", rel)
 		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
@@ -631,6 +634,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return nil
 	case "Rename":
 		relTgt, fullTgt := h.resolve(r.Target)
+
 		// var sOwner, sParentOwner, tOwner, tParentOwner string
 
 		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
@@ -655,7 +659,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		// err := h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 		targetOwner, err := h.srv.GetOwner(relTgt)
 		if err == nil {
-			if targetOwner != h.pubHash {
+			if targetOwner != "" && targetOwner != h.pubHash {
 				// h.logger.Debug("rename denied: target collision",)
 				return h.deny("The destination filename is already claimed by someone else.", "target", relTgt, "owner", targetOwner)
 			}
@@ -739,6 +743,15 @@ func (s *Server) GetUser(hash string) (u userStats) {
 func (s *Server) GetOwner(relPath string) (string, error) {
 	var owner string
 	err := s.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+	if err != nil {
+		return "", err
+	}
+	return owner, nil
+}
+
+func (s *Server) GetOwnerTX(tx *sql.Tx, relPath string) (string, error) {
+	var owner string
+	err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 	if err != nil {
 		return "", err
 	}
@@ -844,7 +857,7 @@ func (sw *statWriter) Close() error {
 }
 
 func (h *fsHandler) deny(msg string, args ...any) error {
-	h.logger.Debug(msg, args...)
+	h.logger.Info(msg, args...)
 	fmt.Fprintf(h.stderr, "\r\n\033[1;31mDENIED:\033[0m %s\r\n", msg)
 	return sftp.ErrSshFxPermissionDenied
 }
