@@ -417,50 +417,39 @@ type fsHandler struct {
 	logger    slog.Logger
 }
 
-func (h *fsHandler) securePath(p string) (rel string, full string) {
+func (h *fsHandler) resolve(p string) (rel string, full string) {
 	virt := path.Clean("/" + p)
 	rel = strings.TrimPrefix(virt, "/")
 	if rel == "" {
 		rel = "."
 	}
-	full = filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
-	h.srv.logger.Debug("path resolution", "input", p, "rel", rel, "full", full)
-	return rel, full
+	return rel, filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
 }
 
-func (h *fsHandler) ensureDirOwnership(relPath string) error {
+func (h *fsHandler) ensureDirs(relPath string) error {
+	if relPath == "." || relPath == "" {
+		return nil
+	}
 	if !h.srv.mkdirLimiter.Allow() {
-		h.logger.Debug("mkdir rate limited")
-		return h.deny("Rate limit exceeded.")
+		return h.deny("Mkdir rate limit reached.")
+	}
+	_, full := h.resolve(relPath)
+	if err := os.MkdirAll(full, 0755); err != nil {
+		return err
 	}
 
+	// Recursively track ownership of new dirs
 	parts := strings.Split(relPath, "/")
-	var currentRel string
-	for _, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-		if currentRel == "" {
-			currentRel = part
-		} else {
-			currentRel = path.Join(currentRel, part)
-		}
-
-		_, full := h.securePath(currentRel)
-		if err := os.MkdirAll(full, 0755); err != nil {
-			h.logger.Error("Could not create directories", "path", full, "error", err)
-			return err
-		}
-
-		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)",
-			currentRel, h.pubHash)
+	curr := ""
+	for _, p := range parts {
+		curr = path.Join(curr, p)
+		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, h.pubHash)
 	}
-
 	return nil
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	rel, full := h.securePath(r.Filepath)
+	rel, full := h.resolve(r.Filepath)
 	h.logger.Debug("fileread request", "path", rel)
 
 	if rel == "README.txt" {
@@ -473,7 +462,6 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	if !h.hasUploaded() {
-		h.logger.Debug("fileread denied: share-first policy")
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
@@ -490,7 +478,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	rel, full := h.securePath(r.Filepath)
+	rel, full := h.resolve(r.Filepath)
 	h.logger.Debug("filewrite request", "path", rel)
 
 	if rel == "README.txt" {
@@ -538,7 +526,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	if err := h.ensureDirOwnership(path.Dir(rel)); err != nil {
+	if err := h.ensureDirs(path.Dir(rel)); err != nil {
 		return nil, err
 	}
 
@@ -567,7 +555,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	rel, full := h.securePath(r.Filepath)
+	rel, full := h.resolve(r.Filepath)
 	h.logger.Debug("filelist request", "method", r.Method, "path", rel)
 
 	if r.Method == "List" {
@@ -610,7 +598,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
-	rel, full := h.securePath(r.Filepath)
+	rel, full := h.resolve(r.Filepath)
 	h.logger.Debug("filecmd request", "method", r.Method, "path", rel)
 
 	switch r.Method {
@@ -619,7 +607,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return h.deny("Symbolic links are not permitted on this server.")
 
 	case "Mkdir":
-		h.ensureDirOwnership(rel)
+		h.resolve(rel)
 		return nil
 
 	case "Remove", "Rmdir":
@@ -639,7 +627,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
 		return nil
 	case "Rename":
-		relTgt, fullTgt := h.securePath(r.Target)
+		relTgt, fullTgt := h.resolve(r.Target)
 		var sOwner, sParentOwner, tOwner, tParentOwner string
 
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
@@ -829,6 +817,7 @@ func (sw *statWriter) Close() error {
 }
 
 func (h *fsHandler) deny(msg string) error {
+	h.logger.Debug(msg)
 	fmt.Fprintf(h.stderr, "\r\n\033[1;31mDENIED:\033[0m %s\r\n", msg)
 	return sftp.ErrSshFxPermissionDenied
 }
