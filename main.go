@@ -23,6 +23,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+
+----------------------------------------------------------------------------
+
+
+# How to use this server
+
+# How to run this server
+
 */
 
 import (
@@ -79,19 +87,17 @@ const (
 // --- Configuration ---
 
 type Config struct {
-	Name          string
-	Port          int
-	HostKeyFile   string
-	DBPath        string
-	LogFile       string
-	UploadDir     string
-	BannerFile    string
-	BannerStats   bool
-	MkdirRate     float64
-	IncludeSource bool
-	Verbose       bool
-	AutoKey       bool
-	MaxFileSize   int64
+	Name        string
+	Port        int
+	HostKeyFile string
+	DBPath      string
+	LogFile     string
+	UploadDir   string
+	BannerFile  string
+	BannerStats bool
+	MkdirRate   float64
+	Verbose     bool
+	MaxFileSize int64
 }
 
 func LoadConfig() Config {
@@ -106,7 +112,6 @@ func LoadConfig() Config {
 	flag.BoolVar(&cfg.BannerStats, "banner.stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
 	flag.Float64Var(&cfg.MkdirRate, "mkdir.rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
 	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
-	flag.BoolVar(&cfg.AutoKey, "autokey", getEnvBool("AUTO_KEY", false), "Auto-generate host key if missing")
 
 	var maxSizeRaw string
 	flag.StringVar(&maxSizeRaw, "maxsize", getEnv("MAX_FILE_SIZE", "8gb"), "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
@@ -137,7 +142,6 @@ func LoadConfig() Config {
 }
 
 func setupLogger(cfg Config) *slog.Logger {
-	// Logger setup with level control
 	logWriter := io.MultiWriter(os.Stdout)
 	if f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 		logWriter = io.MultiWriter(os.Stdout, f)
@@ -168,7 +172,6 @@ func setupLogger(cfg Config) *slog.Logger {
 			"log_file", cfg.LogFile,
 			"banner_file", cfg.BannerFile,
 			"banner_stats", cfg.BannerStats,
-			"autokey", cfg.AutoKey,
 			"max_file_size", cfg.MaxFileSize,
 			"verbose", cfg.Verbose,
 		),
@@ -220,9 +223,6 @@ func main() {
 func (s *Server) Listen() {
 	if err := s.ensureHostKey(); err != nil {
 		s.logger.Error("host key error", "err", err)
-		if !s.cfg.AutoKey {
-			s.logger.Info("Hint: use -autokey to generate one automatically")
-		}
 		os.Exit(1)
 	}
 
@@ -282,10 +282,6 @@ func (s *Server) ensureHostKey() error {
 		return nil // Key already exists
 	}
 
-	if !s.cfg.AutoKey {
-		return fmt.Errorf("host key missing and -autokey not set")
-	}
-
 	s.logger.Info("generating new Ed25519 host key", "path", s.cfg.HostKeyFile)
 
 	_, priv, err := ed25519.GenerateKey(cryptorand.Reader)
@@ -329,6 +325,12 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	s.logger.Info("handling login",
 		slog.Group("user",
 			"id", pubHash[:12],
+			"last_login", stats.LastLogin,
+			"upload_count", stats.UploadCount,
+			"upload_bytes", stats.UploadBytes,
+			"download_count", stats.DownloadCount,
+			"download_bytes", stats.DownloadBytes,
+			"first_timer", stats.FirstTimer,
 		),
 		slog.Group("conn",
 			"user", sConn.User(),
