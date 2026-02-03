@@ -26,11 +26,21 @@ SOFTWARE.
 
 ----------------------------------------------------------------------------
 
+How this works:
+* anyone can download readme.txt
+* anyone can upload a file or make a directory
+* you cannot download a file until you upload a file
 
 # How to use this server
+	ssh-keygen -f id_throwaway -t ed25519 -N ''
+	sftp neuroky.me -i id_throwaway
 
 # How to run this server
-
+    echo "Believe in yourself" > fortunes.txt
+	cp README.txt main.go
+	go init
+	go mod tidy
+	go run main.go
 */
 
 import (
@@ -193,7 +203,6 @@ func main() {
 	cfg := LoadConfig()
 	logger := setupLogger(cfg)
 
-	// Database setup
 	db, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
 		logger.Error("DB connection failed", "err", err)
@@ -322,9 +331,11 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
 	stats := s.updateUserSession(pubHash)
+	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 	s.logger.Info("handling login",
 		slog.Group("user",
 			"id", pubHash[:12],
+			"uid", hashToUid(pubHash),
 			"last_login", stats.LastLogin,
 			"upload_count", stats.UploadCount,
 			"upload_bytes", stats.UploadBytes,
@@ -334,7 +345,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		),
 		slog.Group("conn",
 			"user", sConn.User(),
-			"session", fmt.Sprintf("%x", sConn.SessionID()),
+			"session", sessionID[:16],
 			"client_version", sConn.ClientVersion(),
 			"remote_address", sConn.RemoteAddr(),
 			"local_address", sConn.LocalAddr(),
@@ -358,7 +369,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 					req.Reply(true, nil)
 					s.Welcome(ch.Stderr(), pubHash, stats)
 
-					handler := &fsHandler{srv: s, pubHash: pubHash, stderr: ch.Stderr()}
+					handler := &fsHandler{srv: s, pubHash: pubHash, stderr: ch.Stderr(), sessionID: sessionID}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
 					})
@@ -375,9 +386,10 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 // --- SFTP Handlers ---
 
 type fsHandler struct {
-	srv     *Server
-	pubHash string
-	stderr  io.Writer
+	srv       *Server
+	pubHash   string
+	sessionID string
+	stderr    io.Writer
 }
 
 func (h *fsHandler) securePath(p string) (rel string, full string) {
@@ -393,7 +405,7 @@ func (h *fsHandler) securePath(p string) (rel string, full string) {
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("fileread request", "path", rel, "user", h.pubHash[:12])
+	h.srv.logger.Debug("fileread request", "path", rel, h.userGroup())
 
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
@@ -423,7 +435,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filewrite request", "path", rel, "user", h.pubHash[:12])
+	h.srv.logger.Debug("filewrite request", "path", rel, h.userGroup())
 
 	if rel == "README.txt" {
 		return nil, h.deny("README.txt is a protected system file.")
@@ -497,7 +509,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filelist request", "method", r.Method, "path", rel)
+	h.srv.logger.Debug("filelist request", "method", r.Method, "path", rel, h.userGroup())
 
 	if r.Method == "List" {
 		entries, err := os.ReadDir(full)
@@ -538,9 +550,17 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
 
+func (h *fsHandler) userGroup() slog.Attr {
+	return slog.Group("user",
+		"id", h.pubHash[:12],
+		"uid", hashToUid(h.pubHash),
+		"session", h.sessionID[:16],
+	)
+}
+
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filecmd request", "method", r.Method, "path", rel)
+	h.srv.logger.Debug("filecmd request", "method", r.Method, "path", rel, h.userGroup())
 
 	switch r.Method {
 	case "Symlink", "Link":
@@ -585,6 +605,8 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
 			relTgt, rel, rel, rel+"/%")
 		return nil
+	case "Fortune":
+		h.srv.logger.Info("testing the fortune command", h.srv.getRandomFortune())
 	}
 	return sftp.ErrSshFxOpUnsupported
 }
