@@ -85,7 +85,7 @@ import (
 var embeddedSource embed.FS
 
 const (
-	AppVersion = "1.7.7"
+	AppVersion = "1.7.9"
 	Schema     = `CREATE TABLE IF NOT EXISTS users ( 
 		pubkey_hash TEXT PRIMARY KEY, 
 		last_login DATETIME, 
@@ -449,7 +449,7 @@ func (h *fsHandler) ensureDirOwnership(relPath string) error {
 		}
 
 		_, full := h.securePath(currentRel)
-		if err := os.Mkdir(full, 0755); err != nil {
+		if err := os.MkdirAll(full, 0755); err != nil {
 			h.logger.Error("Could not create directories", "path", full, "error", err)
 			return err
 		}
@@ -631,9 +631,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&parentOwner)
 
-		// Permission is granted if you own the file OR you own the directory it sits in
 		canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
-
 		if !canDelete && owner != "" {
 			h.logger.Debug("remove denied: not owner or parent owner", "path", rel, "owner", owner, "parentOwner", parentOwner)
 			return h.deny("You do not have permission to delete this.")
@@ -644,25 +642,52 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return nil
 	case "Rename":
 		relTgt, fullTgt := h.securePath(r.Target)
-		var sOwner, sParentOwner string
+		var sOwner, sParentOwner, tOwner, tParentOwner string
 
-		// Check ownership of source and its parent
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&sParentOwner)
-
-		// Allow if user owns the file or the folder it is coming from
 		if sOwner != h.pubHash && sParentOwner != h.pubHash {
-			h.logger.Debug("rename denied: permission issue", "src", rel)
-			return h.deny("Rename permission denied.")
+			h.logger.Debug("rename denied: source permission issue", "src", rel)
+			return h.deny("You do not own the source file or directory.")
+		}
+
+		targetDir := path.Dir(relTgt)
+		if targetDir != "." {
+			h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", targetDir).Scan(&tParentOwner)
+			if h.srv.cfg.LockDirectoriesToOwners && tParentOwner != "" && tParentOwner != h.pubHash {
+				h.logger.Debug("rename denied: target directory owned by other", "targetDir", targetDir)
+				return h.deny("Cannot move files into a directory owned by another user.")
+			}
+		}
+
+		err := h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
+		if err == nil {
+			if tOwner != h.pubHash {
+				h.logger.Debug("rename denied: target collision", "tgt", relTgt, "owner", tOwner)
+				return h.deny("The destination filename is already claimed by someone else.")
+			}
 		}
 
 		if err := os.Rename(full, fullTgt); err != nil {
+			h.logger.Error("rename failed", "err", err)
 			return err
 		}
 
-		h.srv.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
+		tx, err := h.srv.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		_, err = tx.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
 			relTgt, rel, rel, rel+"/%")
-		return nil
+
+		if err != nil {
+			h.logger.Error("db update failed after rename", "err", err)
+			return err
+		}
+
+		return tx.Commit()
 	}
 	return sftp.ErrSshFxOpUnsupported
 }
