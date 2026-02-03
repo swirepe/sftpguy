@@ -27,9 +27,10 @@ SOFTWARE.
 ----------------------------------------------------------------------------
 
 How this works:
+* you cannot download a file until you upload a file
 * anyone can download readme.txt
 * anyone can upload a file or make a directory
-* you cannot download a file until you upload a file
+* you can delete, rename, or resume uploading files you created
 
 # How to use this server
 	ssh-keygen -f id_throwaway -t ed25519 -N ''
@@ -77,7 +78,7 @@ import (
 var embeddedSource embed.FS
 
 const (
-	AppVersion = "1.4.2"
+	AppVersion = "1.6.2"
 	Schema     = `CREATE TABLE IF NOT EXISTS users ( 
 		pubkey_hash TEXT PRIMARY KEY, 
 		last_login DATETIME, 
@@ -141,12 +142,12 @@ func LoadConfig() Config {
 		os.Exit(0)
 	}
 
-	limit, err := parseSize(maxSizeRaw)
+	maxSize, err := parseSize(maxSizeRaw)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing maxsize: %v\n", err)
 		os.Exit(1)
 	}
-	cfg.MaxFileSize = limit
+	cfg.MaxFileSize = maxSize
 
 	return cfg
 }
