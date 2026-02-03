@@ -26,17 +26,21 @@ SOFTWARE.
 
 ----------------------------------------------------------------------------
 
-How this works:
-* you cannot download a file until you upload a file
-* anyone can download readme.txt
-* anyone can upload a file or make a directory
-* you can delete, rename, or resume uploading files you created
+# What is this?
+	This is an anonymous sftp server that encourages user contributions.
 
-# How to use this server
+# How this works:
+    * you log in with your ssh key.  Any ssh key is accepted.
+	* you cannot download a file until you upload a file
+	* anyone can download README.txt (this file)
+	* anyone can upload a file or make a directory
+	* you can delete, rename, or resume uploading files you created
+
+# How to use this server:
 	ssh-keygen -f id_throwaway -t ed25519 -N ''
-	sftp neuroky.me -i id_throwaway
+	sftp <host> -i id_throwaway
 
-# How to run this server
+# How to run this server:
     echo "Believe in yourself" > fortunes.txt
 	cp README.txt main.go
 	go init
