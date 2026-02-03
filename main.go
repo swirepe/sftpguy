@@ -105,17 +105,18 @@ const (
 // --- Configuration ---
 
 type Config struct {
-	Name        string
-	Port        int
-	HostKeyFile string
-	DBPath      string
-	LogFile     string
-	UploadDir   string
-	BannerFile  string
-	BannerStats bool
-	MkdirRate   float64
-	Verbose     bool
-	MaxFileSize int64
+	Name                    string
+	Port                    int
+	HostKeyFile             string
+	DBPath                  string
+	LogFile                 string
+	UploadDir               string
+	BannerFile              string
+	BannerStats             bool
+	MkdirRate               float64
+	LockDirectoriesToOwners bool
+	Verbose                 bool
+	MaxFileSize             int64
 }
 
 func LoadConfig() Config {
@@ -128,7 +129,8 @@ func LoadConfig() Config {
 	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
 	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
 	flag.BoolVar(&cfg.BannerStats, "banner.stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
-	flag.Float64Var(&cfg.MkdirRate, "mkdir.rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
+	flag.Float64Var(&cfg.MkdirRate, "dir.rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
+	flag.BoolVar(&cfg.LockDirectoriesToOwners, "dir.owners_only", getEnvBool("LOCK_DIRS_TO_OWNERS", false), "Users can only upload to directories they own")
 	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
 
 	var maxSizeRaw string
@@ -185,6 +187,7 @@ func setupLogger(cfg Config) *slog.Logger {
 			"port", cfg.Port,
 			"db_path", cfg.DBPath,
 			"upload_dir", cfg.UploadDir,
+			"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
 			"host_key", cfg.HostKeyFile,
 			"mkdir_rate", cfg.MkdirRate,
 			"log_file", cfg.LogFile,
@@ -490,7 +493,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if parentRel != "." {
 		var pOwner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
-		if pOwner != "" && pOwner != h.pubHash {
+		if h.srv.cfg.LockDirectoriesToOwners && pOwner != "" && pOwner != h.pubHash {
 			h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", pOwner)
 			return nil, h.deny("Cannot write to another user's directory.")
 		}
@@ -608,23 +611,33 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	case "Remove", "Rmdir":
 		var owner string
+		var parentOwner string
+
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-		if owner != "" && owner != h.pubHash {
-			h.logger.Debug("remove denied: not owner", "path", rel, "owner", owner)
-			return h.deny("You can only remove your own files.")
+		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&parentOwner)
+
+		// Permission is granted if you own the file OR you own the directory it sits in
+		canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
+
+		if !canDelete && owner != "" {
+			h.logger.Debug("remove denied: not owner or parent owner", "path", rel, "owner", owner, "parentOwner", parentOwner)
+			return h.deny("You do not have permission to delete this.")
 		}
+
 		os.RemoveAll(full)
 		h.srv.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
 		return nil
-
 	case "Rename":
 		relTgt, fullTgt := h.securePath(r.Target)
-		var sOwner, tOwner string
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
+		var sOwner, sParentOwner string
 
-		if sOwner != h.pubHash || (tOwner != "" && tOwner != h.pubHash) {
-			h.logger.Debug("rename denied: permission issue", "src", rel, "src_owner", sOwner, "target", relTgt, "target_owner", tOwner)
+		// Check ownership of source and its parent
+		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
+		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&sParentOwner)
+
+		// Allow if user owns the file or the folder it is coming from
+		if sOwner != h.pubHash && sParentOwner != h.pubHash {
+			h.logger.Debug("rename denied: permission issue", "src", rel)
 			return h.deny("Rename permission denied.")
 		}
 
