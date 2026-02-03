@@ -452,7 +452,7 @@ func (h *fsHandler) ensureDirs(relPath string) error {
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.resolve(r.Filepath)
-	h.logger.Debug("fileread request", "path", rel)
+	h.logger.Debug("fileread request", "path", rel, "req", r)
 
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
@@ -460,7 +460,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny("Symlinks are prohibited.")
+		return nil, h.deny("Symlinks are prohibited.", "path", rel)
 	}
 
 	if !h.hasUploaded() {
@@ -473,7 +473,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 	fileSize := fi.Size()
 
-	h.srv.logger.Debug("tracking download", "path", rel, "size", fileSize, "user", h.pubHash[:12])
+	h.logger.Debug("tracking download", "path", rel, "size", fileSize)
 	h.srv.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", fileSize, h.pubHash)
 
 	return os.Open(full)
@@ -499,8 +499,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		parentOwner, _ := h.srv.GetOwner(parentRel)
 		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
 		if h.srv.cfg.LockDirectoriesToOwners && parentOwner != "" && parentOwner != h.pubHash {
-			h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", parentOwner)
-			return nil, h.deny("Cannot write to another user's directory.")
+			// h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", parentOwner)
+			return nil, h.deny("Cannot write to another user's directory.", "parent", parentRel, "owner", parentOwner)
 		}
 	}
 
@@ -522,8 +522,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 			return nil, err
 		}
 	} else if currentOwner != h.pubHash {
-		h.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
-		return nil, h.deny("This filename is already claimed.")
+		// h.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
+		return nil, h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -858,7 +858,7 @@ func (sw *statWriter) Close() error {
 
 func (h *fsHandler) deny(msg string, args ...any) error {
 	h.logger.Info(msg, args...)
-	fmt.Fprintf(h.stderr, "\r\n\033[1;31mDENIED:\033[0m %s\r\n", msg)
+	fmt.Fprintf(h.stderr, "\r\n%s %s\r\n", red.Fmt("DENIED:"), msg)
 	return sftp.ErrSshFxPermissionDenied
 }
 
@@ -868,58 +868,51 @@ func (h *fsHandler) hasUploaded() bool {
 	return count > 0
 }
 
+type asciiColor string
+
 const (
-	bold   = "\033[1m"
-	blue   = "\033[1;34m"
-	yellow = "\033[1;33m"
-	green  = "\033[0;32m"
+	off     asciiColor = "\033[0m"
+	bold    asciiColor = "\033[1m"
+	blue    asciiColor = "\033[1;34m"
+	yellow  asciiColor = "\033[1;33m"
+	yellowI asciiColor = "\033[3;33m"
+	green   asciiColor = "\033[0;32m"
+	red     asciiColor = "\033[1;31m"
 )
 
-func Bold(s string) string {
-	return fmt.Sprintf("%s%s\033[0m", bold, s)
-}
-
-func Blue(s string) string {
-	return fmt.Sprintf("%s%s\033[0m", blue, s)
-}
-
-func Yellow(s string) string {
-	return fmt.Sprintf("%s%s\033[0m", yellow, s)
-}
-
-func Green(s string) string {
-	return fmt.Sprintf("%s%s\033[0m", green, s)
+func (c asciiColor) Fmt(s string) string {
+	return fmt.Sprintf("%s%s%s", c, s, off)
 }
 
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
 
 	readme := func() {
-		fmt.Fprintf(w, "\033[1mReminder:\033[0m upload a file to download a file.\r\n")
-		fmt.Fprintf(w, "  See \033[1mREADME.txt\033[0m for more information.\r\n")
-		fmt.Fprintf(w, "  You may always download \033[1mREADME.txt\033[0m\r\n")
+		fmt.Fprintf(w, bold.Fmt("Reminder: ")+"upload a file to download a file.\r\n")
+		fmt.Fprintf(w, "  See "+bold.Fmt("README.txt")+" for more information.\r\n")
+		fmt.Fprintf(w, "  You may always download "+bold.Fmt("README.txt")+"\r\n")
 	}
 
 	if stats.FirstTimer {
-		fmt.Fprintf(w, "\r\n\033[1mWelcome, %s\033[0m. This is a share-first archive.\r\n", userLabel)
+		fmt.Fprintf(w, bold.Fmt("\r\nWelcome, "+userLabel)+". This is a share-first archive.\r\n")
 		readme()
 	} else {
 		isContributor := stats.UploadBytes > 1024*1024
-		color := Blue
+		color := blue
 		if isContributor {
-			color = Yellow
+			color = yellow
 		}
 
-		fmt.Fprintf(w, "\r\nWelcome, %s\033[0m\r\n", color(userLabel))
+		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Fmt(userLabel))
 		if isContributor {
-			fmt.Fprintf(w, "\033[3;33m\"%s\"\033[0m\r\n", s.getRandomFortune())
+			fmt.Fprintf(w, "\r\n\"%s\"\r\n", yellowI.Fmt(s.getRandomFortune()))
 		}
 
 		if stats.UploadCount == 0 {
 			fmt.Fprintf(w, "\033[31;1mDownloads are restricted.\033[0m\r\n")
 			readme()
 		} else {
-			fmt.Fprintf(w, Green("Downloading is unlocked.\r\n"))
+			fmt.Fprintf(w, green.Fmt("Downloading is unlocked.\r\n"))
 		}
 
 	}
@@ -936,7 +929,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
 	val := GetEnv(env, def)
 	*ptr = val
-	usageWithEnv := fmt.Sprintf("%s (env: %s)", usage, Bold(env))
+	usageWithEnv := fmt.Sprintf("%s (env: %s)", usage, bold.Fmt(env))
 
 	switch p := any(ptr).(type) {
 	case *string:
