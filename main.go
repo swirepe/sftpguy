@@ -27,7 +27,10 @@ SOFTWARE.
 ----------------------------------------------------------------------------
 
 # What is this?
-	This is an anonymous sftp server that encourages user contributions.
+	This is an anonymous sftp archive that encourages user contributions.
+
+	Upload something that you find thought-provoking or beautiful to gain
+	download access to the archive.
 
 # How this works:
     * you log in with your ssh key.  Any ssh key is accepted.
