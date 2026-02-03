@@ -421,6 +421,27 @@ func (h *fsHandler) securePath(p string) (rel string, full string) {
 	return rel, full
 }
 
+func (h *fsHandler) ensureDirOwnership(relPath string) {
+	parts := strings.Split(relPath, "/")
+	var currentRel string
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if currentRel == "" {
+			currentRel = part
+		} else {
+			currentRel = path.Join(currentRel, part)
+		}
+
+		_, full := h.securePath(currentRel)
+		_ = os.Mkdir(full, 0755)
+
+		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)",
+			currentRel, h.pubHash)
+	}
+}
+
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.securePath(r.Filepath)
 	h.logger.Debug("fileread request", "path", rel)
@@ -500,7 +521,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	_ = os.MkdirAll(filepath.Dir(full), 0755)
+	h.ensureDirOwnership(path.Dir(rel))
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
 		flags |= os.O_TRUNC
@@ -582,8 +603,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			h.logger.Debug("mkdir rate limited")
 			return h.deny("Rate limit exceeded.")
 		}
-		os.MkdirAll(full, 0755)
-		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash)
+		h.ensureDirOwnership(rel)
 		return nil
 
 	case "Remove", "Rmdir":
