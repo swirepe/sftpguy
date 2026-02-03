@@ -871,17 +871,30 @@ func (h *fsHandler) hasUploaded() bool {
 type asciiColor string
 
 const (
-	off     asciiColor = "\033[0m"
-	bold    asciiColor = "\033[1m"
-	blue    asciiColor = "\033[1;34m"
-	yellow  asciiColor = "\033[1;33m"
-	yellowI asciiColor = "\033[3;33m"
-	green   asciiColor = "\033[0;32m"
-	red     asciiColor = "\033[1;31m"
+	off    asciiColor = "\033[0m"
+	bold   asciiColor = "\033[1m"
+	blue   asciiColor = "\033[%d;34m"
+	yellow asciiColor = "\033[%d;33m"
+	green  asciiColor = "\033[%d;32m"
+	red    asciiColor = "\033[%d;31m"
 )
 
 func (c asciiColor) Fmt(s string) string {
-	return fmt.Sprintf("%s%s%s", c, s, off)
+	if c == bold || c == off {
+		return fmt.Sprintf("%s%s%s", c, s, off)
+	}
+	cNormal := fmt.Sprintf(string(c), 0)
+	return fmt.Sprintf("%s%s%s", cNormal, s, off)
+}
+
+func (c asciiColor) Bold(s string) string {
+	cBold := fmt.Sprintf(string(c), 1)
+	return fmt.Sprintf("%s%s%s", cBold, s, off)
+}
+
+func (c asciiColor) Italic(s string) string {
+	cBold := fmt.Sprintf(string(c), 3)
+	return fmt.Sprintf("%s%s%s", cBold, s, off)
 }
 
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
@@ -903,9 +916,9 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 			color = yellow
 		}
 
-		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Fmt(userLabel))
+		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
 		if isContributor {
-			fmt.Fprintf(w, "\r\n\"%s\"\r\n", yellowI.Fmt(s.getRandomFortune()))
+			fmt.Fprintf(w, "\r\n\"%s\"\r\n", color.Italic(s.getRandomFortune()))
 		}
 
 		if stats.UploadCount == 0 {
