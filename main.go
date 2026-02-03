@@ -253,25 +253,7 @@ func (s *Server) Listen() {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		BannerCallback: func(conn ssh.ConnMetadata) string {
-			banner := ""
-			stats := ""
-			b, err := embeddedSource.ReadFile(s.cfg.BannerFile)
-			if err != nil {
-				s.logger.Debug("Banner file not readable, using default banner", err)
-				banner = fmt.Sprintf("=== %s v%s - anonymous share-first sftp server ===", s.cfg.Name, AppVersion)
-			} else {
-				banner = string(b)
-			}
-
-			if s.cfg.BannerStats {
-				st := s.getFileStats()
-				stats = fmt.Sprintf("Serving:\r\n  Contributors: %d\r\n  Files: %d\r\n  Bytes: %d\r\nMaximum upload size permitted per file: %s\r\n",
-					st.Contributors, st.Count, st.Size, st.MaxAllowed())
-			}
-
-			return fmt.Sprintf("%s\r\n%s", banner, stats)
-		},
+		BannerCallback: s.bannerCallback,
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
@@ -300,6 +282,22 @@ func (s *Server) Listen() {
 		}
 		go s.handleSSH(conn, sshConfig)
 	}
+}
+
+func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
+	b, err := embeddedSource.ReadFile(s.cfg.BannerFile)
+	banner := string(b)
+	if err != nil {
+		banner = fmt.Sprintf("=== %s v%s ===", s.cfg.Name, AppVersion)
+	}
+
+	if s.cfg.BannerStats {
+		var u, f, b uint64
+		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_count > 0").Scan(&u)
+		s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
+		banner += fmt.Sprintf("\r\nContributors: %d | Files: %d | Size: %d bytes\r\n", u, f, b)
+	}
+	return banner
 }
 
 func (s *Server) ensureHostKey() error {
