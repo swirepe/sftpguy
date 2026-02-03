@@ -493,10 +493,11 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	// Check folder ownership
 	parentRel := path.Dir(rel)
 	if parentRel != "." {
-		var pOwner string
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
-		if h.srv.cfg.LockDirectoriesToOwners && pOwner != "" && pOwner != h.pubHash {
-			h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", pOwner)
+		// var pOwner string
+		parentOwner, _ := h.srv.GetOwner(parentRel)
+		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
+		if h.srv.cfg.LockDirectoriesToOwners && parentOwner != "" && parentOwner != h.pubHash {
+			h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", parentOwner)
 			return nil, h.deny("Cannot write to another user's directory.")
 		}
 	}
@@ -572,8 +573,9 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 		for _, e := range entries {
 			fi, _ := e.Info()
-			var owner string
-			h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Join(rel, e.Name())).Scan(&owner)
+			// var owner string
+			// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Join(rel, e.Name())).Scan(&owner)
+			owner, _ := h.srv.GetOwner(path.Join(rel, e.Name()))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
 		}
 		return listerAt(files), nil
@@ -592,8 +594,9 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, h.deny("Access to symlinks is forbidden.")
 	}
 
-	var owner string
-	h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+	// var owner string
+	// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+	owner, _ := h.srv.GetOwner(rel)
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
 
@@ -611,12 +614,13 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return nil
 
 	case "Remove", "Rmdir":
-		var owner string
-		var parentOwner string
+		// var owner string
+		// var parentOwner string
 
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&parentOwner)
-
+		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
+		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&parentOwner)
+		owner, _ := h.srv.GetOwner(rel)
+		parentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 		canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
 		if !canDelete && owner != "" {
 			h.logger.Debug("remove denied: not owner or parent owner", "path", rel, "owner", owner, "parentOwner", parentOwner)
@@ -628,28 +632,33 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return nil
 	case "Rename":
 		relTgt, fullTgt := h.resolve(r.Target)
-		var sOwner, sParentOwner, tOwner, tParentOwner string
+		// var sOwner, sParentOwner, tOwner, tParentOwner string
 
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
-		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&sParentOwner)
-		if sOwner != h.pubHash && sParentOwner != h.pubHash {
+		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
+		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&sParentOwner)
+		sourceOwner, _ := h.srv.GetOwner(rel)
+		sourceParentOwner, _ := h.srv.GetOwner(path.Dir(rel))
+
+		if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
 			h.logger.Debug("rename denied: source permission issue", "src", rel)
 			return h.deny("You do not own the source file or directory.")
 		}
 
 		targetDir := path.Dir(relTgt)
-		if targetDir != "." {
-			h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", targetDir).Scan(&tParentOwner)
-			if h.srv.cfg.LockDirectoriesToOwners && tParentOwner != "" && tParentOwner != h.pubHash {
+		if h.srv.cfg.LockDirectoriesToOwners && targetDir != "." {
+			targetParentOwner, _ := h.srv.GetOwner(targetDir)
+			// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", targetDir).Scan(&tParentOwner)
+			if targetParentOwner != "" && targetParentOwner != h.pubHash {
 				h.logger.Debug("rename denied: target directory owned by other", "targetDir", targetDir)
 				return h.deny("Cannot move files into a directory owned by another user.")
 			}
 		}
 
-		err := h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
+		// err := h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
+		targetOwner, err := h.srv.GetOwner(relTgt)
 		if err == nil {
-			if tOwner != h.pubHash {
-				h.logger.Debug("rename denied: target collision", "tgt", relTgt, "owner", tOwner)
+			if targetOwner != h.pubHash {
+				h.logger.Debug("rename denied: target collision", "target", relTgt, "owner", targetOwner)
 				return h.deny("The destination filename is already claimed by someone else.")
 			}
 		}
@@ -716,6 +725,25 @@ type userStats struct {
 	DownloadCount int64
 	DownloadBytes int64
 	FirstTimer    bool
+}
+
+func (s *Server) GetUser(hash string) (u userStats) {
+	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes 
+		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes)
+	if err == sql.ErrNoRows {
+		u.FirstTimer = true
+		u.LastLogin = "Never"
+	}
+	return u
+}
+
+func (s *Server) GetOwner(relPath string) (string, error) {
+	var owner string
+	err := s.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+	if err != nil {
+		return "", err
+	}
+	return owner, nil
 }
 
 func (s *Server) updateUserSession(hash string) (st userStats) {
