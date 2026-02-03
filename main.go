@@ -623,8 +623,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		parentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 		canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
 		if !canDelete && owner != "" {
-			h.logger.Debug("remove denied: not owner or parent owner", "path", rel, "owner", owner, "parentOwner", parentOwner)
-			return h.deny("You do not have permission to delete this.")
+			return h.deny("You do not have permission to delete this.", "path", rel, "owner", owner, "parentOwner", parentOwner)
 		}
 
 		os.RemoveAll(full)
@@ -640,8 +639,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		sourceParentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 
 		if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
-			h.logger.Debug("rename denied: source permission issue", "src", rel)
-			return h.deny("You do not own the source file or directory.")
+			return h.deny("You do not own the source file or directory.", "src", rel)
 		}
 
 		targetDir := path.Dir(relTgt)
@@ -649,8 +647,8 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			targetParentOwner, _ := h.srv.GetOwner(targetDir)
 			// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", targetDir).Scan(&tParentOwner)
 			if targetParentOwner != "" && targetParentOwner != h.pubHash {
-				h.logger.Debug("rename denied: target directory owned by other", "targetDir", targetDir)
-				return h.deny("Cannot move files into a directory owned by another user.")
+				// h.logger.Debug("rename denied: target directory owned by other", )
+				return h.deny("Cannot move files into a directory owned by another user.", "targetDir", targetDir)
 			}
 		}
 
@@ -658,14 +656,15 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		targetOwner, err := h.srv.GetOwner(relTgt)
 		if err == nil {
 			if targetOwner != h.pubHash {
-				h.logger.Debug("rename denied: target collision", "target", relTgt, "owner", targetOwner)
-				return h.deny("The destination filename is already claimed by someone else.")
+				// h.logger.Debug("rename denied: target collision",)
+				return h.deny("The destination filename is already claimed by someone else.", "target", relTgt, "owner", targetOwner)
 			}
 		}
 
 		if err := os.Rename(full, fullTgt); err != nil {
-			h.logger.Error("rename failed", "err", err)
-			return err
+			return h.deny("rename failed", "err", err)
+			// h.logger.Error("rename failed", "err", err)
+			// return err
 		}
 
 		tx, err := h.srv.db.Begin()
@@ -844,8 +843,8 @@ func (sw *statWriter) Close() error {
 	return sw.File.Close()
 }
 
-func (h *fsHandler) deny(msg string) error {
-	h.logger.Debug(msg)
+func (h *fsHandler) deny(msg string, args ...any) error {
+	h.logger.Debug(msg, args...)
 	fmt.Fprintf(h.stderr, "\r\n\033[1;31mDENIED:\033[0m %s\r\n", msg)
 	return sftp.ErrSshFxPermissionDenied
 }
