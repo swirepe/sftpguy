@@ -85,7 +85,7 @@ import (
 var embeddedSource embed.FS
 
 const (
-	AppVersion = "1.6.2"
+	AppVersion = "1.7.7"
 	Schema     = `CREATE TABLE IF NOT EXISTS users ( 
 		pubkey_hash TEXT PRIMARY KEY, 
 		last_login DATETIME, 
@@ -121,23 +121,29 @@ type Config struct {
 
 func LoadConfig() Config {
 	cfg := Config{}
-	flag.StringVar(&cfg.Name, "name", GetEnv("ARCHIVE_NAME", "curioarium-sftp"), "Archive name")
-	flag.IntVar(&cfg.Port, "port", GetEnv("SFTP_PORT", 2222), "SSH port")
-	flag.StringVar(&cfg.HostKeyFile, "hostkey", GetEnv("HOST_KEY", "id_ed25519"), "SSH host key")
-	flag.StringVar(&cfg.DBPath, "db", GetEnv("DB_PATH", "sftp.db"), "SQLite path")
-	flag.StringVar(&cfg.LogFile, "logfile", GetEnv("LOG_FILE", "sftp.log"), "Log file path")
-	flag.StringVar(&cfg.UploadDir, "dir", GetEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
-	flag.StringVar(&cfg.BannerFile, "banner", GetEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
-	flag.BoolVar(&cfg.BannerStats, "banner.stats", GetEnv("BANNER_STATS", false), "Show file statistics in the banner")
-	flag.Float64Var(&cfg.MkdirRate, "dir.rate", GetEnv("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
-	flag.BoolVar(&cfg.LockDirectoriesToOwners, "dir.owners_only", GetEnv("LOCK_DIRS_TO_OWNERS", false), "Users can only upload to directories they own")
-	flag.BoolVar(&cfg.Verbose, "verbose", GetEnv("VERBOSE", false), "Enable debug logging")
+	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "curioarium-sftp", "Archive name")
+	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port")
+	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
+	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
+	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
+	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
+	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
+	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
+	EnvFlag(&cfg.MkdirRate, "dir.rate", "MKDIR_RATE", 10.0, "Global mkdir rate limit in directories per second")
+	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
+	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable debug logging")
 
 	var maxSizeRaw string
-	flag.StringVar(&maxSizeRaw, "maxsize", GetEnv("MAX_FILE_SIZE", "8gb"), "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
+	EnvFlag(&maxSizeRaw, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "Note: environment variables may be prefixed with SFTP_ (e.g. SFTP_PORT is checked before PORT)\n")
+	}
 	flag.Parse()
 
 	if *v {
@@ -705,7 +711,7 @@ func (s *Server) updateUserSession(hash string) (st userStats) {
 	now := time.Now().Format("2006-01-02 15:04:05")
 	err := s.db.QueryRow("SELECT last_login, upload_count, upload_bytes, download_count, download_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.UploadCount, &st.UploadBytes, &st.DownloadCount, &st.DownloadBytes)
 	if err == sql.ErrNoRows {
-		s.logger.Debug("registering new user", "hash", hash[:12])
+		s.logger.Debug("registering new user", "user.id", hash[:12])
 		st.FirstTimer = true
 		st.LastLogin = "Never"
 		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
@@ -817,6 +823,10 @@ const (
 	green  = "\033[0;32m"
 )
 
+func Bold(s string) string {
+	return fmt.Sprintf("%s%s\033[0m", bold, s)
+}
+
 func Blue(s string) string {
 	return fmt.Sprintf("%s%s\033[0m", blue, s)
 }
@@ -870,6 +880,25 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 }
 
 // --- Utilities ---
+
+func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
+	val := GetEnv(env, def)
+	*ptr = val
+	usageWithEnv := fmt.Sprintf("%s (env: %s)", usage, Bold(env))
+
+	switch p := any(ptr).(type) {
+	case *string:
+		flag.StringVar(p, name, any(val).(string), usageWithEnv)
+	case *int:
+		flag.IntVar(p, name, any(val).(int), usageWithEnv)
+	case *bool:
+		flag.BoolVar(p, name, any(val).(bool), usageWithEnv)
+	case *float64:
+		flag.Float64Var(p, name, any(val).(float64), usageWithEnv)
+	default:
+		panic(fmt.Sprintf("unsupported flag type: %T", val))
+	}
+}
 
 func GetEnv[T any](k string, defaultValue T) T {
 	val, ok := os.LookupEnv(fmt.Sprintf("SFTP_%s", k))
