@@ -121,20 +121,20 @@ type Config struct {
 
 func LoadConfig() Config {
 	cfg := Config{}
-	flag.StringVar(&cfg.Name, "name", getEnv("ARCHIVE_NAME", "curioarium-sftp"), "Archive name")
-	flag.IntVar(&cfg.Port, "port", getEnvInt("SFTP_PORT", 2222), "SSH port")
-	flag.StringVar(&cfg.HostKeyFile, "hostkey", getEnv("HOST_KEY", "id_ed25519"), "SSH host key")
-	flag.StringVar(&cfg.DBPath, "db", getEnv("DB_PATH", "sftp.db"), "SQLite path")
-	flag.StringVar(&cfg.LogFile, "logfile", getEnv("LOG_FILE", "sftp.log"), "Log file path")
-	flag.StringVar(&cfg.UploadDir, "dir", getEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
-	flag.StringVar(&cfg.BannerFile, "banner", getEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
-	flag.BoolVar(&cfg.BannerStats, "banner.stats", getEnvBool("BANNER_STATS", false), "Show file statistics in the banner")
-	flag.Float64Var(&cfg.MkdirRate, "dir.rate", getEnvFloat("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
-	flag.BoolVar(&cfg.LockDirectoriesToOwners, "dir.owners_only", getEnvBool("LOCK_DIRS_TO_OWNERS", false), "Users can only upload to directories they own")
-	flag.BoolVar(&cfg.Verbose, "verbose", getEnvBool("VERBOSE", false), "Enable debug logging")
+	flag.StringVar(&cfg.Name, "name", GetEnv("ARCHIVE_NAME", "curioarium-sftp"), "Archive name")
+	flag.IntVar(&cfg.Port, "port", GetEnv("SFTP_PORT", 2222), "SSH port")
+	flag.StringVar(&cfg.HostKeyFile, "hostkey", GetEnv("HOST_KEY", "id_ed25519"), "SSH host key")
+	flag.StringVar(&cfg.DBPath, "db", GetEnv("DB_PATH", "sftp.db"), "SQLite path")
+	flag.StringVar(&cfg.LogFile, "logfile", GetEnv("LOG_FILE", "sftp.log"), "Log file path")
+	flag.StringVar(&cfg.UploadDir, "dir", GetEnv("UPLOAD_DIR", "./uploads"), "Upload directory")
+	flag.StringVar(&cfg.BannerFile, "banner", GetEnv("BANNER_FILE", "BANNER.txt"), "Banner file")
+	flag.BoolVar(&cfg.BannerStats, "banner.stats", GetEnv("BANNER_STATS", false), "Show file statistics in the banner")
+	flag.Float64Var(&cfg.MkdirRate, "dir.rate", GetEnv("MKDIR_RATE", 10.0), "Global mkdir rate limit in directories per second")
+	flag.BoolVar(&cfg.LockDirectoriesToOwners, "dir.owners_only", GetEnv("LOCK_DIRS_TO_OWNERS", false), "Users can only upload to directories they own")
+	flag.BoolVar(&cfg.Verbose, "verbose", GetEnv("VERBOSE", false), "Enable debug logging")
 
 	var maxSizeRaw string
-	flag.StringVar(&maxSizeRaw, "maxsize", getEnv("MAX_FILE_SIZE", "8gb"), "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
+	flag.StringVar(&maxSizeRaw, "maxsize", GetEnv("MAX_FILE_SIZE", "8gb"), "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
@@ -424,7 +424,12 @@ func (h *fsHandler) securePath(p string) (rel string, full string) {
 	return rel, full
 }
 
-func (h *fsHandler) ensureDirOwnership(relPath string) {
+func (h *fsHandler) ensureDirOwnership(relPath string) error {
+	if !h.srv.mkdirLimiter.Allow() {
+		h.logger.Debug("mkdir rate limited")
+		return h.deny("Rate limit exceeded.")
+	}
+
 	parts := strings.Split(relPath, "/")
 	var currentRel string
 	for _, part := range parts {
@@ -438,11 +443,16 @@ func (h *fsHandler) ensureDirOwnership(relPath string) {
 		}
 
 		_, full := h.securePath(currentRel)
-		_ = os.Mkdir(full, 0755)
+		if err := os.Mkdir(full, 0755); err != nil {
+			h.logger.Error("Could not create directories", "path", full, "error", err)
+			return err
+		}
 
 		h.srv.db.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)",
 			currentRel, h.pubHash)
 	}
+
+	return nil
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -524,7 +534,10 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, err
 	}
 
-	h.ensureDirOwnership(path.Dir(rel))
+	if err := h.ensureDirOwnership(path.Dir(rel)); err != nil {
+		return nil, err
+	}
+
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
 		flags |= os.O_TRUNC
@@ -602,10 +615,6 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return h.deny("Symbolic links are not permitted on this server.")
 
 	case "Mkdir":
-		if !h.srv.mkdirLimiter.Allow() {
-			h.logger.Debug("mkdir rate limited")
-			return h.deny("Rate limit exceeded.")
-		}
 		h.ensureDirOwnership(rel)
 		return nil
 
@@ -862,32 +871,36 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 
 // --- Utilities ---
 
-func getEnv(k, f string) string {
-	if v, ok := os.LookupEnv(k); ok {
-		return v
+func GetEnv[T any](k string, defaultValue T) T {
+	val, ok := os.LookupEnv(fmt.Sprintf("SFTP_%s", k))
+	if !ok {
+		val, ok = os.LookupEnv(k)
 	}
-	return f
-}
+	if !ok {
+		return defaultValue
+	}
 
-func getEnvInt(k string, f int) int {
-	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
-		return v
-	}
-	return f
-}
+	// Type switch to handle conversion
+	var res any
+	var err error
 
-func getEnvFloat(k string, f float64) float64 {
-	if v, err := strconv.ParseFloat(os.Getenv(k), 64); err == nil {
-		return v
+	switch any(defaultValue).(type) {
+	case string:
+		return any(val).(T)
+	case int:
+		res, err = strconv.Atoi(val)
+	case float64:
+		res, err = strconv.ParseFloat(val, 64)
+	case bool:
+		res, err = strconv.ParseBool(val)
+	default:
+		return defaultValue
 	}
-	return f
-}
 
-func getEnvBool(k string, f bool) bool {
-	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
-		return v
+	if err != nil {
+		return defaultValue
 	}
-	return f
+	return res.(T)
 }
 
 func parseSize(s string) (int64, error) {
