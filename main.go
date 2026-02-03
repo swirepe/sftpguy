@@ -376,7 +376,17 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 					req.Reply(true, nil)
 					s.Welcome(ch.Stderr(), pubHash, stats)
 
-					handler := &fsHandler{srv: s, pubHash: pubHash, stderr: ch.Stderr(), sessionID: sessionID}
+					handler := &fsHandler{srv: s,
+						pubHash:   pubHash,
+						stderr:    ch.Stderr(),
+						sessionID: sessionID,
+						logger: *s.logger.With(
+							slog.Group("user",
+								"id", pubHash[:12],
+								"uid", hashToUid(pubHash),
+								"session", sessionID[:16]),
+						),
+					}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
 						FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
 					})
@@ -397,6 +407,7 @@ type fsHandler struct {
 	pubHash   string
 	sessionID string
 	stderr    io.Writer
+	logger    slog.Logger
 }
 
 func (h *fsHandler) securePath(p string) (rel string, full string) {
@@ -412,7 +423,7 @@ func (h *fsHandler) securePath(p string) (rel string, full string) {
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("fileread request", "path", rel, h.userGroup())
+	h.logger.Debug("fileread request", "path", rel)
 
 	if rel == "README.txt" {
 		data, _ := embeddedSource.ReadFile("main.go")
@@ -424,7 +435,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	if !h.hasUploaded() {
-		h.srv.logger.Debug("fileread denied: share-first policy", "user", h.pubHash[:12])
+		h.logger.Debug("fileread denied: share-first policy")
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
@@ -442,7 +453,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filewrite request", "path", rel, h.userGroup())
+	h.logger.Debug("filewrite request", "path", rel)
 
 	if rel == "README.txt" {
 		return nil, h.deny("README.txt is a protected system file.")
@@ -459,7 +470,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		var pOwner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
 		if pOwner != "" && pOwner != h.pubHash {
-			h.srv.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", pOwner)
+			h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", pOwner)
 			return nil, h.deny("Cannot write to another user's directory.")
 		}
 	}
@@ -473,7 +484,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	var currentOwner string
 	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
 	if err == sql.ErrNoRows {
-		h.srv.logger.Debug("claiming new file ownership", "path", rel, "user", h.pubHash[:12])
+		h.logger.Debug("claiming new file ownership", "path", rel)
 		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
 			return nil, err
 		}
@@ -481,7 +492,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 			return nil, err
 		}
 	} else if currentOwner != h.pubHash {
-		h.srv.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
+		h.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
 		return nil, h.deny("This filename is already claimed.")
 	}
 
@@ -516,7 +527,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filelist request", "method", r.Method, "path", rel, h.userGroup())
+	h.logger.Debug("filelist request", "method", r.Method, "path", rel)
 
 	if r.Method == "List" {
 		entries, err := os.ReadDir(full)
@@ -557,26 +568,18 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
 
-func (h *fsHandler) userGroup() slog.Attr {
-	return slog.Group("user",
-		"id", h.pubHash[:12],
-		"uid", hashToUid(h.pubHash),
-		"session", h.sessionID[:16],
-	)
-}
-
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	rel, full := h.securePath(r.Filepath)
-	h.srv.logger.Debug("filecmd request", "method", r.Method, "path", rel, h.userGroup())
+	h.logger.Debug("filecmd request", "method", r.Method, "path", rel)
 
 	switch r.Method {
 	case "Symlink", "Link":
-		h.srv.logger.Warn("blocked symlink creation attempt", "path", rel, h.userGroup())
+		h.logger.Warn("blocked symlink creation attempt", "path", rel)
 		return h.deny("Symbolic links are not permitted on this server.")
 
 	case "Mkdir":
 		if !h.srv.mkdirLimiter.Allow() {
-			h.srv.logger.Debug("mkdir rate limited", h.userGroup())
+			h.logger.Debug("mkdir rate limited")
 			return h.deny("Rate limit exceeded.")
 		}
 		os.MkdirAll(full, 0755)
@@ -587,7 +590,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		var owner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != "" && owner != h.pubHash {
-			h.srv.logger.Debug("remove denied: not owner", "path", rel, "owner", owner, h.userGroup())
+			h.logger.Debug("remove denied: not owner", "path", rel, "owner", owner)
 			return h.deny("You can only remove your own files.")
 		}
 		os.RemoveAll(full)
@@ -601,7 +604,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 
 		if sOwner != h.pubHash || (tOwner != "" && tOwner != h.pubHash) {
-			h.srv.logger.Debug("rename denied: permission issue", "src", rel, "srcOwner", sOwner, "tgt", relTgt, "tgtOwner", tOwner, h.userGroup())
+			h.logger.Debug("rename denied: permission issue", "src", rel, "src_owner", sOwner, "target", relTgt, "target_owner", tOwner)
 			return h.deny("Rename permission denied.")
 		}
 
@@ -733,12 +736,10 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	requestedSize := off + int64(len(p))
 	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
-		sw.h.srv.logger.Warn("upload blocked: size limit exceeded",
+		sw.h.logger.Warn("upload blocked: size limit exceeded",
 			"path", sw.rel,
 			"requested_size", requestedSize,
-			"limit", sw.maxFileSize,
-			sw.h.userGroup())
-
+			"limit", sw.maxFileSize)
 		sw.h.deny(fmt.Sprintf("File size limit exceeded. Maximum allowed: %d bytes", sw.maxFileSize))
 
 		return 0, sftp.ErrSshFxFailure
