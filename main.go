@@ -571,12 +571,12 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	switch r.Method {
 	case "Symlink", "Link":
-		h.srv.logger.Warn("blocked symlink creation attempt", "user", h.pubHash[:12], "path", rel)
+		h.srv.logger.Warn("blocked symlink creation attempt", "path", rel, h.userGroup())
 		return h.deny("Symbolic links are not permitted on this server.")
 
 	case "Mkdir":
 		if !h.srv.mkdirLimiter.Allow() {
-			h.srv.logger.Debug("mkdir rate limited", "user", h.pubHash[:12])
+			h.srv.logger.Debug("mkdir rate limited", h.userGroup())
 			return h.deny("Rate limit exceeded.")
 		}
 		os.MkdirAll(full, 0755)
@@ -587,7 +587,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		var owner string
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 		if owner != "" && owner != h.pubHash {
-			h.srv.logger.Debug("remove denied: not owner", "path", rel, "owner", owner)
+			h.srv.logger.Debug("remove denied: not owner", "path", rel, "owner", owner, h.userGroup())
 			return h.deny("You can only remove your own files.")
 		}
 		os.RemoveAll(full)
@@ -601,7 +601,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 
 		if sOwner != h.pubHash || (tOwner != "" && tOwner != h.pubHash) {
-			h.srv.logger.Debug("rename denied: permission issue", "src", rel, "srcOwner", sOwner, "tgt", relTgt, "tgtOwner", tOwner)
+			h.srv.logger.Debug("rename denied: permission issue", "src", rel, "srcOwner", sOwner, "tgt", relTgt, "tgtOwner", tOwner, h.userGroup())
 			return h.deny("Rename permission denied.")
 		}
 
@@ -731,17 +731,17 @@ type statWriter struct {
 }
 
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
-	// If limit is set (non-zero) and the write would go past the limit
-	if sw.maxFileSize > 0 && off+int64(len(p)) > sw.maxFileSize {
+	requestedSize := off + int64(len(p))
+	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
 		sw.h.srv.logger.Warn("upload blocked: size limit exceeded",
 			"path", sw.rel,
-			"user", sw.h.pubHash[:12],
-			"limit", sw.maxFileSize)
+			"requested_size", requestedSize,
+			"limit", sw.maxFileSize,
+			sw.h.userGroup())
 
-		// Inform the user via stderr
 		sw.h.deny(fmt.Sprintf("File size limit exceeded. Maximum allowed: %d bytes", sw.maxFileSize))
 
-		return 0, sftp.ErrSshFxFailure // Generic failure or connection break
+		return 0, sftp.ErrSshFxFailure
 	}
 	return sw.File.WriteAt(p, off)
 }
