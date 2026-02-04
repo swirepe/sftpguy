@@ -150,8 +150,8 @@ const (
 	errMsgSymlinksProhibited     = "Symlinks are prohibited. | 禁止使用符号链接。"
 	errMsgAccessLocked           = "Archive access locked. You must share a file first. | 归档访问已锁定。您必须先分享一个文件。"
 	errMsgContributorsLocked     = "%s is only available to contributors who have uploaded at least %d bytes. | %s 仅对上传量至少为 %d 字节的贡献者开放。"
-	errMsgFileProtected          = "%s is a protected system file. \n| %s 是受保护的系统文件。"
-	errMsgCannotWriteToDir       = "Cannot write to another user's directory. \n| 无法写入其他用户的目录。"
+	errMsgFileProtected          = "%s is a protected system file. | %s 是受保护的系统文件。"
+	errMsgCannotWriteToDir       = "Cannot write to another user's directory. | 无法写入其他用户的目录。"
 	errMsgFilenameClaimed        = "This filename is already claimed. | 此文件名已被占用。"
 	errMsgNoPermissionDelete     = "You do not have permission to delete this. | 您没有删除此项的权限。"
 	errMsgNotOwner               = "You do not own the source file or directory. | 您不是源文件或目录的所有者。"
@@ -929,7 +929,7 @@ func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
 		if rel == fortunesFileName {
 			color = yellow
 		}
-		return h.deny(fmt.Sprintf(errMsgFileProtected, color.Bold(rel)), "rel", rel)
+		return h.deny(fmt.Sprintf(errMsgFileProtected, color.Bold(rel), color.Bold(rel)), "rel", rel)
 	}
 
 	// Forbid overwriting or interacting with symlinks
