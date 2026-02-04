@@ -438,6 +438,8 @@ func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
 		return h.deny("Mkdir rate limit reached.")
 	}
 	_, full := h.resolve(relPath)
+
+	// TODO: if h.srv.cfg.LockDirectoriesToOwners,  make sure that we don't let users make dirs inside each other's dirs
 	if err := os.MkdirAll(full, 0755); err != nil {
 		return err
 	}
@@ -592,8 +594,6 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 		for _, e := range entries {
 			fi, _ := e.Info()
-			// var owner string
-			// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Join(rel, e.Name())).Scan(&owner)
 			owner, _ := h.srv.GetOwner(path.Join(rel, e.Name()))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
 		}
@@ -613,8 +613,6 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, h.deny("Access to symlinks is forbidden.")
 	}
 
-	// var owner string
-	// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
 	owner, _ := h.srv.GetOwner(rel)
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
@@ -625,19 +623,13 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	switch r.Method {
 	case "Symlink", "Link":
-		h.logger.Warn("blocked symlink creation attempt", "path", rel)
-		return h.deny("Symbolic links are not permitted on this server.")
+		return h.deny("Symbolic links are not permitted on this server.", "path", rel)
 
 	case "Mkdir":
 		h.resolve(rel)
 		return nil
 
 	case "Remove", "Rmdir":
-		// var owner string
-		// var parentOwner string
-
-		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&owner)
-		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&parentOwner)
 		owner, _ := h.srv.GetOwner(rel)
 		parentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 		canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
@@ -651,13 +643,8 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	case "Rename":
 		relTgt, fullTgt := h.resolve(r.Target)
 
-		// var sOwner, sParentOwner, tOwner, tParentOwner string
-
-		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&sOwner)
-		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", path.Dir(rel)).Scan(&sParentOwner)
 		sourceOwner, _ := h.srv.GetOwner(rel)
 		sourceParentOwner, _ := h.srv.GetOwner(path.Dir(rel))
-
 		if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
 			return h.deny("You do not own the source file or directory.", "src", rel)
 		}
@@ -665,26 +652,20 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		targetDir := path.Dir(relTgt)
 		if h.srv.cfg.LockDirectoriesToOwners && targetDir != "." {
 			targetParentOwner, _ := h.srv.GetOwner(targetDir)
-			// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", targetDir).Scan(&tParentOwner)
 			if targetParentOwner != "" && targetParentOwner != h.pubHash {
-				// h.logger.Debug("rename denied: target directory owned by other", )
 				return h.deny("Cannot move files into a directory owned by another user.", "targetDir", targetDir)
 			}
 		}
 
-		// err := h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relTgt).Scan(&tOwner)
 		targetOwner, err := h.srv.GetOwner(relTgt)
 		if err == nil {
 			if targetOwner != "" && targetOwner != h.pubHash {
-				// h.logger.Debug("rename denied: target collision",)
 				return h.deny("The destination filename is already claimed by someone else.", "target", relTgt, "owner", targetOwner)
 			}
 		}
 
 		if err := os.Rename(full, fullTgt); err != nil {
 			return h.deny("rename failed", "err", err)
-			// h.logger.Error("rename failed", "err", err)
-			// return err
 		}
 
 		tx, err := h.srv.db.Begin()
@@ -851,11 +832,10 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	requestedSize := off + int64(len(p))
 	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
-		sw.h.logger.Warn("upload blocked: size limit exceeded",
+		sw.h.deny(fmt.Sprintf("File size limit exceeded. Maximum allowed: %d bytes", sw.maxFileSize),
 			"path", sw.rel,
 			"requested_size", requestedSize,
 			"limit", sw.maxFileSize)
-		sw.h.deny(fmt.Sprintf("File size limit exceeded. Maximum allowed: %d bytes", sw.maxFileSize))
 
 		return 0, sftp.ErrSshFxFailure
 	}
