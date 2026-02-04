@@ -442,7 +442,6 @@ func (h *fsHandler) ensureDirs(relPath string) error {
 		return err
 	}
 
-	// Recursively track ownership of new dirs
 	parts := strings.Split(relPath, "/")
 	curr := ""
 	for _, p := range parts {
@@ -482,53 +481,59 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	// rel, full := h.resolve(r.Filepath)
+	// h.logger.Debug("filewrite request", "path", rel)
+
+	// if rel == "README.txt" {
+	// 	return nil, h.deny("README.txt is a protected system file.")
+	// }
+
+	// // Forbid overwriting or interacting with symlinks
+	// if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+	// 	return nil, h.deny("Symlinks are prohibited.")
+	// }
+
+	// // Check folder ownership
+	// parentRel := path.Dir(rel)
+	// if parentRel != "." {
+	// 	parentOwner, _ := h.srv.GetOwner(parentRel)
+	// 	if h.srv.cfg.LockDirectoriesToOwners && parentOwner != "" && parentOwner != h.pubHash {
+	// 		return nil, h.deny("Cannot write to another user's directory.", "parent", parentRel, "owner", parentOwner)
+	// 	}
+	// }
 	rel, full := h.resolve(r.Filepath)
 	h.logger.Debug("filewrite request", "path", rel)
 
-	if rel == "README.txt" {
-		return nil, h.deny("README.txt is a protected system file.")
-	}
-
-	// Forbid overwriting or interacting with symlinks
-	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny("Symlinks are prohibited.")
-	}
-
-	// Check folder ownership
-	parentRel := path.Dir(rel)
-	if parentRel != "." {
-		parentOwner, _ := h.srv.GetOwner(parentRel)
-		if h.srv.cfg.LockDirectoriesToOwners && parentOwner != "" && parentOwner != h.pubHash {
-			return nil, h.deny("Cannot write to another user's directory.", "parent", parentRel, "owner", parentOwner)
-		}
-	}
-
-	tx, err := h.srv.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	currentOwner, err := h.srv.GetOwnerTX(tx, rel)
-	if err == sql.ErrNoRows {
-		h.logger.Debug("claiming new file ownership", "path", rel)
-		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
-			return nil, err
-		}
-	} else if currentOwner != h.pubHash {
-		return nil, h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
-	}
-
-	if err := tx.Commit(); err != nil {
+	if err := h.CanWrite(h.pubHash, rel, full); err != nil {
 		return nil, err
 	}
 
-	if err := h.ensureDirs(path.Dir(rel)); err != nil {
-		return nil, err
-	}
+	// tx, err := h.srv.db.Begin()
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer tx.Rollback()
+
+	// currentOwner, err := h.srv.GetOwnerTX(tx, rel)
+	// if err == sql.ErrNoRows {
+	// 	h.logger.Debug("claiming new file ownership", "path", rel)
+	// 	if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
+	// 		return nil, err
+	// 	}
+	// 	if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
+	// 		return nil, err
+	// 	}
+	// } else if currentOwner != h.pubHash {
+	// 	return nil, h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
+	// }
+
+	// if err := tx.Commit(); err != nil {
+	// 	return nil, err
+	// }
+
+	// if err := h.ensureDirs(path.Dir(rel)); err != nil {
+	// 	return nil, err
+	// }
 
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
@@ -552,6 +557,83 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		oldSize:     oldSize,
 		maxFileSize: h.srv.cfg.MaxFileSize,
 	}, nil
+}
+
+func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
+	if rel == "README.txt" {
+		return h.deny("README.txt is a protected system file.")
+	}
+
+	// Forbid overwriting or interacting with symlinks
+	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return h.deny("Symlinks are prohibited.")
+	}
+
+	// Check folder ownership
+	parentRel := path.Dir(rel)
+	if h.srv.cfg.LockDirectoriesToOwners && parentRel != "." {
+		parentOwner, _ := h.srv.GetOwner(parentRel)
+		if parentOwner != "" && parentOwner != pubHash {
+			return h.deny("Cannot write to another user's directory.", "parent", parentRel, "owner", parentOwner)
+		}
+	}
+
+	if err := h.ClaimFile(pubHash, rel); err != nil {
+		return err
+	}
+	// tx, err := h.srv.db.Begin()
+	// if err != nil {
+	// 	return err
+	// }
+	// defer tx.Rollback()
+
+	// currentOwner, err := h.srv.GetOwnerTX(tx, rel)
+	// if err == sql.ErrNoRows {
+	// 	h.logger.Debug("claiming new file ownership", "path", rel)
+	// 	if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
+	// 		return err
+	// 	}
+	// 	if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
+	// 		return err
+	// 	}
+	// } else if currentOwner != h.pubHash {
+	// 	return h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
+	// }
+
+	// if err := tx.Commit(); err != nil {
+	// 	return err
+	// }
+
+	if err := h.ensureDirs(parentRel); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *fsHandler) ClaimFile(pubhash, rel string) error {
+	tx, err := h.srv.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	currentOwner, err := h.srv.GetOwnerTX(tx, rel)
+	if err == sql.ErrNoRows {
+		h.logger.Debug("claiming new file ownership", "path", rel)
+		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
+			return err
+		}
+	} else if currentOwner != h.pubHash {
+		return h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
