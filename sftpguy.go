@@ -40,15 +40,10 @@ SOFTWARE.
 	* you can delete, rename, or resume uploading files you created
 
 # How to use this server:
-	ssh-keygen -f id_throwaway -t ed25519 -N ''
-	sftp <host> -i id_throwaway
+	TODO
 
 # How to run this server:
-    echo "Believe in yourself" > fortunes.txt
-	cp README.txt sftpguy.go
-	go init
-	go mod tidy
-	go run sftpguy.go
+	TODO
 */
 
 import (
@@ -450,10 +445,11 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 	}
 
 	if s.cfg.BannerStats {
-		var u, f, b uint64
-		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_count > 0").Scan(&u)
+		var u, c, f, b uint64
+		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_count > 0", contributorThreshold).Scan(&u)
+		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_bytes > ?", contributorThreshold).Scan(&c)
 		s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
-		banner += fmt.Sprintf("\r\nContributors: %d | Files: %d | Size: %d bytes\r\n", u, f, b)
+		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %d bytes\r\n", u, c, f, b)
 	}
 	return banner
 }
@@ -555,6 +551,23 @@ func (s *Server) logConnection(pubHash, sessionID string, stats userStats, sConn
 	)
 }
 
+func (s *Server) getVirtualFile(name string) ([]byte, bool) {
+	if _, ok := restrictedFiles[name]; !ok {
+		return nil, false
+	}
+
+	embedPath := name
+	if name == readmeFile {
+		embedPath = sourceFile
+	}
+
+	data, err := embeddedSource.ReadFile(embedPath)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
 func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn) {
 	defer ch.Close()
 
@@ -630,9 +643,14 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 			readme()
 		} else {
 			fmt.Fprint(w, green.Fmt("Downloading is unlocked.\r\n"))
-			if !isContributor {
-				fmt.Fprintf(w, "  Upload %d more bytes to unlock "+bold.Fmt(fortunesFileName)+"\r\n", contributorThreshold-stats.UploadBytes)
+			for name, threshold := range restrictedFiles {
+				if stats.UploadBytes < threshold {
+					fmt.Fprintf(w, "  Upload %d more bytes to unlock %s\r\n", threshold-stats.UploadBytes, bold.Fmt(name))
+				}
 			}
+			// if !isContributor {
+			// 	fmt.Fprintf(w, "  Upload %d more bytes to unlock "+bold.Fmt(fortunesFileName)+"\r\n", contributorThreshold-stats.UploadBytes)
+			// }
 		}
 	}
 
@@ -852,17 +870,20 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 			return nil, h.deny(fmt.Sprintf(errMsgContributorsLocked, rel, threshold, rel, threshold))
 		}
 
-		// Map virtual path to embedded source path
-		embedPath := rel
-		if rel == readmeFile {
-			embedPath = sourceFile
+		if data, ok := h.srv.getVirtualFile(rel); ok {
+			return bytes.NewReader(data), nil
 		}
+		// // Map virtual path to embedded source path
+		// embedPath := rel
+		// if rel == readmeFile {
+		// 	embedPath = sourceFile
+		// }
 
-		data, err := embeddedSource.ReadFile(embedPath)
-		if err != nil {
-			return nil, err
-		}
-		return bytes.NewReader(data), nil
+		// data, err := embeddedSource.ReadFile(embedPath)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		// return bytes.NewReader(data), nil
 	}
 
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
@@ -1011,14 +1032,8 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return listerAt(files), nil
 	}
 
-	if rel == readmeFile {
-		data, _ := embeddedSource.ReadFile(sourceFile)
-		return listerAt{&virtualFileInfo{name: readmeFile, size: int64(len(data))}}, nil
-	}
-
-	if rel == fortunesFileName {
-		data, _ := embeddedSource.ReadFile(fortunesFileName)
-		return listerAt{&virtualFileInfo{name: fortunesFileName, size: int64(len(data))}}, nil
+	if data, isVirtual := h.srv.getVirtualFile(rel); isVirtual {
+		return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
 	}
 
 	fi, err := os.Lstat(full)
