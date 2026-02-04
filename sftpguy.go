@@ -2,7 +2,7 @@ package main
 
 /*
 
-curioarium-sftp - anonymous share-first SFTP server
+sftpguy - anonymous share-first SFTP server
 Copyright (C) 2026 台湾独立运动
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -45,10 +45,10 @@ SOFTWARE.
 
 # How to run this server:
     echo "Believe in yourself" > fortunes.txt
-	cp README.txt main.go
+	cp README.txt sftpguy.go
 	go init
 	go mod tidy
-	go run main.go
+	go run sftpguy.go
 */
 
 import (
@@ -81,7 +81,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-//go:embed main.go fortunes.txt
+//go:embed sftpguy.go fortunes.txt
 var embeddedSource embed.FS
 
 const (
@@ -123,7 +123,7 @@ type Config struct {
 
 func LoadConfig() Config {
 	cfg := Config{}
-	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "curioarium-sftp", "Archive name")
+	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name")
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
@@ -155,7 +155,7 @@ func LoadConfig() Config {
 	}
 
 	if *src {
-		srcCode, _ := embeddedSource.ReadFile("main.go")
+		srcCode, _ := embeddedSource.ReadFile("sftpguy.go")
 		fmt.Printf("%s", srcCode)
 		os.Exit(0)
 	}
@@ -457,7 +457,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	h.logger.Debug("fileread request", "path", rel, "req", r)
 
 	if rel == "README.txt" {
-		data, _ := embeddedSource.ReadFile("main.go")
+		data, _ := embeddedSource.ReadFile("sftpguy.go")
 		return bytes.NewReader(data), nil
 	}
 
@@ -566,7 +566,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		var files []os.FileInfo
 
 		if rel == "." {
-			data, _ := embeddedSource.ReadFile("main.go")
+			data, _ := embeddedSource.ReadFile("sftpguy.go")
 			files = append(files, &virtualFileInfo{name: "README.txt", size: int64(len(data))})
 		}
 
@@ -581,7 +581,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 
 	if rel == "README.txt" {
-		data, _ := embeddedSource.ReadFile("main.go")
+		data, _ := embeddedSource.ReadFile("sftpguy.go")
 		return listerAt{&virtualFileInfo{name: "README.txt", size: int64(len(data))}}, nil
 	}
 
