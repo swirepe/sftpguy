@@ -77,6 +77,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/text/width"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 )
@@ -827,29 +828,37 @@ func (h *fsHandler) isContributor(pubHash string) bool {
 }
 
 var (
-	enPadded = padRightVisual("DENIED:", 11)
-	zhPadded = padRightVisual("访问被拒绝:", 11)
+	enPadded = red.Fmt(padRightVisual("DENIED:", 12))
+	zhPadded = red.Fmt(padRightVisual("访问被拒绝:", 12))
 )
 
 func (h *fsHandler) deny(msg string, args ...any) error {
 
 	h.logger.Info(msg, args...)
-	msgSplit := strings.Split(msg, "|")
+	msgSplit := strings.SplitN(msg, "|", 2)
 	fmt.Fprintf(h.stderr, "\r\n%-8s %s", red.Fmt(enPadded), strings.TrimSpace(msgSplit[0]))
 	fmt.Fprintf(h.stderr, "\r\n%-8s %s\r\n", red.Fmt(zhPadded), strings.TrimSpace(msgSplit[1]))
 	return sftp.ErrSshFxPermissionDenied
 }
 
-func padRightVisual(s string, width int) string {
-	visualWidth := 0
+func visualWidth(s string) int {
+	w := 0
 	for _, r := range s {
-		if r > 0x7f { // Basic check for multi-byte/Chinese characters
-			visualWidth += 2
-		} else {
-			visualWidth += 1
+		kind := width.LookupRune(r).Kind()
+		switch kind {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			w += 2
+		case width.EastAsianHalfwidth, width.EastAsianNarrow, width.Neutral:
+			w += 1
+		default:
+			w += 1 // Fallback
 		}
 	}
-	padding := width - visualWidth
+	return w
+}
+
+func padRightVisual(s string, width int) string {
+	padding := width - visualWidth(s)
 	if padding < 0 {
 		return s
 	}
