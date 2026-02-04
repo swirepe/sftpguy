@@ -142,10 +142,7 @@ const (
 		path TEXT PRIMARY KEY,
 		owner_hash TEXT,
 		size INTEGER DEFAULT 0
-	);
-	
-	INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?);
-	INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?);`
+	);`
 )
 
 // Error messages
@@ -299,10 +296,16 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 
 	db.Exec("PRAGMA journal_mode=WAL;")
 
-	// Initialize schema with proper parameters for both system files
-	if _, err := db.Exec(Schema, readmeFile, systemOwner, fortunesFileName, systemOwner); err != nil {
+	if _, err := db.Exec(Schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema init failed: %w", err)
+	}
+	for filename := range restrictedFiles {
+		_, err := db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", filename, systemOwner)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to initialize system file %s: %w", filename, err)
+		}
 	}
 
 	absDir, err := filepath.Abs(cfg.UploadDir)
