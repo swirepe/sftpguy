@@ -144,7 +144,8 @@ func LoadConfig() Config {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "Note: environment variables may be prefixed with SFTP_ (e.g. SFTP_PORT is checked before PORT)\n")
+		fmt.Fprintf(os.Stderr, "Note: environment variables may be optionally prefixed with %s. ", bold.Fmt(envPrefix))
+		fmt.Fprintf(os.Stderr, "For example: "+bold.Fmt(envPrefix+"PORT")+" is checked before "+bold.Fmt("PORT\n"))
 	}
 	flag.Parse()
 
@@ -393,7 +394,8 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 							slog.Group("user",
 								"id", pubHash[:12],
 								"uid", hashToUid(pubHash),
-								"session", sessionID[:16]),
+								"session", sessionID[:16],
+								"remote_address", sConn.RemoteAddr()),
 						),
 					}
 					server := sftp.NewRequestServer(ch, sftp.Handlers{
@@ -463,7 +465,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, h.deny("Symlinks are prohibited.", "path", rel)
 	}
 
-	if !h.hasUploaded() {
+	if !h.hasUploaded(h.pubHash) {
 		return nil, h.deny("Archive access locked. You must share a file first.")
 	}
 
@@ -495,11 +497,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	// Check folder ownership
 	parentRel := path.Dir(rel)
 	if parentRel != "." {
-		// var pOwner string
 		parentOwner, _ := h.srv.GetOwner(parentRel)
-		// h.srv.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", parentRel).Scan(&pOwner)
 		if h.srv.cfg.LockDirectoriesToOwners && parentOwner != "" && parentOwner != h.pubHash {
-			// h.logger.Debug("filewrite denied: parent directory owned by other", "parent", parentRel, "owner", parentOwner)
 			return nil, h.deny("Cannot write to another user's directory.", "parent", parentRel, "owner", parentOwner)
 		}
 	}
@@ -510,8 +509,6 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	defer tx.Rollback()
 
-	// var currentOwner string
-	// err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", rel).Scan(&currentOwner)
 	currentOwner, err := h.srv.GetOwnerTX(tx, rel)
 	if err == sql.ErrNoRows {
 		h.logger.Debug("claiming new file ownership", "path", rel)
@@ -522,7 +519,6 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 			return nil, err
 		}
 	} else if currentOwner != h.pubHash {
-		// h.logger.Debug("filewrite denied: file already claimed", "path", rel, "owner", currentOwner)
 		return nil, h.deny("This filename is already claimed.", "path", rel, "owner", currentOwner)
 	}
 
@@ -862,9 +858,9 @@ func (h *fsHandler) deny(msg string, args ...any) error {
 	return sftp.ErrSshFxPermissionDenied
 }
 
-func (h *fsHandler) hasUploaded() bool {
+func (h *fsHandler) hasUploaded(pubHash string) bool {
 	var count int
-	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", h.pubHash).Scan(&count)
+	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", pubHash).Scan(&count)
 	return count > 0
 }
 
@@ -938,11 +934,12 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 }
 
 // --- Utilities ---
+const envPrefix = "SFTP_"
 
 func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
 	val := GetEnv(env, def)
 	*ptr = val
-	usageWithEnv := fmt.Sprintf("%s (env: %s)", usage, bold.Fmt(env))
+	usageWithEnv := fmt.Sprintf("%-28s  %s", bold.Fmt(env), usage)
 
 	switch p := any(ptr).(type) {
 	case *string:
@@ -959,7 +956,7 @@ func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
 }
 
 func GetEnv[T any](k string, defaultValue T) T {
-	val, ok := os.LookupEnv(fmt.Sprintf("SFTP_%s", k))
+	val, ok := os.LookupEnv(fmt.Sprintf("%s%s", envPrefix, k))
 	if !ok {
 		val, ok = os.LookupEnv(k)
 	}
