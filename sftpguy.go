@@ -101,7 +101,7 @@ var restrictedFiles = map[string]int64{
 // ============================================================================
 
 const (
-	AppVersion = "1.7.9"
+	AppVersion = "1.8.1"
 	envPrefix  = "SFTP_"
 
 	// System identifiers
@@ -147,22 +147,22 @@ const (
 
 // Error messages
 const (
-	errMsgSymlinksProhibited     = "Symlinks are prohibited."
-	errMsgAccessLocked           = "Archive access locked. You must share a file first."
-	errMsgContributorsLocked     = "%s is only available to contributors who have uploaded at least %d bytes."
-	errMsgFileProtected          = "%s is a protected system file."
-	errMsgCannotWriteToDir       = "Cannot write to another user's directory."
-	errMsgFilenameClaimed        = "This filename is already claimed."
-	errMsgNoPermissionDelete     = "You do not have permission to delete this."
-	errMsgNotOwner               = "You do not own the source file or directory."
-	errMsgCannotMoveToDir        = "Cannot move files into a directory owned by another user."
-	errMsgDestinationClaimed     = "The destination filename is already claimed by someone else."
-	errMsgRenameFailed           = "rename failed"
-	errMsgSymlinksNotPermitted   = "Symbolic links are not permitted on this server."
-	errMsgAccessToSymlinksForbid = "Access to symlinks is forbidden."
-	errMsgMkdirRateLimit         = "Mkdir rate limit reached."
-	errMsgFileSizeExceeded       = "File size limit exceeded. Maximum allowed: %d bytes"
-	errMsgPathTraversal          = "Path traversal detected - access denied."
+	errMsgSymlinksProhibited     = "Symlinks are prohibited. | 禁止使用符号链接。"
+	errMsgAccessLocked           = "Archive access locked. You must share a file first. | 归档访问已锁定。您必须先分享一个文件。"
+	errMsgContributorsLocked     = "%s is only available to contributors who have uploaded at least %d bytes. | %s 仅对上传量至少为 %d 字节的贡献者开放。"
+	errMsgFileProtected          = "%s is a protected system file. \n| %s 是受保护的系统文件。"
+	errMsgCannotWriteToDir       = "Cannot write to another user's directory. \n| 无法写入其他用户的目录。"
+	errMsgFilenameClaimed        = "This filename is already claimed. | 此文件名已被占用。"
+	errMsgNoPermissionDelete     = "You do not have permission to delete this. | 您没有删除此项的权限。"
+	errMsgNotOwner               = "You do not own the source file or directory. | 您不是源文件或目录的所有者。"
+	errMsgCannotMoveToDir        = "Cannot move files into a directory owned by another user. | 无法将文件移动到属于其他用户的目录。"
+	errMsgDestinationClaimed     = "The destination filename is already claimed by someone else. | 目标文件名已被其他人占用。"
+	errMsgRenameFailed           = "rename failed | 重命名失败"
+	errMsgSymlinksNotPermitted   = "Symbolic links are not permitted on this server. | 此服务器上不允许使用符号链接。"
+	errMsgAccessToSymlinksForbid = "Access to symlinks is forbidden. | 禁止访问符号链接。"
+	errMsgMkdirRateLimit         = "Mkdir rate limit reached. | 已达到创建目录的频率限制。"
+	errMsgFileSizeExceeded       = "File size limit exceeded. Maximum allowed: %d bytes | 超过文件大小限制。最大允许：%d 字节"
+	errMsgPathTraversal          = "Path traversal detected - access denied. | 检测到路径遍历 - 访问被拒绝。"
 )
 
 // ============================================================================
@@ -621,7 +621,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 
 		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
 		if isContributor {
-			fmt.Fprintf(w, "\r\n\"%s\"\r\n", color.Italic(s.getRandomFortune()))
+			fmt.Fprintf(w, "\"%s\"\r\n", color.Italic(s.getRandomFortune()))
 			fmt.Fprint(w, yellow.Fmt("★ Contributor status unlocked! You can now read "+fortunesFileName+"\r\n"))
 		}
 
@@ -808,13 +808,36 @@ func (h *fsHandler) isContributor(pubHash string) bool {
 	return uploadBytes >= contributorThreshold
 }
 
+var (
+	enPadded = padRightVisual("DENIED:", 11)
+	zhPadded = padRightVisual("访问被拒绝:", 11)
+)
+
 func (h *fsHandler) deny(msg string, args ...any) error {
+
 	h.logger.Info(msg, args...)
-	fmt.Fprintf(h.stderr, "\r\n%s %s\r\n", red.Fmt("DENIED:"), msg)
+	msgSplit := strings.Split(msg, "|")
+	fmt.Fprintf(h.stderr, "\r\n%-8s %s", red.Fmt(enPadded), strings.TrimSpace(msgSplit[0]))
+	fmt.Fprintf(h.stderr, "\r\n%-8s %s\r\n", red.Fmt(zhPadded), strings.TrimSpace(msgSplit[1]))
 	return sftp.ErrSshFxPermissionDenied
 }
 
-// Fileread implements sftp file reading
+func padRightVisual(s string, width int) string {
+	visualWidth := 0
+	for _, r := range s {
+		if r > 0x7f { // Basic check for multi-byte/Chinese characters
+			visualWidth += 2
+		} else {
+			visualWidth += 1
+		}
+	}
+	padding := width - visualWidth
+	if padding < 0 {
+		return s
+	}
+	return s + strings.Repeat(" ", padding)
+}
+
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
@@ -826,7 +849,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if threshold, isRestricted := restrictedFiles[rel]; isRestricted {
 		stats := h.srv.GetUser(h.pubHash)
 		if stats.UploadBytes < threshold {
-			return nil, h.deny(fmt.Sprintf(errMsgContributorsLocked, rel, threshold))
+			return nil, h.deny(fmt.Sprintf(errMsgContributorsLocked, rel, threshold, rel, threshold))
 		}
 
 		// Map virtual path to embedded source path
