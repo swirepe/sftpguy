@@ -90,6 +90,8 @@ var restrictedFiles = map[string]int64{
 	readmeFile:       0,
 	fortunesFileName: contributorThreshold,
 	sourceFile:       0,
+	"RULES.txt":      0,
+	"LICENSE.txt":    0,
 }
 
 // ============================================================================
@@ -1028,9 +1030,10 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 			readmeData, _ := embeddedSource.ReadFile(sourceFile)
 			files = append(files, &virtualFileInfo{name: readmeFile, size: int64(len(readmeData))})
 
-			// Add fortunes.txt (always visible, but locked for non-contributors)
-			fortunesData, _ := embeddedSource.ReadFile(fortunesFileName)
-			files = append(files, &virtualFileInfo{name: fortunesFileName, size: int64(len(fortunesData))})
+			for f, _ := range restrictedFiles {
+				d, _ := embeddedSource.ReadFile(f)
+				files = append(files, &virtualFileInfo{name: f, size: int64(len(d))})
+			}
 		}
 
 		for _, e := range entries {
