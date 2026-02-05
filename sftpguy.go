@@ -89,7 +89,6 @@ var embeddedSource embed.FS
 var restrictedFiles = map[string]int64{
 	readmeFile:       0,
 	fortunesFileName: contributorThreshold,
-	sourceFile:       0,
 	"RULES.txt":      0,
 	"LICENSE.txt":    0,
 }
@@ -143,25 +142,45 @@ const (
 	);`
 )
 
-// Error messages
+var errorHeaders []string = []string{red.Fmt(padRightVisual("DENIED:", 12)), red.Fmt(padRightVisual("DENIED:", 12))}
+
 const (
-	errMsgSymlinksProhibited     = "Symlinks are prohibited. | 禁止使用符号链接。"
-	errMsgAccessLocked           = "Archive access locked. You must share a file first. | 归档访问已锁定。您必须先分享一个文件。"
-	errMsgContributorsLocked     = "%s is only available to contributors who have uploaded at least %d bytes. | %s 仅对上传量至少为 %d 字节的贡献者开放。"
-	errMsgFileProtected          = "%s is a protected system file. | %s 是受保护的系统文件。"
-	errMsgCannotWriteToDir       = "Cannot write to another user's directory. | 无法写入其他用户的目录。"
-	errMsgFilenameClaimed        = "This filename is already claimed. | 此文件名已被占用。"
-	errMsgNoPermissionDelete     = "You do not have permission to delete this. | 您没有删除此项的权限。"
-	errMsgNotOwner               = "You do not own the source file or directory. | 您不是源文件或目录的所有者。"
-	errMsgCannotMoveToDir        = "Cannot move files into a directory owned by another user. | 无法将文件移动到属于其他用户的目录。"
-	errMsgDestinationClaimed     = "The destination filename is already claimed by someone else. | 目标文件名已被其他人占用。"
-	errMsgRenameFailed           = "rename failed | 重命名失败"
-	errMsgSymlinksNotPermitted   = "Symbolic links are not permitted on this server. | 此服务器上不允许使用符号链接。"
-	errMsgAccessToSymlinksForbid = "Access to symlinks is forbidden. | 禁止访问符号链接。"
-	errMsgMkdirRateLimit         = "Mkdir rate limit reached. | 已达到创建目录的频率限制。"
-	errMsgFileSizeExceeded       = "File size limit exceeded. Maximum allowed: %d bytes | 超过文件大小限制。最大允许：%d 字节"
-	errMsgPathTraversal          = "Path traversal detected - access denied. | 检测到路径遍历 - 访问被拒绝。"
+	errMsgSymlinksProhibited     TranslatableError = "Symlinks are prohibited. | 禁止使用符号链接。"
+	errMsgAccessLocked           TranslatableError = "Archive access locked. You must share a file first. | 归档访问已锁定。您必须先分享一个文件。"
+	errMsgContributorsLocked     TranslatableError = "%s is only available to contributors who have uploaded at least %d bytes. | %s 仅对上传量至少为 %d 字节的贡献者开放。"
+	errMsgFileProtected          TranslatableError = "%s is a protected system file. | %s 是受保护的系统文件。"
+	errMsgCannotWriteToDir       TranslatableError = "Cannot write to another user's directory. | 无法写入其他用户的目录。"
+	errMsgFilenameClaimed        TranslatableError = "This filename is already claimed. | 此文件名已被占用。"
+	errMsgNoPermissionDelete     TranslatableError = "You do not have permission to delete this. | 您没有删除此项的权限。"
+	errMsgNotOwner               TranslatableError = "You do not own the source file or directory. | 您不是源文件或目录的所有者。"
+	errMsgCannotMoveToDir        TranslatableError = "Cannot move files into a directory owned by another user. | 无法将文件移动到属于其他用户的目录。"
+	errMsgDestinationClaimed     TranslatableError = "The destination filename is already claimed by someone else. | 目标文件名已被其他人占用。"
+	errMsgRenameFailed           TranslatableError = "rename failed | 重命名失败"
+	errMsgSymlinksNotPermitted   TranslatableError = "Symbolic links are not permitted on this server. | 此服务器上不允许使用符号链接。"
+	errMsgAccessToSymlinksForbid TranslatableError = "Access to symlinks is forbidden. | 禁止访问符号链接。"
+	errMsgMkdirRateLimit         TranslatableError = "Mkdir rate limit reached. | 已达到创建目录的频率限制。"
+	errMsgFileSizeExceeded       TranslatableError = "File size limit exceeded. Maximum allowed: %d bytes | 超过文件大小限制。最大允许：%d 字节"
+	errMsgPathTraversal          TranslatableError = "Path traversal detected - access denied. | 检测到路径遍历 - 访问被拒绝。"
 )
+
+type TranslatableError string
+
+func (msg TranslatableError) Fmt(args ...any) string {
+	msgSplit := strings.Split(string(msg), "|")
+	formattedParts := make([]string, len(msgSplit))
+
+	for i, part := range msgSplit {
+		trimmed := strings.TrimSpace(part)
+
+		if len(args) > 0 {
+			formattedParts[i] = errorHeaders[i] + fmt.Sprintf(trimmed, args...)
+		} else {
+			formattedParts[i] = errorHeaders[i] + trimmed
+		}
+	}
+
+	return strings.Join(formattedParts, "\n")
+}
 
 // ============================================================================
 // Configuration
@@ -306,6 +325,12 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		}
 	}
 
+	sourceName := fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion)
+	if _, err := db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", sourceName, systemOwner); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to initialize source file %s: %w", sourceName, err)
+	}
+
 	absDir, err := filepath.Abs(cfg.UploadDir)
 	if err != nil {
 		db.Close()
@@ -331,6 +356,10 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	return srv, nil
+}
+
+func (s *Server) sourceFileName() string {
+	return fmt.Sprintf("%s-v%s.go", s.cfg.Name, AppVersion)
 }
 
 func (s *Server) Shutdown() error {
@@ -440,9 +469,21 @@ func (s *Server) addHostKey(config *ssh.ServerConfig) error {
 	return nil
 }
 
+func (s *Server) ReadRealOrVirtualFile(relPath string) (data []byte, err error) {
+	physicalPath := filepath.Join(s.absUploadDir, relPath)
+	if fi, statErr := os.Stat(physicalPath); statErr == nil && !fi.IsDir() {
+		data, err = os.ReadFile(physicalPath)
+	}
+
+	if err != nil || len(data) == 0 {
+		data, err = embeddedSource.ReadFile(s.cfg.BannerFile)
+	}
+	return data, err
+}
+
 func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
-	b, err := embeddedSource.ReadFile(s.cfg.BannerFile)
-	banner := string(b)
+	data, err := s.ReadRealOrVirtualFile(s.cfg.BannerFile)
+	banner := string(data)
 	if err != nil {
 		banner = fmt.Sprintf("=== %s v%s ===", s.cfg.Name, AppVersion)
 	}
@@ -555,16 +596,16 @@ func (s *Server) logConnection(pubHash, sessionID string, stats userStats, sConn
 }
 
 func (s *Server) getVirtualFile(name string) ([]byte, bool) {
+	if name == s.sourceFileName() {
+		data, err := embeddedSource.ReadFile(sourceFile)
+		return data, err == nil
+	}
+
 	if _, ok := restrictedFiles[name]; !ok {
 		return nil, false
 	}
 
-	embedPath := name
-	if name == readmeFile {
-		embedPath = sourceFile
-	}
-
-	data, err := embeddedSource.ReadFile(embedPath)
+	data, err := embeddedSource.ReadFile(name)
 	if err != nil {
 		return nil, false
 	}
@@ -622,6 +663,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 		fmt.Fprint(w, bold.Fmt("Reminder: ")+"upload a file to download a file.\r\n")
 		fmt.Fprint(w, "  See "+bold.Fmt(readmeFile)+" for more information.\r\n")
 		fmt.Fprint(w, "  You may always download "+bold.Fmt(readmeFile)+"\r\n")
+		fmt.Fprint(w, "  You may also download the source code at "+bold.Fmt(s.sourceFileName())+"\r\n")
 		fmt.Fprint(w, "  Upload 1MB+ to unlock "+yellow.Bold(fortunesFileName)+"\r\n")
 	}
 
@@ -651,9 +693,6 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 					fmt.Fprintf(w, "  Upload %d more bytes to unlock %s\r\n", threshold-stats.UploadBytes, bold.Fmt(name))
 				}
 			}
-			// if !isContributor {
-			// 	fmt.Fprintf(w, "  Upload %d more bytes to unlock "+bold.Fmt(fortunesFileName)+"\r\n", contributorThreshold-stats.UploadBytes)
-			// }
 		}
 	}
 
@@ -690,7 +729,18 @@ func (s *Server) reconcileOrphans() {
 }
 
 func (s *Server) getRandomFortune() string {
-	data, _ := embeddedSource.ReadFile(fortunesFileName)
+	var data []byte
+	var err error
+
+	physicalPath := filepath.Join(s.absUploadDir, fortunesFileName)
+	if fi, statErr := os.Stat(physicalPath); statErr == nil && !fi.IsDir() {
+		data, err = os.ReadFile(physicalPath)
+	}
+
+	if err != nil || len(data) == 0 {
+		data, _ = embeddedSource.ReadFile(fortunesFileName)
+	}
+
 	fortunes := strings.Split(string(data), "\n%\n")
 	if len(fortunes) == 0 {
 		return ""
@@ -775,7 +825,7 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 
 	// Validate path doesn't escape upload directory
 	if !isPathSafe(full, h.srv.absUploadDir) {
-		return "", "", fmt.Errorf(errMsgPathTraversal)
+		return "", "", fmt.Errorf(errMsgPathTraversal.Fmt())
 	}
 
 	return rel, full, nil
@@ -787,7 +837,7 @@ func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
 	}
 
 	if !h.srv.mkdirLimiter.Allow() {
-		return h.deny(errMsgMkdirRateLimit)
+		return h.deny(errMsgMkdirRateLimit.Fmt())
 	}
 
 	_, full, err := h.resolve(relPath)
@@ -875,34 +925,38 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 	h.logger.Debug("fileread request", "path", rel, "req", r)
 
-	if threshold, isRestricted := restrictedFiles[rel]; isRestricted {
+	sourceName := h.srv.sourceFileName()
+	threshold, isRestricted := restrictedFiles[rel]
+	if rel == sourceName {
+		threshold = 0
+		isRestricted = true
+	}
+
+	if isRestricted {
 		stats := h.srv.GetUser(h.pubHash)
 		if stats.UploadBytes < threshold {
-			return nil, h.deny(fmt.Sprintf(errMsgContributorsLocked, rel, threshold, rel, threshold))
+			return nil, h.deny(errMsgContributorsLocked.Fmt(rel, threshold))
 		}
 
+		// Priority 1: Read physical file from upload directory if it exists
+		if fi, statErr := os.Stat(full); statErr == nil && !fi.IsDir() {
+			return os.Open(full)
+		}
+
+		// Priority 2: Fallback to embedded file
 		if data, ok := h.srv.getVirtualFile(rel); ok {
 			return bytes.NewReader(data), nil
 		}
-		// // Map virtual path to embedded source path
-		// embedPath := rel
-		// if rel == readmeFile {
-		// 	embedPath = sourceFile
-		// }
 
-		// data, err := embeddedSource.ReadFile(embedPath)
-		// if err != nil {
-		// 	return nil, err
-		// }
-		// return bytes.NewReader(data), nil
+		return nil, os.ErrNotExist
 	}
 
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny(errMsgSymlinksProhibited, "path", rel)
+		return nil, h.deny(errMsgSymlinksProhibited.Fmt(), "path", rel)
 	}
 
 	if !h.hasUploaded(h.pubHash) {
-		return nil, h.deny(errMsgAccessLocked)
+		return nil, h.deny(errMsgAccessLocked.Fmt())
 	}
 
 	fi, err := os.Stat(full)
@@ -956,17 +1010,19 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 // CanWrite checks if a user can write to a given path
 func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
-	if _, ok := restrictedFiles[rel]; ok {
+	sourceName := h.srv.sourceFileName()
+
+	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
 		var color AsciiDecorator = bold
 		if rel == fortunesFileName {
 			color = yellow
 		}
-		return h.deny(fmt.Sprintf(errMsgFileProtected, color.Bold(rel), color.Bold(rel)), "rel", rel)
+		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "rel", rel)
 	}
 
 	// Forbid overwriting or interacting with symlinks
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return h.deny(errMsgSymlinksProhibited)
+		return h.deny(errMsgSymlinksProhibited.Fmt())
 	}
 
 	// Check folder ownership
@@ -974,7 +1030,7 @@ func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
 	if h.srv.cfg.LockDirectoriesToOwners && parentRel != "." {
 		parentOwner, _ := h.srv.GetOwner(parentRel)
 		if parentOwner != "" && parentOwner != pubHash {
-			return h.deny(errMsgCannotWriteToDir, "parent", parentRel, "owner", parentOwner)
+			return h.deny(errMsgCannotWriteToDir.Fmt(), "parent", parentRel, "owner", parentOwner)
 		}
 	}
 
@@ -1003,7 +1059,7 @@ func (h *fsHandler) ClaimFile(pubhash, rel string) error {
 			return err
 		}
 	} else if currentOwner != h.pubHash {
-		return h.deny(errMsgFilenameClaimed, "path", rel, "owner", currentOwner)
+		return h.deny(errMsgFilenameClaimed.Fmt(), "path", rel, "owner", currentOwner)
 	}
 
 	return tx.Commit()
@@ -1018,46 +1074,60 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 	h.logger.Debug("filelist request", "method", r.Method, "path", rel)
 
+	sourceName := h.srv.sourceFileName()
+
 	if r.Method == "List" {
 		entries, err := os.ReadDir(full)
 		if err != nil {
 			return nil, err
 		}
 		var files []os.FileInfo
-
-		if rel == "." {
-			// Add README.txt (always visible)
-			readmeData, _ := embeddedSource.ReadFile(sourceFile)
-			files = append(files, &virtualFileInfo{name: readmeFile, size: int64(len(readmeData))})
-
-			for f, _ := range restrictedFiles {
-				d, _ := embeddedSource.ReadFile(f)
-				files = append(files, &virtualFileInfo{name: f, size: int64(len(d))})
-			}
-		}
+		physicalFiles := make(map[string]bool)
 
 		for _, e := range entries {
 			fi, _ := e.Info()
+			physicalFiles[e.Name()] = true
 			owner, _ := h.srv.GetOwner(path.Join(rel, e.Name()))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
 		}
+
+		if rel == "." {
+			// Add source file if not physically present
+			if !physicalFiles[sourceName] {
+				if sourceData, err := embeddedSource.ReadFile(sourceFile); err == nil {
+					files = append(files, &virtualFileInfo{name: sourceName, size: int64(len(sourceData))})
+				}
+			}
+
+			// Add other restricted files if not physically present
+			for f := range restrictedFiles {
+				if !physicalFiles[f] {
+					if d, err := embeddedSource.ReadFile(f); err == nil {
+						files = append(files, &virtualFileInfo{name: f, size: int64(len(d))})
+					}
+				}
+			}
+		}
+
 		return listerAt(files), nil
 	}
 
+	// Handle Stat or Lstat
+	fi, err := os.Lstat(full)
+	if err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, h.deny(errMsgAccessToSymlinksForbid.Fmt())
+		}
+		owner, _ := h.srv.GetOwner(rel)
+		return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
+	}
+
+	// Fallback to virtual files
 	if data, isVirtual := h.srv.getVirtualFile(rel); isVirtual {
 		return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
 	}
 
-	fi, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny(errMsgAccessToSymlinksForbid)
-	}
-
-	owner, _ := h.srv.GetOwner(rel)
-	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
+	return nil, os.ErrNotExist
 }
 
 // Filecmd implements file operations (mkdir, remove, rename, etc)
@@ -1071,7 +1141,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	switch r.Method {
 	case "Symlink", "Link":
-		return h.deny(errMsgSymlinksNotPermitted, "path", rel)
+		return h.deny(errMsgSymlinksNotPermitted.Fmt(), "path", rel)
 
 	case "Mkdir":
 		return h.ensureDirs(h.pubHash, rel)
@@ -1087,12 +1157,17 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 }
 
 func (h *fsHandler) handleRemove(rel, full string) error {
+	sourceName := h.srv.sourceFileName()
+	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
+		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel)
+	}
+
 	owner, _ := h.srv.GetOwner(rel)
 	parentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 	canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
 
 	if !canDelete && owner != "" {
-		return h.deny(errMsgNoPermissionDelete, "path", rel, "owner", owner, "parentOwner", parentOwner)
+		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel, "owner", owner, "parentOwner", parentOwner)
 	}
 
 	os.RemoveAll(full)
@@ -1106,11 +1181,31 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 		return h.deny(err.Error(), "target", r.Target)
 	}
 
+	sourceName := h.srv.sourceFileName()
+
+	// Prevent renaming TO a protected file
+	if _, ok := restrictedFiles[relTgt]; ok || relTgt == sourceName {
+		var color AsciiDecorator = bold
+		if relTgt == fortunesFileName {
+			color = yellow
+		}
+		return h.deny(errMsgFileProtected.Fmt(color.Bold(relTgt)), "target", relTgt)
+	}
+
+	// Prevent renaming FROM a protected file
+	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
+		var color AsciiDecorator = bold
+		if rel == fortunesFileName {
+			color = yellow
+		}
+		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "src", rel)
+	}
+
 	// Check source permissions
 	sourceOwner, _ := h.srv.GetOwner(rel)
 	sourceParentOwner, _ := h.srv.GetOwner(path.Dir(rel))
 	if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
-		return h.deny(errMsgNotOwner, "src", rel)
+		return h.deny(errMsgNotOwner.Fmt(), "src", rel)
 	}
 
 	// Check target directory permissions
@@ -1118,7 +1213,7 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 	if h.srv.cfg.LockDirectoriesToOwners && targetDir != "." {
 		targetParentOwner, _ := h.srv.GetOwner(targetDir)
 		if targetParentOwner != "" && targetParentOwner != h.pubHash {
-			return h.deny(errMsgCannotMoveToDir, "targetDir", targetDir)
+			return h.deny(errMsgCannotMoveToDir.Fmt(), "targetDir", targetDir)
 		}
 	}
 
@@ -1126,13 +1221,13 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 	targetOwner, err := h.srv.GetOwner(relTgt)
 	if err == nil {
 		if targetOwner != "" && targetOwner != h.pubHash {
-			return h.deny(errMsgDestinationClaimed, "target", relTgt, "owner", targetOwner)
+			return h.deny(errMsgDestinationClaimed.Fmt(), "target", relTgt, "owner", targetOwner)
 		}
 	}
 
 	// Perform filesystem rename
 	if err := os.Rename(full, fullTgt); err != nil {
-		return h.deny(errMsgRenameFailed, "err", err)
+		return h.deny(errMsgRenameFailed.Fmt(), "err", err)
 	}
 
 	// Update database
@@ -1189,7 +1284,7 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	requestedSize := off + int64(len(p))
 	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
-		sw.h.deny(fmt.Sprintf(errMsgFileSizeExceeded, sw.maxFileSize),
+		sw.h.deny(errMsgFileSizeExceeded.Fmt(sw.maxFileSize),
 			"path", sw.rel,
 			"requested_size", requestedSize,
 			"limit", sw.maxFileSize)
