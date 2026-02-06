@@ -23,27 +23,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-
-----------------------------------------------------------------------------
-
-# What is this?
-	This is an anonymous sftp archive that encourages user contributions.
-
-	Upload something that you find thought-provoking or beautiful to gain
-	download access to the archive.
-
-# How this works:
-    * you log in with your ssh key.  Any ssh key is accepted.
-	* you cannot download a file until you upload a file
-	* anyone can download README.txt (this file)
-	* anyone can upload a file or make a directory
-	* you can delete, rename, or resume uploading files you created
-
-# How to use this server:
-	TODO
-
-# How to run this server:
-	TODO
 */
 
 import (
@@ -63,7 +42,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -124,7 +102,7 @@ const (
 	minPort = 1
 	maxPort = 65535
 
-	// Database
+	// Database Schema
 	Schema = `CREATE TABLE IF NOT EXISTS users ( 
 		pubkey_hash TEXT PRIMARY KEY, 
 		last_login DATETIME, 
@@ -141,32 +119,17 @@ const (
 	);`
 )
 
+// ============================================================================
+// Translatable Errors
+// ============================================================================
+
 var errorPrefix = struct {
 	EN string
 	ZH string
 }{
-	EN: red.Fmt("DENIED:     "),
+	EN: red.Fmt("DENIED:      "),
 	ZH: red.Fmt("访问被拒绝:  "),
 }
-
-var (
-	errMsgSymlinksProhibited     = TranslatableError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
-	errMsgAccessLocked           = TranslatableError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
-	errMsgContributorsLocked     = TranslatableError{EN: "%s is only available to contributors who have uploaded at least %d bytes.", ZH: "%s 仅对上传量至少为 %d 字节的贡献者开放。"}
-	errMsgFileProtected          = TranslatableError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
-	errMsgCannotWriteToDir       = TranslatableError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
-	errMsgFilenameClaimed        = TranslatableError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
-	errMsgNoPermissionDelete     = TranslatableError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
-	errMsgNotOwner               = TranslatableError{EN: "You do not own the source file or directory.", ZH: "您不是源文件或目录的所有者。"}
-	errMsgCannotMoveToDir        = TranslatableError{EN: "Cannot move files into a directory owned by another user.", ZH: "无法将文件移动到属于其他用户的目录。"}
-	errMsgDestinationClaimed     = TranslatableError{EN: "The destination filename is already claimed by someone else.", ZH: "目标文件名已被其他人占用。"}
-	errMsgRenameFailed           = TranslatableError{EN: "rename failed", ZH: "重命名失败"}
-	errMsgSymlinksNotPermitted   = TranslatableError{EN: "Symbolic links are not permitted on this server.", ZH: "此服务器上不允许使用符号链接。"}
-	errMsgAccessToSymlinksForbid = TranslatableError{EN: "Access to symlinks is forbidden.", ZH: "禁止访问符号链接。"}
-	errMsgMkdirRateLimit         = TranslatableError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
-	errMsgFileSizeExceeded       = TranslatableError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
-	errMsgPathTraversal          = TranslatableError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
-)
 
 type TranslatableError struct {
 	EN   string
@@ -193,6 +156,194 @@ func (e TranslatableError) String() string {
 		errorPrefix.ZH, zh)
 }
 
+var (
+	errMsgSymlinksProhibited = TranslatableError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
+	errMsgAccessLocked       = TranslatableError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
+	errMsgContributorsLocked = TranslatableError{EN: "%s is only available to contributors who have uploaded at least %d bytes.", ZH: "%s 仅对上传量至少为 %d 字节的贡献者开放。"}
+	errMsgFileProtected      = TranslatableError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
+	errMsgCannotWriteToDir   = TranslatableError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
+	errMsgFilenameClaimed    = TranslatableError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
+	errMsgNoPermissionDelete = TranslatableError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
+	errMsgNotOwner           = TranslatableError{EN: "You do not own the source file or directory.", ZH: "您不是源文件 or 目录的所有者。"}
+	errMsgRenameFailed       = TranslatableError{EN: "Rename failed.", ZH: "重命名失败。"}
+	errMsgMkdirRateLimit     = TranslatableError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
+	errMsgFileSizeExceeded   = TranslatableError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
+	errMsgPathTraversal      = TranslatableError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
+)
+
+// ============================================================================
+// Store (Database Operations)
+// ============================================================================
+
+type userStats struct {
+	UploadCount   int64
+	LastLogin     string
+	UploadBytes   int64
+	DownloadCount int64
+	DownloadBytes int64
+	FirstTimer    bool
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+func NewStore(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.Exec("PRAGMA journal_mode=WAL;")
+	if _, err := db.Exec(Schema); err != nil {
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+func (s *Store) GetUserStats(hash string) (userStats, error) {
+	var u userStats
+	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes 
+		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes)
+	if err == sql.ErrNoRows {
+		u.FirstTimer = true
+		u.LastLogin = "Never"
+		return u, nil
+	}
+	return u, err
+}
+
+func (s *Store) UpsertUserSession(hash string) (userStats, error) {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	st, err := s.GetUserStats(hash)
+	if err != nil {
+		return st, err
+	}
+
+	if st.FirstTimer {
+		_, err = s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
+	} else {
+		_, err = s.db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
+	}
+	return st, err
+}
+
+func (s *Store) GetFileOwner(relPath string) (string, error) {
+	var owner string
+	err := s.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return owner, err
+}
+
+func (s *Store) RegisterSystemFiles(filenames []string) error {
+	for _, f := range filenames {
+		if _, err := s.db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", f, systemOwner); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ClaimFile(hash, relPath string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var owner string
+	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
+
+	if err == sql.ErrNoRows {
+		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", relPath, hash); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", hash); err != nil {
+			return err
+		}
+	} else if owner != hash {
+		return fmt.Errorf("claimed")
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) EnsureDirectory(hash, relPath string) error {
+	if relPath == "." || relPath == "" {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	parts := strings.Split(relPath, "/")
+	curr := ""
+	for _, p := range parts {
+		curr = path.Join(curr, p)
+		if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, hash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, relPath); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE users SET upload_bytes = upload_bytes + ? WHERE pubkey_hash = ?", delta, hash); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RecordDownload(hash string, bytes int64) error {
+	_, err := s.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", bytes, hash)
+	return err
+}
+
+func (s *Store) RenamePath(oldRel, newRel string) error {
+	_, err := s.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
+		newRel, oldRel, oldRel, oldRel+"/%")
+	return err
+}
+
+func (s *Store) DeletePath(relPath string) error {
+	_, err := s.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", relPath, relPath+"/%")
+	return err
+}
+
+func (s *Store) GetBannerStats(threshold int64) (u, c, f, b uint64) {
+	s.db.QueryRow(`
+		SELECT 
+			COUNT(*) FILTER (WHERE upload_count > 0),
+			COUNT(*) FILTER (WHERE upload_bytes > ?)
+		FROM users
+	`, threshold).Scan(&u, &c)
+	s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
+	return
+}
+
+func (s *Store) FileExistsInDB(relPath string) bool {
+	var exists bool
+	s.db.QueryRow("SELECT 1 FROM files WHERE path = ?", relPath).Scan(&exists)
+	return exists
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -215,7 +366,6 @@ type Config struct {
 func LoadConfig() (Config, error) {
 	cfg := Config{}
 
-	// Define all flags using EnvFlag helper
 	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name")
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
@@ -237,8 +387,6 @@ func LoadConfig() (Config, error) {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nNote: environment variables may be optionally prefixed with %s. ", bold.Fmt(envPrefix))
-		fmt.Fprint(os.Stderr, "For example: "+bold.Fmt(envPrefix+"PORT")+" is checked before "+bold.Fmt("PORT\n"))
 	}
 	flag.Parse()
 
@@ -259,7 +407,6 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.MaxFileSize = maxSize
 
-	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("configuration validation failed: %w", err)
 	}
@@ -269,33 +416,11 @@ func LoadConfig() (Config, error) {
 
 func (c Config) Validate() error {
 	if c.Port < minPort || c.Port > maxPort {
-		return fmt.Errorf("port must be between %d and %d, got %d", minPort, maxPort, c.Port)
+		return fmt.Errorf("port must be between %d and %d", minPort, maxPort)
 	}
-
-	if c.MkdirRate < 0 {
-		return fmt.Errorf("mkdir rate cannot be negative, got %f", c.MkdirRate)
+	if c.Name == "" || c.HostKeyFile == "" || c.DBPath == "" || c.UploadDir == "" {
+		return errors.New("required configuration fields missing")
 	}
-
-	if c.MaxFileSize < 0 {
-		return fmt.Errorf("max file size cannot be negative, got %d", c.MaxFileSize)
-	}
-
-	if c.Name == "" {
-		return errors.New("archive name cannot be empty")
-	}
-
-	if c.HostKeyFile == "" {
-		return errors.New("host key file path cannot be empty")
-	}
-
-	if c.DBPath == "" {
-		return errors.New("database path cannot be empty")
-	}
-
-	if c.UploadDir == "" {
-		return errors.New("upload directory cannot be empty")
-	}
-
 	return nil
 }
 
@@ -304,7 +429,7 @@ func (c Config) Validate() error {
 // ============================================================================
 
 type Server struct {
-	db           *sql.DB
+	store        *Store
 	logger       *slog.Logger
 	mkdirLimiter *rate.Limiter
 	cfg          Config
@@ -317,46 +442,29 @@ type Server struct {
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
-	db, err := sql.Open("sqlite", cfg.DBPath)
+	store, err := NewStore(cfg.DBPath)
 	if err != nil {
-		return nil, fmt.Errorf("DB connection failed: %w", err)
+		return nil, fmt.Errorf("failed to init store: %w", err)
 	}
 
-	db.Exec("PRAGMA journal_mode=WAL;")
-
-	if _, err := db.Exec(Schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema init failed: %w", err)
+	var sysFiles []string
+	for f := range restrictedFiles {
+		sysFiles = append(sysFiles, f)
 	}
-	for filename := range restrictedFiles {
-		_, err := db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", filename, systemOwner)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to initialize system file %s: %w", filename, err)
-		}
-	}
-
-	sourceName := fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion)
-	if _, err := db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", sourceName, systemOwner); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to initialize source file %s: %w", sourceName, err)
+	sysFiles = append(sysFiles, fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion))
+	if err := store.RegisterSystemFiles(sysFiles); err != nil {
+		return nil, err
 	}
 
 	absDir, err := filepath.Abs(cfg.UploadDir)
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to resolve upload directory: %w", err)
+		return nil, err
 	}
-
-	if err := os.MkdirAll(absDir, permDir); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create upload directory: %w", err)
-	}
+	os.MkdirAll(absDir, permDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
 	srv := &Server{
-		db:           db,
+		store:        store,
 		logger:       logger,
 		mkdirLimiter: rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1),
 		cfg:          cfg,
@@ -374,46 +482,18 @@ func (s *Server) sourceFileName() string {
 }
 
 func (s *Server) Shutdown() error {
-	s.logger.Info("initiating graceful shutdown")
-
-	// Signal shutdown
 	close(s.shutdown)
 	s.cancel()
-
-	// Stop accepting new connections
 	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.logger.Error("error closing listener", "err", err)
-		}
+		s.listener.Close()
 	}
-
-	// Wait for active connections with timeout
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		s.logger.Info("all connections closed")
-	case <-time.After(30 * time.Second):
-		s.logger.Warn("shutdown timeout reached, forcing close")
-	}
-
-	// Close database
-	if err := s.db.Close(); err != nil {
-		s.logger.Error("error closing database", "err", err)
-		return err
-	}
-
-	s.logger.Info("shutdown complete")
-	return nil
+	s.wg.Wait()
+	return s.store.Close()
 }
 
 func (s *Server) Listen() error {
 	if err := s.ensureHostKey(); err != nil {
-		return fmt.Errorf("host key error: %w", err)
+		return err
 	}
 
 	sshConfig := &ssh.ServerConfig{
@@ -421,33 +501,25 @@ func (s *Server) Listen() error {
 		PublicKeyCallback: s.publicKeyCallback,
 	}
 
-	if err := s.addHostKey(sshConfig); err != nil {
-		return err
-	}
+	keyBytes, _ := os.ReadFile(s.cfg.HostKeyFile)
+	key, _ := ssh.ParsePrivateKey(keyBytes)
+	sshConfig.AddHostKey(key)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
 	if err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return err
 	}
 	s.listener = listener
 
-	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "dir", s.absUploadDir)
+	s.logger.Info("SFTP archive online", "port", s.cfg.Port)
 
-	// Accept connections until shutdown
 	for {
-		select {
-		case <-s.shutdown:
-			return nil
-		default:
-		}
-
 		conn, err := listener.Accept()
 		if err != nil {
 			select {
 			case <-s.shutdown:
 				return nil
 			default:
-				s.logger.Debug("accept error", "err", err)
 				continue
 			}
 		}
@@ -465,122 +537,36 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 }
 
-func (s *Server) addHostKey(config *ssh.ServerConfig) error {
-	keyBytes, err := os.ReadFile(s.cfg.HostKeyFile)
-	if err != nil {
-		return fmt.Errorf("host key missing. Generate: ssh-keygen -t ed25519 -f id_ed25519 -N ''")
-	}
-
-	key, err := ssh.ParsePrivateKey(keyBytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse host key: %w", err)
-	}
-
-	config.AddHostKey(key)
-	return nil
-}
-
-func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
-	physicalPath := filepath.Join(s.absUploadDir, relPath)
-	if fi, statErr := os.Stat(physicalPath); statErr == nil && !fi.IsDir() {
-		if data, err := os.ReadFile(physicalPath); err == nil {
-			return data, nil
-		}
-	}
-	return embeddedSource.ReadFile(embeddedPath)
-}
-
-func (s *Server) ReadRealOrVirtualFile(relPath string) (data []byte, err error) {
-	return s.readFileWithFallback(relPath, s.cfg.BannerFile)
-}
-
 func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
-	data, err := s.ReadRealOrVirtualFile(s.cfg.BannerFile)
-	banner := string(data)
-	if err != nil {
+	banner := ""
+	if data, err := s.readFileWithFallback(s.cfg.BannerFile, s.cfg.BannerFile); err == nil {
+		banner = string(data)
+	} else {
 		banner = fmt.Sprintf("=== %s v%s ===", s.cfg.Name, AppVersion)
 	}
 
 	if s.cfg.BannerStats {
-		var u, c, f, b uint64
-
-		s.db.QueryRow(`
-			SELECT 
-				COUNT(*) FILTER (WHERE upload_count > 0),
-				COUNT(*) FILTER (WHERE upload_bytes > ?)
-			FROM users
-		`, contributorThreshold).Scan(&u, &c)
-		s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
+		u, c, f, b := s.store.GetBannerStats(contributorThreshold)
 		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %d bytes\r\n", u, c, f, b)
 	}
 	return banner
 }
 
-func (s *Server) ensureHostKey() error {
-	if _, err := os.Stat(s.cfg.HostKeyFile); err == nil {
-		return nil // Key already exists
-	}
-
-	s.logger.Info("generating new Ed25519 host key", "path", s.cfg.HostKeyFile)
-
-	_, priv, err := ed25519.GenerateKey(cryptorand.Reader)
-	if err != nil {
-		return fmt.Errorf("failed to generate key: %w", err)
-	}
-
-	bytes, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return fmt.Errorf("failed to marshal key: %w", err)
-	}
-
-	pemBlock := &pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: bytes,
-	}
-
-	keyFile, err := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, permHostKey)
-	if err != nil {
-		return fmt.Errorf("failed to open key file for writing: %w", err)
-	}
-	defer keyFile.Close()
-
-	if err := pem.Encode(keyFile, pemBlock); err != nil {
-		return fmt.Errorf("failed to encode pem: %w", err)
-	}
-
-	return nil
-}
-
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
-	// Check if we're shutting down
-	select {
-	case <-s.shutdown:
-		nConn.Close()
-		return
-	default:
-	}
-
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
-		s.logger.Debug("ssh handshake failed", "err", err)
 		return
 	}
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
-	stats := s.updateUserSession(pubHash)
+	stats, _ := s.store.UpsertUserSession(pubHash)
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 
-	s.logConnection(pubHash, sessionID, stats, sConn)
+	s.logger.Info("login", "user", shortID(pubHash), "addr", sConn.RemoteAddr())
 	go ssh.DiscardRequests(reqs)
 
 	for newCh := range chans {
-		select {
-		case <-s.shutdown:
-			return
-		default:
-		}
-
 		if newCh.ChannelType() != "session" {
 			newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
 			continue
@@ -591,235 +577,80 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	}
 }
 
-func (s *Server) logConnection(pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn) {
-	s.logger.Info("handling login",
-		slog.Group("user",
-			"id", pubHash[:12],
-			"uid", hashToUid(pubHash),
-			"last_login", stats.LastLogin,
-			"upload_count", stats.UploadCount,
-			"upload_bytes", stats.UploadBytes,
-			"download_count", stats.DownloadCount,
-			"download_bytes", stats.DownloadBytes,
-			"first_timer", stats.FirstTimer,
-		),
-		slog.Group("conn",
-			"user", sConn.User(),
-			"session", sessionID[:16],
-			"client_version", sConn.ClientVersion(),
-			"remote_address", sConn.RemoteAddr(),
-			"local_address", sConn.LocalAddr(),
-		),
-	)
-}
-
-func (s *Server) getVirtualFile(name string) ([]byte, bool) {
-	if name == s.sourceFileName() {
-		data, err := embeddedSource.ReadFile(sourceFile)
-		return data, err == nil
-	}
-
-	if _, ok := restrictedFiles[name]; !ok {
-		return nil, false
-	}
-
-	data, err := embeddedSource.ReadFile(name)
-	if err != nil {
-		return nil, false
-	}
-	return data, true
-}
-
 func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn) {
 	defer ch.Close()
-
 	for req := range reqs {
-		select {
-		case <-s.shutdown:
-			return
-		default:
-		}
-
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
 			req.Reply(true, nil)
 			s.Welcome(ch.Stderr(), pubHash, stats)
 
-			handler := s.newFSHandler(pubHash, sessionID, ch.Stderr(), sConn.RemoteAddr())
+			handler := &fsHandler{
+				srv:       s,
+				pubHash:   pubHash,
+				stderr:    ch.Stderr(),
+				sessionID: sessionID,
+				logger: *s.logger.With(
+					slog.Group("user",
+						"id", shortID(pubHash),
+						"uid", hashToUid(pubHash),
+						"session", sessionID[:16],
+						"remote_address", sConn.RemoteAddr(),
+					),
+				),
+			}
 			server := sftp.NewRequestServer(ch, sftp.Handlers{
 				FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
 			})
-
-			if err := server.Serve(); err != nil && err != io.EOF {
-				s.logger.Error("sftp session ended", "err", err)
-			}
+			server.Serve()
 			return
 		}
-	}
-}
-
-func (s *Server) newFSHandler(pubHash, sessionID string, stderr io.Writer, remoteAddr net.Addr) *fsHandler {
-	return &fsHandler{
-		srv:       s,
-		pubHash:   pubHash,
-		stderr:    stderr,
-		sessionID: sessionID,
-		logger: *s.logger.With(
-			slog.Group("user",
-				"id", pubHash[:12],
-				"uid", hashToUid(pubHash),
-				"session", sessionID[:16],
-				"remote_address", remoteAddr,
-			),
-		),
 	}
 }
 
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
+	isContributor := stats.UploadBytes >= contributorThreshold
 
-	readme := func() {
-		fmt.Fprint(w, bold.Fmt("Reminder: ")+"upload a file to download a file.\r\n")
-		fmt.Fprint(w, "  See "+bold.Fmt(readmeFile)+" for more information.\r\n")
-		fmt.Fprint(w, "  You may always download "+bold.Fmt(readmeFile)+"\r\n")
-		fmt.Fprint(w, "  You may also download the source code at "+bold.Fmt(s.sourceFileName())+"\r\n")
-		fmt.Fprint(w, "  Upload 1MB+ to unlock "+yellow.Bold(fortunesFileName)+"\r\n")
+	fmt.Fprintf(w, "\r\nWelcome, %s\r\n", userLabel)
+	if isContributor {
+		fmt.Fprint(w, yellow.Bold("★ Contributor status unlocked!\r\n"))
 	}
+	fmt.Fprintf(w, "ID: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.UploadCount, stats.UploadBytes)
+}
 
-	if stats.FirstTimer {
-		fmt.Fprint(w, bold.Fmt("\r\nWelcome, "+userLabel)+". This is a share-first archive.\r\n")
-		readme()
-	} else {
-		isContributor := stats.UploadBytes >= contributorThreshold
-		color := blue
-		if isContributor {
-			color = yellow
-		}
-
-		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
-		if isContributor {
-			fmt.Fprintf(w, "\"%s\"\r\n", color.Italic(s.getRandomFortune()))
-			fmt.Fprint(w, yellow.Fmt("★ Contributor status unlocked! You can now read "+fortunesFileName+"\r\n"))
-		}
-
-		if stats.UploadCount == 0 {
-			fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
-			readme()
-		} else {
-			fmt.Fprint(w, green.Fmt("Downloading is unlocked.\r\n"))
-			for name, threshold := range restrictedFiles {
-				if stats.UploadBytes < threshold {
-					fmt.Fprintf(w, "  Upload %d more bytes to unlock %s\r\n", threshold-stats.UploadBytes, bold.Fmt(name))
-				}
-			}
-		}
+func (s *Server) ensureHostKey() error {
+	if _, err := os.Stat(s.cfg.HostKeyFile); err == nil {
+		return nil
 	}
+	_, priv, _ := ed25519.GenerateKey(cryptorand.Reader)
+	bytes, _ := x509.MarshalPKCS8PrivateKey(priv)
+	pemBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: bytes}
+	keyFile, _ := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	defer keyFile.Close()
+	return pem.Encode(keyFile, pemBlock)
+}
 
-	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes",
-		userLabel, stats.LastLogin, stats.UploadCount, stats.UploadBytes)
-	if stats.DownloadCount > 0 {
-		fmt.Fprintf(w, " |  Downloaded: %d files, %d bytes", stats.DownloadCount, stats.DownloadBytes)
+func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
+	physicalPath := filepath.Join(s.absUploadDir, relPath)
+	if data, err := os.ReadFile(physicalPath); err == nil {
+		return data, nil
 	}
-	fmt.Fprintf(w, "\r\n")
+	return embeddedSource.ReadFile(embeddedPath)
 }
 
 func (s *Server) reconcileOrphans() {
-	s.logger.Info("reconciling filesystem with database")
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || p == s.absUploadDir {
+		if err != nil || p == s.absUploadDir || d.IsDir() {
 			return nil
 		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-
 		rel, _ := filepath.Rel(s.absUploadDir, p)
 		rel = filepath.ToSlash(rel)
-
-		var exists bool
-		s.db.QueryRow("SELECT 1 FROM files WHERE path = ?", rel).Scan(&exists)
-		if !exists {
+		if !s.store.FileExistsInDB(rel) {
 			fi, _ := d.Info()
-			s.logger.Debug("found orphan file, assigning to system", "path", rel)
-			s.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, ?)", rel, systemOwner, fi.Size())
+			s.store.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, ?)", rel, systemOwner, fi.Size())
 		}
 		return nil
 	})
-}
-
-func (s *Server) getRandomFortune() string {
-	data, err := s.readFileWithFallback(fortunesFileName, fortunesFileName)
-	if err != nil {
-		return ""
-	}
-
-	fortunes := strings.Split(string(data), "\n%\n")
-	if len(fortunes) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(fortunes[rand.Intn(len(fortunes))])
-}
-
-func (s *Server) withTx(fn func(*sql.Tx) error) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// ============================================================================
-// Database Operations
-// ============================================================================
-
-type userStats struct {
-	UploadCount   int64
-	LastLogin     string
-	UploadBytes   int64
-	DownloadCount int64
-	DownloadBytes int64
-	FirstTimer    bool
-}
-
-func (s *Server) GetUser(hash string) (u userStats) {
-	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes 
-		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes)
-	if err == sql.ErrNoRows {
-		u.FirstTimer = true
-		u.LastLogin = "Never"
-	}
-	return u
-}
-
-func (s *Server) GetOwner(relPath string) (string, error) {
-	var owner string
-	err := s.db.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
-	return owner, err
-}
-
-func (s *Server) GetOwnerTX(tx *sql.Tx, relPath string) (string, error) {
-	var owner string
-	err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
-	return owner, err
-}
-
-func (s *Server) updateUserSession(hash string) (st userStats) {
-	now := time.Now().Format("2006-01-02 15:04:05")
-	err := s.db.QueryRow("SELECT last_login, upload_count, upload_bytes, download_count, download_bytes FROM users WHERE pubkey_hash = ?", hash).Scan(&st.LastLogin, &st.UploadCount, &st.UploadBytes, &st.DownloadCount, &st.DownloadBytes)
-
-	if err == sql.ErrNoRows {
-		s.logger.Debug("registering new user", "user.id", hash[:12])
-		st.FirstTimer = true
-		st.LastLogin = "Never"
-		s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
-	} else {
-		s.db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
-	}
-	return st
 }
 
 // ============================================================================
@@ -834,418 +665,236 @@ type fsHandler struct {
 	logger    slog.Logger
 }
 
-// resolve converts an SFTP path to relative and absolute filesystem paths
-// with path traversal protection
+func (h *fsHandler) deny(err TranslatableError, args ...any) error {
+	logArgs := make([]any, 0, 2+len(args))
+	logArgs = append(logArgs, "reason", err.EN)
+	logArgs = append(logArgs, args...)
+
+	h.logger.Info("permission denied", logArgs...)
+	fmt.Fprintln(h.stderr, err.String())
+	return sftp.ErrSSHFxPermissionDenied
+}
+
 func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
-	// Clean the path
 	virt := path.Clean("/" + p)
 	rel = strings.TrimPrefix(virt, "/")
 	if rel == "" {
 		rel = "."
 	}
-
-	// Build full path
 	full = filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
-
-	// Validate path doesn't escape upload directory
 	if !isPathSafe(full, h.srv.absUploadDir) {
-		return "", "", fmt.Errorf(errMsgPathTraversal.String())
+		return "", "", fmt.Errorf("traversal")
 	}
-
 	return rel, full, nil
-}
-
-func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
-	if relPath == "." || relPath == "" {
-		return nil
-	}
-
-	if !h.srv.mkdirLimiter.Allow() {
-		return h.deny(errMsgMkdirRateLimit.String())
-	}
-
-	_, full, err := h.resolve(relPath)
-	if err != nil {
-		return err
-	}
-
-	// TODO: if h.srv.cfg.LockDirectoriesToOwners,  make sure that we don't let users make dirs inside each other's dirs
-	if err := os.MkdirAll(full, permDir); err != nil {
-		return err
-	}
-
-	parts := strings.Split(relPath, "/")
-	curr := ""
-
-	return h.srv.withTx(func(tx *sql.Tx) error {
-		for _, p := range parts {
-			curr = path.Join(curr, p)
-			if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, pubHash); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (h *fsHandler) getPathOwnership(rel string) (owner, parentOwner string) {
-	owner, _ = h.srv.GetOwner(rel)
-	parentOwner, _ = h.srv.GetOwner(path.Dir(rel))
-	return
-}
-
-func (h *fsHandler) hasUploaded(pubHash string) bool {
-	stats := h.srv.GetUser(pubHash)
-	return stats.UploadCount > 0
-}
-
-func (h *fsHandler) isContributor(pubHash string) bool {
-	stats := h.srv.GetUser(pubHash)
-	return stats.UploadBytes >= contributorThreshold
-}
-
-func (h *fsHandler) isProtectedFile(rel string) bool {
-	sourceName := h.srv.sourceFileName()
-	_, isRestricted := restrictedFiles[rel]
-	return isRestricted || rel == sourceName
-}
-
-func (h *fsHandler) getFileColor(filename string) AsciiDecorator {
-	if filename == fortunesFileName {
-		return yellow
-	}
-	return bold
-}
-
-func (h *fsHandler) canModifyPath(rel string) (canModify bool, owner, parentOwner string) {
-	owner, parentOwner = h.getPathOwnership(rel)
-	canModify = owner == h.pubHash || parentOwner == h.pubHash
-	return
-}
-
-func (h *fsHandler) canWriteToDirectory(dirPath string) error {
-	if !h.srv.cfg.LockDirectoriesToOwners || dirPath == "." {
-		return nil
-	}
-
-	dirOwner, _ := h.srv.GetOwner(dirPath)
-	if dirOwner != "" && dirOwner != h.pubHash {
-		return h.deny(errMsgCannotWriteToDir.String(), "parent", dirPath, "owner", dirOwner)
-	}
-	return nil
-}
-
-func (h *fsHandler) canClaimFile(rel string) error {
-	owner, err := h.srv.GetOwner(rel)
-	if err == nil && owner != "" && owner != h.pubHash {
-		return h.deny(errMsgDestinationClaimed.String(), "target", rel, "owner", owner)
-	}
-	return nil
-}
-
-func (h *fsHandler) deny(msg string, args ...any) error {
-	h.logger.Info(msg, args...)
-	fmt.Fprintf(h.stderr, msg)
-	return sftp.ErrSshFxPermissionDenied
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
-		return nil, h.deny(err.Error(), "path", r.Filepath)
+		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	h.logger.Debug("fileread request", "path", rel, "req", r)
-
-	sourceName := h.srv.sourceFileName()
 	threshold, isRestricted := restrictedFiles[rel]
-	if rel == sourceName {
+	if rel == h.srv.sourceFileName() {
 		threshold = 0
 		isRestricted = true
 	}
 
+	stats, _ := h.srv.store.GetUserStats(h.pubHash)
 	if isRestricted {
-		stats := h.srv.GetUser(h.pubHash)
+
 		if stats.UploadBytes < threshold {
-			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold).String())
+			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold),
+				"path", rel,
+				"uploaded_bytes", stats.UploadBytes,
+				"required", threshold)
 		}
 
-		// Priority 1: Read physical file from upload directory if it exists
-		if fi, statErr := os.Stat(full); statErr == nil && !fi.IsDir() {
+		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			h.logger.Info("read system file", "path", rel)
 			return os.Open(full)
 		}
 
-		// Priority 2: Fallback to embedded file
-		if data, ok := h.srv.getVirtualFile(rel); ok {
+		if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
 			return bytes.NewReader(data), nil
 		}
 
+		if rel == h.srv.sourceFileName() {
+			if data, err := embeddedSource.ReadFile(sourceFile); err == nil {
+				h.logger.Info("read embedded file", "path", rel)
+				return bytes.NewReader(data), nil
+			}
+		}
 		return nil, os.ErrNotExist
 	}
 
-	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny(errMsgSymlinksProhibited.String(), "path", rel)
-	}
-
-	if !h.hasUploaded(h.pubHash) {
-		return nil, h.deny(errMsgAccessLocked.String())
+	if stats.UploadCount == 0 {
+		return nil, h.deny(errMsgAccessLocked, "path", rel)
 	}
 
 	fi, err := os.Stat(full)
 	if err != nil {
 		return nil, err
 	}
-	fileSize := fi.Size()
-
-	h.logger.Debug("tracking download", "path", rel, "size", fileSize)
-	h.srv.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", fileSize, h.pubHash)
-
+	h.logger.Info("file download", "path", rel, "size", fi.Size())
+	h.srv.store.RecordDownload(h.pubHash, fi.Size())
 	return os.Open(full)
 }
 
-// Filewrite implements sftp file writing
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
-		return nil, h.deny(err.Error(), "path", r.Filepath)
+		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	h.logger.Debug("filewrite request", "path", rel)
+	if _, ok := restrictedFiles[rel]; ok || rel == h.srv.sourceFileName() {
+		return nil, h.deny(errMsgFileProtected.Args(rel), "path", rel)
+	}
 
-	if err := h.CanWrite(h.pubHash, rel, full); err != nil {
-		return nil, err
+	parentRel := path.Dir(rel)
+	if h.srv.cfg.LockDirectoriesToOwners && parentRel != "." {
+		owner, _ := h.srv.store.GetFileOwner(parentRel)
+		if owner != "" && owner != h.pubHash {
+			return nil, h.deny(errMsgCannotWriteToDir, "path", rel, "parent", parentRel, "owner", shortID(owner))
+		}
+	}
+
+	if !h.srv.mkdirLimiter.Allow() {
+		return nil, h.deny(errMsgMkdirRateLimit, "path", rel)
+	}
+
+	h.srv.store.EnsureDirectory(h.pubHash, parentRel)
+	os.MkdirAll(filepath.Dir(full), permDir)
+
+	if err := h.srv.store.ClaimFile(h.pubHash, rel); err != nil {
+		return nil, h.deny(errMsgFilenameClaimed, "path", rel)
 	}
 
 	flags := os.O_RDWR | os.O_CREATE
-	if !r.Pflags().Append {
+	isAppend := r.Pflags().Append
+	if !isAppend {
 		flags |= os.O_TRUNC
 	}
 
+	h.logger.Info("file write open", "path", rel, "append", isAppend)
 	f, err := os.OpenFile(full, flags, permFile)
 	if err != nil {
+		h.logger.Error("io error", "op", "openwrite", "path", rel, "err", err)
 		return nil, err
 	}
 
-	var oldSize int64
+	oldSize := int64(0)
 	if fi, err := os.Stat(full); err == nil {
 		oldSize = fi.Size()
 	}
 
-	return &statWriter{
-		File:        f,
-		h:           h,
-		rel:         rel,
-		oldSize:     oldSize,
-		maxFileSize: h.srv.cfg.MaxFileSize,
-	}, nil
+	return &statWriter{File: f, h: h, rel: rel, oldSize: oldSize}, nil
 }
 
-// CanWrite checks if a user can write to a given path
-func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
-	if h.isProtectedFile(rel) {
-		color := h.getFileColor(rel)
-		return h.deny(errMsgFileProtected.Args(color.Bold(rel)).String(), "rel", rel)
-	}
-
-	// Forbid overwriting or interacting with symlinks
-	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return h.deny(errMsgSymlinksProhibited.String())
-	}
-
-	// Check folder ownership
-	parentRel := path.Dir(rel)
-	if err := h.canWriteToDirectory(parentRel); err != nil {
-		return err
-	}
-
-	if err := h.ensureDirs(pubHash, parentRel); err != nil {
-		return err
-	}
-
-	return h.ClaimFile(pubHash, rel)
-}
-
-// ClaimFile attempts to claim ownership of a file
-func (h *fsHandler) ClaimFile(pubhash, rel string) error {
-	return h.srv.withTx(func(tx *sql.Tx) error {
-		currentOwner, err := h.srv.GetOwnerTX(tx, rel)
-		if err == sql.ErrNoRows {
-			h.logger.Debug("claiming new file ownership", "path", rel)
-			if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
-				return err
-			}
-			if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
-				return err
-			}
-		} else if currentOwner != h.pubHash {
-			return h.deny(errMsgFilenameClaimed.String(), "path", rel, "owner", currentOwner)
-		}
-		return nil
-	})
-}
-
-// Filelist implements directory listing
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
-		return nil, h.deny(err.Error(), "path", r.Filepath)
+		return nil, sftp.ErrSshFxPermissionDenied
 	}
 
-	h.logger.Debug("filelist request", "method", r.Method, "path", rel)
-
-	sourceName := h.srv.sourceFileName()
-
 	if r.Method == "List" {
-		entries, err := os.ReadDir(full)
-		if err != nil {
-			return nil, err
-		}
+		entries, _ := os.ReadDir(full)
 		var files []os.FileInfo
-		physicalFiles := make(map[string]bool)
-
 		for _, e := range entries {
 			fi, _ := e.Info()
-			physicalFiles[e.Name()] = true
-			owner, _ := h.srv.GetOwner(path.Join(rel, e.Name()))
+			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, e.Name()))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
 		}
-
 		if rel == "." {
-			// Add source file if not physically present
-			if !physicalFiles[sourceName] {
-				if sourceData, err := embeddedSource.ReadFile(sourceFile); err == nil {
-					files = append(files, &virtualFileInfo{name: sourceName, size: int64(len(sourceData))})
-				}
-			}
-
-			// Add other restricted files if not physically present
+			files = append(files, &virtualFileInfo{name: h.srv.sourceFileName(), size: 0})
 			for f := range restrictedFiles {
-				if !physicalFiles[f] {
-					if d, err := embeddedSource.ReadFile(f); err == nil {
-						files = append(files, &virtualFileInfo{name: f, size: int64(len(d))})
-					}
-				}
+				files = append(files, &virtualFileInfo{name: f, size: 0})
 			}
 		}
-
 		return listerAt(files), nil
 	}
 
-	// Handle Stat or Lstat
 	fi, err := os.Lstat(full)
-	if err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return nil, h.deny(errMsgAccessToSymlinksForbid.String())
-		}
-		owner, _ := h.srv.GetOwner(rel)
-		return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
+	if err != nil {
+		return nil, os.ErrNotExist
 	}
-
-	// Fallback to virtual files
-	if data, isVirtual := h.srv.getVirtualFile(rel); isVirtual {
-		return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
-	}
-
-	return nil, os.ErrNotExist
+	owner, _ := h.srv.store.GetFileOwner(rel)
+	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
 
-// Filecmd implements file operations (mkdir, remove, rename, etc)
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
-		return h.deny(err.Error(), "path", r.Filepath)
+		return h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
-
-	h.logger.Debug("filecmd request", "method", r.Method, "path", rel)
 
 	switch r.Method {
-	case "Symlink", "Link":
-		return h.deny(errMsgSymlinksNotPermitted.String(), "path", rel)
-
 	case "Mkdir":
-		return h.ensureDirs(h.pubHash, rel)
-
+		if !h.srv.mkdirLimiter.Allow() {
+			return h.deny(errMsgMkdirRateLimit, "path", rel)
+		}
+		os.MkdirAll(full, permDir)
+		return h.srv.store.EnsureDirectory(h.pubHash, rel)
 	case "Remove", "Rmdir":
-		return h.handleRemove(rel, full)
-
+		owner, _ := h.srv.store.GetFileOwner(rel)
+		if owner != "" && owner != h.pubHash {
+			return h.deny(errMsgNoPermissionDelete, "path", rel, "owner", shortID(owner))
+		}
+		if _, ok := restrictedFiles[rel]; ok || rel == h.srv.sourceFileName() {
+			return h.deny(errMsgFileProtected.Args(rel), "path", rel)
+		}
+		os.RemoveAll(full)
+		return h.srv.store.DeletePath(rel)
 	case "Rename":
-		return h.handleRename(r, rel, full)
+		relTgt, fullTgt, err := h.resolve(r.Target)
+		if err != nil {
+			return h.deny(errMsgPathTraversal, "from", rel, "to", r.Target)
+		}
+		owner, _ := h.srv.store.GetFileOwner(rel)
+		if owner != "" && owner != h.pubHash {
+			return h.deny(errMsgNotOwner, "path", rel)
+		}
+		if _, ok := restrictedFiles[relTgt]; ok || relTgt == h.srv.sourceFileName() {
+			return h.deny(errMsgFileProtected.Args(relTgt), "path", relTgt)
+		}
+		h.logger.Info("rename", "from", rel, "to", relTgt)
+		if err := os.Rename(full, fullTgt); err != nil {
+			return h.deny(errMsgRenameFailed)
+		}
+		return h.srv.store.RenamePath(rel, relTgt)
 	}
-
 	return sftp.ErrSshFxOpUnsupported
 }
 
-func (h *fsHandler) handleRemove(rel, full string) error {
-	if h.isProtectedFile(rel) {
-		return h.deny(errMsgNoPermissionDelete.String(), "path", rel)
-	}
+// ============================================================================
+// Helpers & Types
+// ============================================================================
 
-	canDelete, owner, parentOwner := h.canModifyPath(rel)
-
-	if !canDelete && owner != "" {
-		return h.deny(errMsgNoPermissionDelete.String(), "path", rel, "owner", owner, "parentOwner", parentOwner)
-	}
-
-	os.RemoveAll(full)
-	h.srv.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
-	return nil
+type statWriter struct {
+	*os.File
+	h       *fsHandler
+	rel     string
+	oldSize int64
 }
 
-func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
-	relTgt, fullTgt, err := h.resolve(r.Target)
-	if err != nil {
-		return h.deny(err.Error(), "target", r.Target)
+func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
+	if sw.h.srv.cfg.MaxFileSize > 0 && off+int64(len(p)) > sw.h.srv.cfg.MaxFileSize {
+		return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
+			"path", sw.rel,
+			"offset", off,
+			"size", len(p))
 	}
-
-	// Prevent renaming TO a protected file
-	if h.isProtectedFile(relTgt) {
-		color := h.getFileColor(relTgt)
-		return h.deny(errMsgFileProtected.Args(color.Bold(relTgt)).String(), "target", relTgt)
-	}
-
-	// Prevent renaming FROM a protected file
-	if h.isProtectedFile(rel) {
-		color := h.getFileColor(rel)
-		return h.deny(errMsgFileProtected.Args(color.Bold(rel)).String(), "src", rel)
-	}
-
-	// Check source permissions
-	canModifySource, _, _ := h.canModifyPath(rel)
-	if !canModifySource {
-		return h.deny(errMsgNotOwner.String(), "src", rel)
-	}
-
-	// Check target directory permissions
-	targetDir := path.Dir(relTgt)
-	if err := h.canWriteToDirectory(targetDir); err != nil {
-		return err
-	}
-
-	// Check if target is already claimed
-	if err := h.canClaimFile(relTgt); err != nil {
-		return err
-	}
-
-	// Perform filesystem rename
-	if err := os.Rename(full, fullTgt); err != nil {
-		return h.deny(errMsgRenameFailed.String(), "err", err)
-	}
-
-	// Update database
-	return h.srv.withTx(func(tx *sql.Tx) error {
-		_, err = tx.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
-			relTgt, rel, rel, rel+"/%")
-		if err != nil {
-			h.logger.Error("db update failed after rename", "err", err)
-			return err
-		}
-		return nil
-	})
+	return sw.File.WriteAt(p, off)
 }
 
-// ============================================================================
-// SFTP File Types
-// ============================================================================
+func (sw *statWriter) Close() error {
+	fi, _ := sw.File.Stat()
+	size := fi.Size()
+	delta := size - sw.oldSize
+	sw.h.logger.Info("file write closed", "path", sw.rel, "final_size", size, "delta", delta)
+	sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.rel, size, delta)
+	return sw.File.Close()
+}
 
 type sftpFile struct {
 	os.FileInfo
@@ -1269,38 +918,6 @@ func (v *virtualFileInfo) ModTime() time.Time { return time.Now() }
 func (v *virtualFileInfo) IsDir() bool        { return false }
 func (v *virtualFileInfo) Sys() interface{}   { return &sftp.FileStat{UID: defaultUID, GID: defaultGID} }
 
-type statWriter struct {
-	*os.File
-	h           *fsHandler
-	rel         string
-	oldSize     int64
-	maxFileSize int64
-}
-
-func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
-	requestedSize := off + int64(len(p))
-	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
-		sw.h.deny(errMsgFileSizeExceeded.Args(sw.maxFileSize).String(),
-			"path", sw.rel,
-			"requested_size", requestedSize,
-			"limit", sw.maxFileSize)
-		return 0, sftp.ErrSshFxFailure
-	}
-	return sw.File.WriteAt(p, off)
-}
-
-func (sw *statWriter) Close() error {
-	fi, _ := sw.File.Stat()
-	newSize := fi.Size()
-	delta := newSize - sw.oldSize
-
-	sw.h.srv.logger.Debug("closing file write", "path", sw.rel, "newSize", newSize, "delta", delta)
-	sw.h.srv.db.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, sw.rel)
-	sw.h.srv.db.Exec("UPDATE users SET upload_bytes = upload_bytes + ? WHERE pubkey_hash = ?", delta, sw.h.pubHash)
-
-	return sw.File.Close()
-}
-
 type listerAt []os.FileInfo
 
 func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
@@ -1318,69 +935,22 @@ func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
 // Terminal Colors
 // ============================================================================
 
-type AsciiDecorator interface {
-	Fmt(string) string
-	Bold(string) string
-	Italic(string) string
-	Underline(string) string
-}
-
-type asciiColor string
 type asciiStyle string
 
-const asciiReset = "\033[0m"
-
 const (
-	off       asciiStyle = "0"
-	bold      asciiStyle = "1"
-	dim       asciiStyle = "2"
-	italic    asciiStyle = "3"
-	underline asciiStyle = "4"
+	asciiReset            = "\033[0m"
+	bold       asciiStyle = "1"
+	red        asciiStyle = "31"
+	yellow     asciiStyle = "33"
+	blue       asciiStyle = "34"
 )
 
-func (style asciiStyle) Fmt(str string) string {
-	return fmt.Sprintf("\033[%sm%s%s", style, str, asciiReset)
+func (s asciiStyle) Fmt(str string) string {
+	return fmt.Sprintf("\033[%sm%s%s", s, str, asciiReset)
 }
 
 func (s asciiStyle) Bold(str string) string {
-	// If we are already a style, we override to bold (1)
-	return fmt.Sprintf("\033[1m%s%s", str, asciiReset)
-}
-
-func (s asciiStyle) Italic(str string) string {
-	return fmt.Sprintf("\033[3m%s%s", str, asciiReset)
-}
-
-func (s asciiStyle) Underline(str string) string {
-	return fmt.Sprintf("\033[4m%s%s", str, asciiReset)
-}
-
-const (
-	red    asciiColor = "\033[%s;31m"
-	green  asciiColor = "\033[%s;32m"
-	yellow asciiColor = "\033[%s;33m"
-	blue   asciiColor = "\033[%s;34m"
-
-	magenta asciiColor = "\033[%s;35m"
-	cyan    asciiColor = "\033[%s;36m"
-	white   asciiColor = "\033[%s;37m"
-	gray    asciiColor = "\033[%s;90m"
-)
-
-func (c asciiColor) Fmt(s string) string {
-	return fmt.Sprintf(string(c), off) + s + asciiReset
-}
-
-func (c asciiColor) Bold(s string) string {
-	return fmt.Sprintf(string(c), bold) + s + asciiReset
-}
-
-func (c asciiColor) Italic(s string) string {
-	return fmt.Sprintf(string(c), italic) + s + asciiReset
-}
-
-func (c asciiColor) Underline(s string) string {
-	return fmt.Sprintf(string(c), italic) + s + asciiReset
+	return fmt.Sprintf("\033[1;%sm%s%s", s, str, asciiReset)
 }
 
 // ============================================================================
@@ -1388,106 +958,12 @@ func (c asciiColor) Underline(s string) string {
 // ============================================================================
 
 func isPathSafe(fullPath, baseDir string) bool {
-	// Get absolute paths
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
+	absP, err1 := filepath.Abs(fullPath)
+	absB, err2 := filepath.Abs(baseDir)
+	if err1 != nil || err2 != nil {
 		return false
 	}
-
-	absBase, err := filepath.Abs(baseDir)
-	if err != nil {
-		return false
-	}
-
-	// Check if path is within base directory
-	rel, err := filepath.Rel(absBase, absPath)
-	if err != nil {
-		return false
-	}
-
-	// Path should not start with ".." which would indicate escape
-	return !strings.HasPrefix(rel, "..") && !strings.Contains(rel, string(filepath.Separator)+"..")
-}
-
-func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
-	val := GetEnv(env, def)
-	*ptr = val
-	usageWithEnv := fmt.Sprintf("%-28s  %s", bold.Fmt(env), usage)
-
-	switch p := any(ptr).(type) {
-	case *string:
-		flag.StringVar(p, name, any(val).(string), usageWithEnv)
-	case *int:
-		flag.IntVar(p, name, any(val).(int), usageWithEnv)
-	case *bool:
-		flag.BoolVar(p, name, any(val).(bool), usageWithEnv)
-	case *float64:
-		flag.Float64Var(p, name, any(val).(float64), usageWithEnv)
-	default:
-		panic(fmt.Sprintf("unsupported flag type: %T", val))
-	}
-}
-
-func GetEnv[T any](k string, defaultValue T) T {
-	val, ok := os.LookupEnv(fmt.Sprintf("%s%s", envPrefix, k))
-	if !ok {
-		val, ok = os.LookupEnv(k)
-	}
-	if !ok {
-		return defaultValue
-	}
-
-	var res any
-	var err error
-
-	switch any(defaultValue).(type) {
-	case string:
-		return any(val).(T)
-	case int:
-		res, err = strconv.Atoi(val)
-	case float64:
-		res, err = strconv.ParseFloat(val, 64)
-	case bool:
-		res, err = strconv.ParseBool(val)
-	default:
-		return defaultValue
-	}
-
-	if err != nil {
-		return defaultValue
-	}
-	return res.(T)
-}
-
-func parseSize(s string) (int64, error) {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-
-	var multiplier int64 = 1
-	suffix := ""
-
-	if strings.HasSuffix(s, "gb") {
-		multiplier = 1024 * 1024 * 1024
-		suffix = "gb"
-	} else if strings.HasSuffix(s, "mb") {
-		multiplier = 1024 * 1024
-		suffix = "mb"
-	} else if strings.HasSuffix(s, "kb") {
-		multiplier = 1024
-		suffix = "kb"
-	} else if strings.HasSuffix(s, "b") {
-		multiplier = 1
-		suffix = "b"
-	}
-
-	valStr := strings.TrimSuffix(s, suffix)
-	val, err := strconv.ParseInt(valStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size format: %v", err)
-	}
-	return val * multiplier, nil
+	return strings.HasPrefix(absP, absB)
 }
 
 func hashToUid(hash string) uint32 {
@@ -1499,86 +975,89 @@ func hashToUid(hash string) uint32 {
 	return h.Sum32() & 0x7FFFFFFF
 }
 
-func setupLogger(cfg Config) *slog.Logger {
-	logWriter := io.MultiWriter(os.Stdout)
-	if f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile); err == nil {
-		logWriter = io.MultiWriter(os.Stdout, f)
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" || s == "0" {
+		return 0, nil
 	}
-
-	logLevel := slog.LevelInfo
-	if cfg.Verbose {
-		logLevel = slog.LevelDebug
+	mult := int64(1)
+	if strings.HasSuffix(s, "gb") {
+		mult = 1024 * 1024 * 1024
+		s = s[:len(s)-2]
+	} else if strings.HasSuffix(s, "mb") {
+		mult = 1024 * 1024
+		s = s[:len(s)-2]
 	}
-
-	handler := slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: logLevel})
-	logger := slog.New(handler)
-
-	if cfg.Verbose {
-		logger = logger.With("app", cfg.Name, "version", AppVersion)
-	}
-
-	logger.Info("server configuration",
-		slog.Group("config",
-			"port", cfg.Port,
-			"db_path", cfg.DBPath,
-			"upload_dir", cfg.UploadDir,
-			"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
-			"host_key", cfg.HostKeyFile,
-			"mkdir_rate", cfg.MkdirRate,
-			"log_file", cfg.LogFile,
-			"banner_file", cfg.BannerFile,
-			"banner_stats", cfg.BannerStats,
-			"max_file_size", cfg.MaxFileSize,
-			"verbose", cfg.Verbose,
-		),
-	)
-	return logger
+	v, err := strconv.ParseInt(s, 10, 64)
+	return v * mult, err
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
+	val, ok := os.LookupEnv(envPrefix + env)
+	if !ok {
+		val, ok = os.LookupEnv(env)
+	}
+
+	switch p := any(ptr).(type) {
+	case *string:
+		if ok {
+			*p = val
+		} else {
+			*p = any(def).(string)
+		}
+		flag.StringVar(p, name, *p, usage)
+	case *int:
+		if ok {
+			iv, _ := strconv.Atoi(val)
+			*p = iv
+		} else {
+			*p = any(def).(int)
+		}
+		flag.IntVar(p, name, *p, usage)
+	case *bool:
+		if ok {
+			bv, _ := strconv.ParseBool(val)
+			*p = bv
+		} else {
+			*p = any(def).(bool)
+		}
+		flag.BoolVar(p, name, *p, usage)
+	case *float64:
+		if ok {
+			fv, _ := strconv.ParseFloat(val, 64)
+			*p = fv
+		} else {
+			*p = any(def).(float64)
+		}
+		flag.Float64Var(p, name, *p, usage)
+	}
+}
+
+func shortID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
 
 func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
 	}
 
-	logger := setupLogger(cfg)
-
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	srv, err := NewServer(cfg, logger)
 	if err != nil {
-		logger.Error("server initialization failed", "err", err)
 		os.Exit(1)
 	}
 
-	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Start orphan reconciliation in background
 	go srv.reconcileOrphans()
+	go srv.Listen()
 
-	// Start server in goroutine
-	errChan := make(chan error, 1)
-	go func() {
-		if err := srv.Listen(); err != nil {
-			errChan <- err
-		}
-	}()
-
-	// Wait for shutdown signal or error
-	select {
-	case sig := <-sigChan:
-		logger.Info("received shutdown signal", "signal", sig)
-		if err := srv.Shutdown(); err != nil {
-			logger.Error("shutdown error", "err", err)
-			os.Exit(1)
-		}
-	case err := <-errChan:
-		logger.Error("server error", "err", err)
-		os.Exit(1)
-	}
+	<-sigChan
+	srv.Shutdown()
 }
