@@ -42,6 +42,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -64,10 +65,10 @@ var embeddedSource embed.FS
 
 // path to number of uploaded bytes needed for permission to download
 var restrictedFiles = map[string]int64{
-	readmeFile:       0,
-	fortunesFileName: contributorThreshold,
-	"RULES.txt":      0,
-	"LICENSE.txt":    0,
+	"README.txt":   0,
+	"fortunes.txt": contributorThresholdDefault,
+	"RULES.txt":    0,
+	"LICENSE.txt":  0,
 }
 
 // ============================================================================
@@ -79,10 +80,8 @@ const (
 	envPrefix  = "SFTP_"
 
 	// System identifiers
-	systemOwner      = "system"
-	readmeFile       = "README.txt"
-	fortunesFileName = "fortunes.txt"
-	sourceFile       = "sftpguy.go"
+	systemOwner = "system"
+	sourceFile  = "sftpguy.go"
 
 	// File permissions
 	permDir      = 0755
@@ -92,7 +91,7 @@ const (
 	permReadOnly = 0444
 
 	// User thresholds
-	contributorThreshold = 1024 * 1024 // 1MB uploaded = contributor
+	contributorThresholdDefault = 1024 * 1024 // 1MB uploaded = contributor
 
 	// System defaults
 	defaultUID = 1000
@@ -361,6 +360,7 @@ type Config struct {
 	LockDirectoriesToOwners bool
 	Verbose                 bool
 	MaxFileSize             int64
+	ContributorThreshold    int64
 }
 
 func LoadConfig() (Config, error) {
@@ -380,6 +380,9 @@ func LoadConfig() (Config, error) {
 
 	var maxSizeRaw string
 	EnvFlag(&maxSizeRaw, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
+
+	var contributorThresholdRaw string
+	EnvFlag(&contributorThresholdRaw, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock contributor status")
 
 	src := flag.Bool("src", false, "Show source code")
 	v := flag.Bool("version", false, "Show version")
@@ -406,6 +409,12 @@ func LoadConfig() (Config, error) {
 		return cfg, fmt.Errorf("invalid maxsize: %w", err)
 	}
 	cfg.MaxFileSize = maxSize
+
+	contrib, err := parseSize(contributorThresholdRaw)
+	if err != nil {
+		return cfg, fmt.Errorf("invalid contributor threshold: %w", err)
+	}
+	cfg.ContributorThreshold = contrib
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("configuration validation failed: %w", err)
@@ -546,7 +555,7 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 	}
 
 	if s.cfg.BannerStats {
-		u, c, f, b := s.store.GetBannerStats(contributorThreshold)
+		u, c, f, b := s.store.GetBannerStats(s.cfg.ContributorThreshold)
 		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %d bytes\r\n", u, c, f, b)
 	}
 	return banner
@@ -607,15 +616,52 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 	}
 }
 
+func (s *Server) getRandomFortune() string {
+	data, _ := embeddedSource.ReadFile("fortunes.txt")
+	fortunes := strings.Split(string(data), "\n%\n")
+	if len(fortunes) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fortunes[rand.Intn(len(fortunes))])
+}
+
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
-	isContributor := stats.UploadBytes >= contributorThreshold
-
-	fmt.Fprintf(w, "\r\nWelcome, %s\r\n", userLabel)
-	if isContributor {
-		fmt.Fprint(w, yellow.Bold("★ Contributor status unlocked!\r\n"))
+	isContributor := stats.UploadBytes >= s.cfg.ContributorThreshold
+	color := bold
+	if stats.FirstTimer {
+		color = blue
+	} else if isContributor {
+		color = yellow
 	}
-	fmt.Fprintf(w, "ID: %s | Shared: %d files, %d bytes\r\n", userLabel, stats.UploadCount, stats.UploadBytes)
+	fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Fmt(userLabel))
+
+	if stats.FirstTimer {
+		fmt.Fprintln(w, "This is a share-first archive.  You must upload a file to unlock downloads.")
+		fmt.Fprintln(w, "You may always download:\r\n. %s", bold.Fmt(s.sourceFileName()))
+
+		for pathName, threshold := range restrictedFiles {
+			if threshold <= 0 {
+				fmt.Fprintln(w, "  "+bold.Fmt(pathName))
+			}
+		}
+
+	}
+
+	if isContributor {
+		fmt.Fprintln(w, yellow.Bold("★ Contributor status unlocked!"))
+		fmt.Fprintln(w, yellow.Italic(s.getRandomFortune()))
+	} else if stats.UploadCount > 0 {
+		fmt.Fprint(w, green.Fmt("Downloading is unlocked.\r\n"))
+	} else {
+		fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
+	}
+	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes",
+		userLabel, stats.LastLogin, stats.UploadCount, stats.UploadBytes)
+	if stats.DownloadCount > 0 {
+		fmt.Fprintf(w, " |  Downloaded: %d files, %d bytes", stats.DownloadCount, stats.DownloadBytes)
+	}
+	fmt.Fprintf(w, "\r\n")
 }
 
 func (s *Server) ensureHostKey() error {
@@ -689,6 +735,7 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	h.logger.Debug("fileread", "path", r.Filepath)
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
@@ -696,8 +743,9 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 	threshold, isRestricted := restrictedFiles[rel]
 	if rel == h.srv.sourceFileName() {
-		threshold = 0
-		isRestricted = true
+		if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
+			return bytes.NewReader(data), nil
+		}
 	}
 
 	stats, _ := h.srv.store.GetUserStats(h.pubHash)
@@ -797,18 +845,36 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, sftp.ErrSshFxPermissionDenied
 	}
 
+	// Handle Directory Listing
 	if r.Method == "List" {
 		entries, _ := os.ReadDir(full)
 		var files []os.FileInfo
+		seen := make(map[string]bool)
+
 		for _, e := range entries {
 			fi, _ := e.Info()
-			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, e.Name()))
+			name := e.Name()
+			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, name))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
+			seen[name] = true
 		}
+
 		if rel == "." {
-			files = append(files, &virtualFileInfo{name: h.srv.sourceFileName(), size: 0})
+			srcName := h.srv.sourceFileName()
+			if !seen[srcName] {
+				data, _ := h.srv.readFileWithFallback(srcName, sourceFile)
+				files = append(files, &virtualFileInfo{name: srcName, size: int64(len(data))})
+				seen[srcName] = true
+			}
+
 			for f := range restrictedFiles {
-				files = append(files, &virtualFileInfo{name: f, size: 0})
+				if seen[f] {
+					continue
+				}
+				if data, err := h.srv.readFileWithFallback(f, f); err == nil {
+					files = append(files, &virtualFileInfo{name: f, size: int64(len(data))})
+					seen[f] = true
+				}
 			}
 		}
 		return listerAt(files), nil
@@ -816,8 +882,19 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 	fi, err := os.Lstat(full)
 	if err != nil {
+		// Check if it's one of our virtual files before giving up
+		if rel == h.srv.sourceFileName() {
+			data, _ := h.srv.readFileWithFallback(rel, sourceFile)
+			return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
+		}
+		if _, isRestricted := restrictedFiles[rel]; isRestricted {
+			if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
+				return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
+			}
+		}
 		return nil, os.ErrNotExist
 	}
+
 	owner, _ := h.srv.store.GetFileOwner(rel)
 	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
 }
@@ -941,6 +1018,7 @@ const (
 	asciiReset            = "\033[0m"
 	bold       asciiStyle = "1"
 	red        asciiStyle = "31"
+	green      asciiStyle = "32"
 	yellow     asciiStyle = "33"
 	blue       asciiStyle = "34"
 )
@@ -951,6 +1029,10 @@ func (s asciiStyle) Fmt(str string) string {
 
 func (s asciiStyle) Bold(str string) string {
 	return fmt.Sprintf("\033[1;%sm%s%s", s, str, asciiReset)
+}
+
+func (s asciiStyle) Italic(str string) string {
+	return fmt.Sprintf("\033[3;%sm%s%s", s, str, asciiReset)
 }
 
 // ============================================================================
@@ -1040,13 +1122,50 @@ func shortID(id string) string {
 	return id[:12]
 }
 
+func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
+	lvl := slog.LevelInfo
+	if cfg.Verbose {
+		lvl = slog.LevelDebug
+	}
+
+	// Open log file for appending, create if it doesn't exist
+	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	mw := io.MultiWriter(os.Stdout, f)
+
+	logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{
+		Level: lvl,
+	}))
+
+	logger.Info("configuration",
+		"version", AppVersion,
+		"port", cfg.Port,
+		"upload_dir", cfg.UploadDir,
+		"db_path", cfg.DBPath,
+		"max_file_size", cfg.MaxFileSize,
+		"mkdir_rate", cfg.MkdirRate,
+		"verbose_logging", cfg.Verbose,
+	)
+
+	return logger, f, nil
+}
+
 func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger, logFile, err := setupLogger(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Logger setup error: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
 	srv, err := NewServer(cfg, logger)
 	if err != nil {
 		os.Exit(1)
@@ -1059,5 +1178,6 @@ func main() {
 	go srv.Listen()
 
 	<-sigChan
+	logger.Info("Shutting down...")
 	srv.Shutdown()
 }
