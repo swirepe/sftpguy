@@ -492,8 +492,13 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 
 	if s.cfg.BannerStats {
 		var u, c, f, b uint64
-		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_count > 0", contributorThreshold).Scan(&u)
-		s.db.QueryRow("SELECT count(*) FROM users WHERE upload_bytes > ?", contributorThreshold).Scan(&c)
+
+		s.db.QueryRow(`
+			SELECT 
+				COUNT(*) FILTER (WHERE upload_count > 0),
+				COUNT(*) FILTER (WHERE upload_bytes > ?)
+			FROM users
+		`, contributorThreshold).Scan(&u, &c)
 		s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
 		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %d bytes\r\n", u, c, f, b)
 	}
