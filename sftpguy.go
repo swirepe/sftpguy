@@ -77,7 +77,6 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/text/width"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
 )
@@ -142,44 +141,56 @@ const (
 	);`
 )
 
-var errorHeaders []string = []string{red.Fmt(padRightVisual("DENIED:", 12)), red.Fmt(padRightVisual("访问被拒绝:", 12))}
+var errorPrefix = struct {
+	EN string
+	ZH string
+}{
+	EN: red.Fmt("DENIED:     "),
+	ZH: red.Fmt("访问被拒绝:  "),
+}
 
-const (
-	errMsgSymlinksProhibited     TranslatableError = "Symlinks are prohibited. | 禁止使用符号链接。"
-	errMsgAccessLocked           TranslatableError = "Archive access locked. You must share a file first. | 归档访问已锁定。您必须先分享一个文件。"
-	errMsgContributorsLocked     TranslatableError = "%s is only available to contributors who have uploaded at least %d bytes. | %s 仅对上传量至少为 %d 字节的贡献者开放。"
-	errMsgFileProtected          TranslatableError = "%s is a protected system file. | %s 是受保护的系统文件。"
-	errMsgCannotWriteToDir       TranslatableError = "Cannot write to another user's directory. | 无法写入其他用户的目录。"
-	errMsgFilenameClaimed        TranslatableError = "This filename is already claimed. | 此文件名已被占用。"
-	errMsgNoPermissionDelete     TranslatableError = "You do not have permission to delete this. | 您没有删除此项的权限。"
-	errMsgNotOwner               TranslatableError = "You do not own the source file or directory. | 您不是源文件或目录的所有者。"
-	errMsgCannotMoveToDir        TranslatableError = "Cannot move files into a directory owned by another user. | 无法将文件移动到属于其他用户的目录。"
-	errMsgDestinationClaimed     TranslatableError = "The destination filename is already claimed by someone else. | 目标文件名已被其他人占用。"
-	errMsgRenameFailed           TranslatableError = "rename failed | 重命名失败"
-	errMsgSymlinksNotPermitted   TranslatableError = "Symbolic links are not permitted on this server. | 此服务器上不允许使用符号链接。"
-	errMsgAccessToSymlinksForbid TranslatableError = "Access to symlinks is forbidden. | 禁止访问符号链接。"
-	errMsgMkdirRateLimit         TranslatableError = "Mkdir rate limit reached. | 已达到创建目录的频率限制。"
-	errMsgFileSizeExceeded       TranslatableError = "File size limit exceeded. Maximum allowed: %d bytes | 超过文件大小限制。最大允许：%d 字节"
-	errMsgPathTraversal          TranslatableError = "Path traversal detected. | 检测到路径遍历。"
+var (
+	errMsgSymlinksProhibited     = TranslatableError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
+	errMsgAccessLocked           = TranslatableError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
+	errMsgContributorsLocked     = TranslatableError{EN: "%s is only available to contributors who have uploaded at least %d bytes.", ZH: "%s 仅对上传量至少为 %d 字节的贡献者开放。"}
+	errMsgFileProtected          = TranslatableError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
+	errMsgCannotWriteToDir       = TranslatableError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
+	errMsgFilenameClaimed        = TranslatableError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
+	errMsgNoPermissionDelete     = TranslatableError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
+	errMsgNotOwner               = TranslatableError{EN: "You do not own the source file or directory.", ZH: "您不是源文件或目录的所有者。"}
+	errMsgCannotMoveToDir        = TranslatableError{EN: "Cannot move files into a directory owned by another user.", ZH: "无法将文件移动到属于其他用户的目录。"}
+	errMsgDestinationClaimed     = TranslatableError{EN: "The destination filename is already claimed by someone else.", ZH: "目标文件名已被其他人占用。"}
+	errMsgRenameFailed           = TranslatableError{EN: "rename failed", ZH: "重命名失败"}
+	errMsgSymlinksNotPermitted   = TranslatableError{EN: "Symbolic links are not permitted on this server.", ZH: "此服务器上不允许使用符号链接。"}
+	errMsgAccessToSymlinksForbid = TranslatableError{EN: "Access to symlinks is forbidden.", ZH: "禁止访问符号链接。"}
+	errMsgMkdirRateLimit         = TranslatableError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
+	errMsgFileSizeExceeded       = TranslatableError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
+	errMsgPathTraversal          = TranslatableError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
 )
 
-type TranslatableError string
+type TranslatableError struct {
+	EN   string
+	ZH   string
+	args []any
+}
 
-func (msg TranslatableError) Fmt(args ...any) string {
-	msgSplit := strings.Split(string(msg), "|")
-	formattedParts := make([]string, len(msgSplit))
+func (e TranslatableError) Args(args ...any) TranslatableError {
+	e.args = args
+	return e
+}
 
-	for i, part := range msgSplit {
-		trimmed := strings.TrimSpace(part)
+func (e TranslatableError) String() string {
+	en := e.EN
+	zh := e.ZH
 
-		if len(args) > 0 {
-			formattedParts[i] = errorHeaders[i] + fmt.Sprintf(trimmed, args...)
-		} else {
-			formattedParts[i] = errorHeaders[i] + trimmed
-		}
+	if len(e.args) > 0 {
+		en = fmt.Sprintf(e.EN, e.args...)
+		zh = fmt.Sprintf(e.ZH, e.args...)
 	}
 
-	return strings.Join(formattedParts, "\n")
+	return fmt.Sprintf("%s%s\n%s%s",
+		errorPrefix.EN, en,
+		errorPrefix.ZH, zh)
 }
 
 // ============================================================================
@@ -838,7 +849,7 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 
 	// Validate path doesn't escape upload directory
 	if !isPathSafe(full, h.srv.absUploadDir) {
-		return "", "", fmt.Errorf(errMsgPathTraversal.Fmt())
+		return "", "", fmt.Errorf(errMsgPathTraversal.String())
 	}
 
 	return rel, full, nil
@@ -850,7 +861,7 @@ func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
 	}
 
 	if !h.srv.mkdirLimiter.Allow() {
-		return h.deny(errMsgMkdirRateLimit.Fmt())
+		return h.deny(errMsgMkdirRateLimit.String())
 	}
 
 	_, full, err := h.resolve(relPath)
@@ -919,7 +930,7 @@ func (h *fsHandler) canWriteToDirectory(dirPath string) error {
 
 	dirOwner, _ := h.srv.GetOwner(dirPath)
 	if dirOwner != "" && dirOwner != h.pubHash {
-		return h.deny(errMsgCannotWriteToDir.Fmt(), "parent", dirPath, "owner", dirOwner)
+		return h.deny(errMsgCannotWriteToDir.String(), "parent", dirPath, "owner", dirOwner)
 	}
 	return nil
 }
@@ -927,44 +938,15 @@ func (h *fsHandler) canWriteToDirectory(dirPath string) error {
 func (h *fsHandler) canClaimFile(rel string) error {
 	owner, err := h.srv.GetOwner(rel)
 	if err == nil && owner != "" && owner != h.pubHash {
-		return h.deny(errMsgDestinationClaimed.Fmt(), "target", rel, "owner", owner)
+		return h.deny(errMsgDestinationClaimed.String(), "target", rel, "owner", owner)
 	}
 	return nil
 }
-
-var (
-	enPadded = red.Fmt(padRightVisual("DENIED:", 12))
-	zhPadded = red.Fmt(padRightVisual("访问被拒绝:", 12))
-)
 
 func (h *fsHandler) deny(msg string, args ...any) error {
 	h.logger.Info(msg, args...)
 	fmt.Fprintf(h.stderr, msg)
 	return sftp.ErrSshFxPermissionDenied
-}
-
-func visualWidth(s string) int {
-	w := 0
-	for _, r := range s {
-		kind := width.LookupRune(r).Kind()
-		switch kind {
-		case width.EastAsianWide, width.EastAsianFullwidth:
-			w += 2
-		case width.EastAsianHalfwidth, width.EastAsianNarrow, width.Neutral:
-			w += 1
-		default:
-			w += 1 // Fallback
-		}
-	}
-	return w
-}
-
-func padRightVisual(s string, width int) string {
-	padding := width - visualWidth(s)
-	if padding < 0 {
-		return s
-	}
-	return s + strings.Repeat(" ", padding)
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -985,7 +967,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if isRestricted {
 		stats := h.srv.GetUser(h.pubHash)
 		if stats.UploadBytes < threshold {
-			return nil, h.deny(errMsgContributorsLocked.Fmt(rel, threshold))
+			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold).String())
 		}
 
 		// Priority 1: Read physical file from upload directory if it exists
@@ -1002,11 +984,11 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny(errMsgSymlinksProhibited.Fmt(), "path", rel)
+		return nil, h.deny(errMsgSymlinksProhibited.String(), "path", rel)
 	}
 
 	if !h.hasUploaded(h.pubHash) {
-		return nil, h.deny(errMsgAccessLocked.Fmt())
+		return nil, h.deny(errMsgAccessLocked.String())
 	}
 
 	fi, err := os.Stat(full)
@@ -1062,12 +1044,12 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
 	if h.isProtectedFile(rel) {
 		color := h.getFileColor(rel)
-		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "rel", rel)
+		return h.deny(errMsgFileProtected.Args(color.Bold(rel)).String(), "rel", rel)
 	}
 
 	// Forbid overwriting or interacting with symlinks
 	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return h.deny(errMsgSymlinksProhibited.Fmt())
+		return h.deny(errMsgSymlinksProhibited.String())
 	}
 
 	// Check folder ownership
@@ -1096,7 +1078,7 @@ func (h *fsHandler) ClaimFile(pubhash, rel string) error {
 				return err
 			}
 		} else if currentOwner != h.pubHash {
-			return h.deny(errMsgFilenameClaimed.Fmt(), "path", rel, "owner", currentOwner)
+			return h.deny(errMsgFilenameClaimed.String(), "path", rel, "owner", currentOwner)
 		}
 		return nil
 	})
@@ -1153,7 +1135,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	fi, err := os.Lstat(full)
 	if err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
-			return nil, h.deny(errMsgAccessToSymlinksForbid.Fmt())
+			return nil, h.deny(errMsgAccessToSymlinksForbid.String())
 		}
 		owner, _ := h.srv.GetOwner(rel)
 		return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
@@ -1178,7 +1160,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	switch r.Method {
 	case "Symlink", "Link":
-		return h.deny(errMsgSymlinksNotPermitted.Fmt(), "path", rel)
+		return h.deny(errMsgSymlinksNotPermitted.String(), "path", rel)
 
 	case "Mkdir":
 		return h.ensureDirs(h.pubHash, rel)
@@ -1195,13 +1177,13 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 func (h *fsHandler) handleRemove(rel, full string) error {
 	if h.isProtectedFile(rel) {
-		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel)
+		return h.deny(errMsgNoPermissionDelete.String(), "path", rel)
 	}
 
 	canDelete, owner, parentOwner := h.canModifyPath(rel)
 
 	if !canDelete && owner != "" {
-		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel, "owner", owner, "parentOwner", parentOwner)
+		return h.deny(errMsgNoPermissionDelete.String(), "path", rel, "owner", owner, "parentOwner", parentOwner)
 	}
 
 	os.RemoveAll(full)
@@ -1218,19 +1200,19 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 	// Prevent renaming TO a protected file
 	if h.isProtectedFile(relTgt) {
 		color := h.getFileColor(relTgt)
-		return h.deny(errMsgFileProtected.Fmt(color.Bold(relTgt)), "target", relTgt)
+		return h.deny(errMsgFileProtected.Args(color.Bold(relTgt)).String(), "target", relTgt)
 	}
 
 	// Prevent renaming FROM a protected file
 	if h.isProtectedFile(rel) {
 		color := h.getFileColor(rel)
-		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "src", rel)
+		return h.deny(errMsgFileProtected.Args(color.Bold(rel)).String(), "src", rel)
 	}
 
 	// Check source permissions
 	canModifySource, _, _ := h.canModifyPath(rel)
 	if !canModifySource {
-		return h.deny(errMsgNotOwner.Fmt(), "src", rel)
+		return h.deny(errMsgNotOwner.String(), "src", rel)
 	}
 
 	// Check target directory permissions
@@ -1246,7 +1228,7 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 
 	// Perform filesystem rename
 	if err := os.Rename(full, fullTgt); err != nil {
-		return h.deny(errMsgRenameFailed.Fmt(), "err", err)
+		return h.deny(errMsgRenameFailed.String(), "err", err)
 	}
 
 	// Update database
@@ -1298,7 +1280,7 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	requestedSize := off + int64(len(p))
 	if sw.maxFileSize > 0 && requestedSize > sw.maxFileSize {
-		sw.h.deny(errMsgFileSizeExceeded.Fmt(sw.maxFileSize),
+		sw.h.deny(errMsgFileSizeExceeded.Args(sw.maxFileSize).String(),
 			"path", sw.rel,
 			"requested_size", requestedSize,
 			"limit", sw.maxFileSize)
