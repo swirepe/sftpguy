@@ -867,6 +867,12 @@ func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
 	return tx.Commit()
 }
 
+func (h *fsHandler) getPathOwnership(rel string) (owner, parentOwner string) {
+	owner, _ = h.srv.GetOwner(rel)
+	parentOwner, _ = h.srv.GetOwner(path.Dir(rel))
+	return
+}
+
 func (h *fsHandler) hasUploaded(pubHash string) bool {
 	var count int
 	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", pubHash).Scan(&count)
@@ -1159,8 +1165,7 @@ func (h *fsHandler) handleRemove(rel, full string) error {
 		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel)
 	}
 
-	owner, _ := h.srv.GetOwner(rel)
-	parentOwner, _ := h.srv.GetOwner(path.Dir(rel))
+	owner, parentOwner := h.getPathOwnership(rel)
 	canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
 
 	if !canDelete && owner != "" {
@@ -1199,23 +1204,22 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 	}
 
 	// Check source permissions
-	sourceOwner, _ := h.srv.GetOwner(rel)
-	sourceParentOwner, _ := h.srv.GetOwner(path.Dir(rel))
+	sourceOwner, sourceParentOwner := h.getPathOwnership(rel)
 	if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
 		return h.deny(errMsgNotOwner.Fmt(), "src", rel)
 	}
 
 	// Check target directory permissions
+	targetOwner, targetParentOwner := h.getPathOwnership(relTgt)
 	targetDir := path.Dir(relTgt)
 	if h.srv.cfg.LockDirectoriesToOwners && targetDir != "." {
-		targetParentOwner, _ := h.srv.GetOwner(targetDir)
+
 		if targetParentOwner != "" && targetParentOwner != h.pubHash {
 			return h.deny(errMsgCannotMoveToDir.Fmt(), "targetDir", targetDir)
 		}
 	}
 
 	// Check if target is already claimed
-	targetOwner, err := h.srv.GetOwner(relTgt)
 	if err == nil {
 		if targetOwner != "" && targetOwner != h.pubHash {
 			return h.deny(errMsgDestinationClaimed.Fmt(), "target", relTgt, "owner", targetOwner)
