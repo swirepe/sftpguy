@@ -469,16 +469,18 @@ func (s *Server) addHostKey(config *ssh.ServerConfig) error {
 	return nil
 }
 
-func (s *Server) ReadRealOrVirtualFile(relPath string) (data []byte, err error) {
+func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
 	physicalPath := filepath.Join(s.absUploadDir, relPath)
 	if fi, statErr := os.Stat(physicalPath); statErr == nil && !fi.IsDir() {
-		data, err = os.ReadFile(physicalPath)
+		if data, err := os.ReadFile(physicalPath); err == nil {
+			return data, nil
+		}
 	}
+	return embeddedSource.ReadFile(embeddedPath)
+}
 
-	if err != nil || len(data) == 0 {
-		data, err = embeddedSource.ReadFile(s.cfg.BannerFile)
-	}
-	return data, err
+func (s *Server) ReadRealOrVirtualFile(relPath string) (data []byte, err error) {
+	return s.readFileWithFallback(relPath, s.cfg.BannerFile)
 }
 
 func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
@@ -729,16 +731,9 @@ func (s *Server) reconcileOrphans() {
 }
 
 func (s *Server) getRandomFortune() string {
-	var data []byte
-	var err error
-
-	physicalPath := filepath.Join(s.absUploadDir, fortunesFileName)
-	if fi, statErr := os.Stat(physicalPath); statErr == nil && !fi.IsDir() {
-		data, err = os.ReadFile(physicalPath)
-	}
-
-	if err != nil || len(data) == 0 {
-		data, _ = embeddedSource.ReadFile(fortunesFileName)
+	data, err := s.readFileWithFallback(fortunesFileName, fortunesFileName)
+	if err != nil {
+		return ""
 	}
 
 	fortunes := strings.Split(string(data), "\n%\n")
@@ -746,6 +741,19 @@ func (s *Server) getRandomFortune() string {
 		return ""
 	}
 	return strings.TrimSpace(fortunes[rand.Intn(len(fortunes))])
+}
+
+func (s *Server) withTx(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ============================================================================
@@ -852,19 +860,16 @@ func (h *fsHandler) ensureDirs(pubHash, relPath string) error {
 
 	parts := strings.Split(relPath, "/")
 	curr := ""
-	tx, err := h.srv.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
-	for _, p := range parts {
-		curr = path.Join(curr, p)
-		if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, pubHash); err != nil {
-			return err
+	return h.srv.withTx(func(tx *sql.Tx) error {
+		for _, p := range parts {
+			curr = path.Join(curr, p)
+			if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, pubHash); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func (h *fsHandler) getPathOwnership(rel string) (owner, parentOwner string) {
@@ -874,15 +879,52 @@ func (h *fsHandler) getPathOwnership(rel string) (owner, parentOwner string) {
 }
 
 func (h *fsHandler) hasUploaded(pubHash string) bool {
-	var count int
-	h.srv.db.QueryRow("SELECT upload_count FROM users WHERE pubkey_hash = ?", pubHash).Scan(&count)
-	return count > 0
+	stats := h.srv.GetUser(pubHash)
+	return stats.UploadCount > 0
 }
 
 func (h *fsHandler) isContributor(pubHash string) bool {
-	var uploadBytes int64
-	h.srv.db.QueryRow("SELECT upload_bytes FROM users WHERE pubkey_hash = ?", pubHash).Scan(&uploadBytes)
-	return uploadBytes >= contributorThreshold
+	stats := h.srv.GetUser(pubHash)
+	return stats.UploadBytes >= contributorThreshold
+}
+
+func (h *fsHandler) isProtectedFile(rel string) bool {
+	sourceName := h.srv.sourceFileName()
+	_, isRestricted := restrictedFiles[rel]
+	return isRestricted || rel == sourceName
+}
+
+func (h *fsHandler) getFileColor(filename string) AsciiDecorator {
+	if filename == fortunesFileName {
+		return yellow
+	}
+	return bold
+}
+
+func (h *fsHandler) canModifyPath(rel string) (canModify bool, owner, parentOwner string) {
+	owner, parentOwner = h.getPathOwnership(rel)
+	canModify = owner == h.pubHash || parentOwner == h.pubHash
+	return
+}
+
+func (h *fsHandler) canWriteToDirectory(dirPath string) error {
+	if !h.srv.cfg.LockDirectoriesToOwners || dirPath == "." {
+		return nil
+	}
+
+	dirOwner, _ := h.srv.GetOwner(dirPath)
+	if dirOwner != "" && dirOwner != h.pubHash {
+		return h.deny(errMsgCannotWriteToDir.Fmt(), "parent", dirPath, "owner", dirOwner)
+	}
+	return nil
+}
+
+func (h *fsHandler) canClaimFile(rel string) error {
+	owner, err := h.srv.GetOwner(rel)
+	if err == nil && owner != "" && owner != h.pubHash {
+		return h.deny(errMsgDestinationClaimed.Fmt(), "target", rel, "owner", owner)
+	}
+	return nil
 }
 
 var (
@@ -1013,13 +1055,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 // CanWrite checks if a user can write to a given path
 func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
-	sourceName := h.srv.sourceFileName()
-
-	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
-		var color AsciiDecorator = bold
-		if rel == fortunesFileName {
-			color = yellow
-		}
+	if h.isProtectedFile(rel) {
+		color := h.getFileColor(rel)
 		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "rel", rel)
 	}
 
@@ -1030,11 +1067,8 @@ func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
 
 	// Check folder ownership
 	parentRel := path.Dir(rel)
-	if h.srv.cfg.LockDirectoriesToOwners && parentRel != "." {
-		parentOwner, _ := h.srv.GetOwner(parentRel)
-		if parentOwner != "" && parentOwner != pubHash {
-			return h.deny(errMsgCannotWriteToDir.Fmt(), "parent", parentRel, "owner", parentOwner)
-		}
+	if err := h.canWriteToDirectory(parentRel); err != nil {
+		return err
 	}
 
 	if err := h.ensureDirs(pubHash, parentRel); err != nil {
@@ -1046,26 +1080,21 @@ func (h *fsHandler) CanWrite(pubHash, rel, full string) error {
 
 // ClaimFile attempts to claim ownership of a file
 func (h *fsHandler) ClaimFile(pubhash, rel string) error {
-	tx, err := h.srv.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	currentOwner, err := h.srv.GetOwnerTX(tx, rel)
-	if err == sql.ErrNoRows {
-		h.logger.Debug("claiming new file ownership", "path", rel)
-		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
-			return err
+	return h.srv.withTx(func(tx *sql.Tx) error {
+		currentOwner, err := h.srv.GetOwnerTX(tx, rel)
+		if err == sql.ErrNoRows {
+			h.logger.Debug("claiming new file ownership", "path", rel)
+			if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", rel, h.pubHash); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
+				return err
+			}
+		} else if currentOwner != h.pubHash {
+			return h.deny(errMsgFilenameClaimed.Fmt(), "path", rel, "owner", currentOwner)
 		}
-		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", h.pubHash); err != nil {
-			return err
-		}
-	} else if currentOwner != h.pubHash {
-		return h.deny(errMsgFilenameClaimed.Fmt(), "path", rel, "owner", currentOwner)
-	}
-
-	return tx.Commit()
+		return nil
+	})
 }
 
 // Filelist implements directory listing
@@ -1160,13 +1189,11 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 }
 
 func (h *fsHandler) handleRemove(rel, full string) error {
-	sourceName := h.srv.sourceFileName()
-	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
+	if h.isProtectedFile(rel) {
 		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel)
 	}
 
-	owner, parentOwner := h.getPathOwnership(rel)
-	canDelete := (owner == h.pubHash) || (parentOwner == h.pubHash)
+	canDelete, owner, parentOwner := h.canModifyPath(rel)
 
 	if !canDelete && owner != "" {
 		return h.deny(errMsgNoPermissionDelete.Fmt(), "path", rel, "owner", owner, "parentOwner", parentOwner)
@@ -1183,47 +1210,33 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 		return h.deny(err.Error(), "target", r.Target)
 	}
 
-	sourceName := h.srv.sourceFileName()
-
 	// Prevent renaming TO a protected file
-	if _, ok := restrictedFiles[relTgt]; ok || relTgt == sourceName {
-		var color AsciiDecorator = bold
-		if relTgt == fortunesFileName {
-			color = yellow
-		}
+	if h.isProtectedFile(relTgt) {
+		color := h.getFileColor(relTgt)
 		return h.deny(errMsgFileProtected.Fmt(color.Bold(relTgt)), "target", relTgt)
 	}
 
 	// Prevent renaming FROM a protected file
-	if _, ok := restrictedFiles[rel]; ok || rel == sourceName {
-		var color AsciiDecorator = bold
-		if rel == fortunesFileName {
-			color = yellow
-		}
+	if h.isProtectedFile(rel) {
+		color := h.getFileColor(rel)
 		return h.deny(errMsgFileProtected.Fmt(color.Bold(rel)), "src", rel)
 	}
 
 	// Check source permissions
-	sourceOwner, sourceParentOwner := h.getPathOwnership(rel)
-	if sourceOwner != h.pubHash && sourceParentOwner != h.pubHash {
+	canModifySource, _, _ := h.canModifyPath(rel)
+	if !canModifySource {
 		return h.deny(errMsgNotOwner.Fmt(), "src", rel)
 	}
 
 	// Check target directory permissions
-	targetOwner, targetParentOwner := h.getPathOwnership(relTgt)
 	targetDir := path.Dir(relTgt)
-	if h.srv.cfg.LockDirectoriesToOwners && targetDir != "." {
-
-		if targetParentOwner != "" && targetParentOwner != h.pubHash {
-			return h.deny(errMsgCannotMoveToDir.Fmt(), "targetDir", targetDir)
-		}
+	if err := h.canWriteToDirectory(targetDir); err != nil {
+		return err
 	}
 
 	// Check if target is already claimed
-	if err == nil {
-		if targetOwner != "" && targetOwner != h.pubHash {
-			return h.deny(errMsgDestinationClaimed.Fmt(), "target", relTgt, "owner", targetOwner)
-		}
+	if err := h.canClaimFile(relTgt); err != nil {
+		return err
 	}
 
 	// Perform filesystem rename
@@ -1232,20 +1245,15 @@ func (h *fsHandler) handleRename(r *sftp.Request, rel, full string) error {
 	}
 
 	// Update database
-	tx, err := h.srv.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
-		relTgt, rel, rel, rel+"/%")
-	if err != nil {
-		h.logger.Error("db update failed after rename", "err", err)
-		return err
-	}
-
-	return tx.Commit()
+	return h.srv.withTx(func(tx *sql.Tx) error {
+		_, err = tx.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
+			relTgt, rel, rel, rel+"/%")
+		if err != nil {
+			h.logger.Error("db update failed after rename", "err", err)
+			return err
+		}
+		return nil
+	})
 }
 
 // ============================================================================
