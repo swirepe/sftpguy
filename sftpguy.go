@@ -142,7 +142,7 @@ const (
 	);`
 )
 
-var errorHeaders []string = []string{red.Fmt(padRightVisual("DENIED:", 12)), red.Fmt(padRightVisual("DENIED:", 12))}
+var errorHeaders []string = []string{red.Fmt(padRightVisual("DENIED:", 12)), red.Fmt(padRightVisual("访问被拒绝:", 12))}
 
 const (
 	errMsgSymlinksProhibited     TranslatableError = "Symlinks are prohibited. | 禁止使用符号链接。"
@@ -160,7 +160,7 @@ const (
 	errMsgAccessToSymlinksForbid TranslatableError = "Access to symlinks is forbidden. | 禁止访问符号链接。"
 	errMsgMkdirRateLimit         TranslatableError = "Mkdir rate limit reached. | 已达到创建目录的频率限制。"
 	errMsgFileSizeExceeded       TranslatableError = "File size limit exceeded. Maximum allowed: %d bytes | 超过文件大小限制。最大允许：%d 字节"
-	errMsgPathTraversal          TranslatableError = "Path traversal detected - access denied. | 检测到路径遍历 - 访问被拒绝。"
+	errMsgPathTraversal          TranslatableError = "Path traversal detected. | 检测到路径遍历。"
 )
 
 type TranslatableError string
@@ -885,11 +885,8 @@ var (
 )
 
 func (h *fsHandler) deny(msg string, args ...any) error {
-
 	h.logger.Info(msg, args...)
-	msgSplit := strings.SplitN(msg, "|", 2)
-	fmt.Fprintf(h.stderr, "\r\n%-8s %s", red.Fmt(enPadded), strings.TrimSpace(msgSplit[0]))
-	fmt.Fprintf(h.stderr, "\r\n%-8s %s\r\n", red.Fmt(zhPadded), strings.TrimSpace(msgSplit[1]))
+	fmt.Fprintf(h.stderr, msg)
 	return sftp.ErrSshFxPermissionDenied
 }
 
