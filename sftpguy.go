@@ -818,24 +818,63 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 	if meta.isUnrestricted {
 		return h.deny(errMsgFileProtected.Args(meta.rel))
 	}
-	if meta.owner != "" && meta.owner != systemOwner && meta.owner != h.pubHash {
-		return h.deny(errMsgNoPermissionDel.Args(meta.rel, hashToUid(meta.owner), hashToUid(h.pubHash)))
+
+	// If the file/dir doesn't exist yet, there are no ownership
+	// restrictions on the target itself (directory rules still apply later).
+	if !meta.exists {
+		return nil
 	}
+
+	// Orphaned files on disk (exists=true, owner="") are treated as system files.
+	effectiveOwner := meta.owner
+	if effectiveOwner == "" {
+		effectiveOwner = systemOwner
+	}
+
+	if effectiveOwner != h.pubHash {
+		if effectiveOwner == systemOwner {
+			return h.deny(errMsgFileProtected.Args(meta.rel))
+		}
+		return h.deny(errMsgFilenameClaimed, "path", meta.rel)
+	}
+
 	return nil
 }
 
-func (h *fsHandler) checkMkdirLimit(rel string) error {
-	if !h.srv.mkdirLimiter.Allow() {
-		return h.deny(errMsgMkdirRateLimit, "path", rel)
+func (h *fsHandler) prepareDirectory(rel string) error {
+	if rel == "." || rel == "" {
+		return nil
 	}
 
+	// 1. Ownership Check (Can I create things inside the parent?)
+	if h.srv.cfg.LockDirectoriesToOwners {
+		parentRel := path.Dir(rel)
+		if parentRel != "." {
+			owner, _ := h.srv.store.GetFileOwner(parentRel)
+			// Deny if the parent folder belongs to another specific user
+			if owner != "" && owner != systemOwner && owner != h.pubHash {
+				return h.deny(errMsgCannotWriteToDir, "path", rel, "parent", parentRel)
+			}
+		}
+	}
 	if !h.srv.store.FileExistsInDB(rel) {
+		if !h.srv.mkdirLimiter.Allow() {
+			return h.deny(errMsgMkdirRateLimit, "path", rel)
+		}
+
 		count, _ := h.srv.store.GetDirectoryCount()
 		if count >= h.srv.cfg.MaxDirs {
 			return h.deny(errMsgMaxDirsReached, "path", rel)
 		}
 	}
-	return nil
+
+	full := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(full, permDir); err != nil {
+		h.logger.Error("mkdir error", "path", rel, "err", err)
+		return err
+	}
+
+	return h.srv.store.EnsureDirectory(h.pubHash, rel)
 }
 
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
@@ -895,60 +934,45 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	h.logger.Debug("Filewrite", "method", r.Method, "path", r.Filepath)
-	rel, full, err := h.resolve(r.Filepath)
+
+	// 1. Identity of the target file
+	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	if h.srv.cfg.unrestrictedMap[rel] {
-		return nil, h.deny(errMsgFileProtected.Args(rel), "path", rel)
+	// 2. Authorization (Check ownership/orphans/system protection)
+	if err := h.canModify(meta); err != nil {
+		return nil, err
 	}
 
-	parentRel := path.Dir(rel)
-	if h.srv.cfg.LockDirectoriesToOwners && parentRel != "." {
-		owner, _ := h.srv.store.GetFileOwner(parentRel)
-		if owner != "" && owner != h.pubHash {
-			return nil, h.deny(errMsgCannotWriteToDir, "path", rel, "parent", parentRel, "owner", shortID(owner))
-		}
+	// 3. Prepare the Container (Parent Directory)
+	if err := h.prepareDirectory(path.Dir(meta.rel)); err != nil {
+		return nil, err
 	}
 
-	if !h.srv.mkdirLimiter.Allow() {
-		return nil, h.deny(errMsgMkdirRateLimit, "path", rel)
+	// 4. Database Claim
+	if err := h.srv.store.ClaimFile(h.pubHash, meta.rel); err != nil {
+		return nil, h.deny(errMsgFilenameClaimed, "path", meta.rel)
 	}
 
-	// Check directory limit before creating parent
-	if parentRel != "." && !h.srv.store.FileExistsInDB(parentRel) {
-		if err := h.checkMkdirLimit(parentRel); err != nil {
-			return nil, err
-		}
-	}
-
-	h.srv.store.EnsureDirectory(h.pubHash, parentRel)
-	os.MkdirAll(filepath.Dir(full), permDir)
-
-	if err := h.srv.store.ClaimFile(h.pubHash, rel); err != nil {
-		return nil, h.deny(errMsgFilenameClaimed, "path", rel)
-	}
-
+	// 5. IO Handle
 	flags := os.O_RDWR | os.O_CREATE
-	isAppend := r.Pflags().Append
-	if !isAppend {
+	if !r.Pflags().Append {
 		flags |= os.O_TRUNC
 	}
 
-	h.logger.Info("file write open", "path", rel, "append", isAppend)
-	f, err := os.OpenFile(full, flags, permFile)
+	f, err := os.OpenFile(meta.full, flags, permFile)
 	if err != nil {
-		h.logger.Error("io error", "op", "openwrite", "path", rel, "err", err)
 		return nil, err
 	}
 
 	oldSize := int64(0)
-	if fi, err := os.Stat(full); err == nil {
+	if fi, err := f.Stat(); err == nil {
 		oldSize = fi.Size()
 	}
 
-	return &statWriter{File: f, h: h, rel: rel, oldSize: oldSize}, nil
+	return &statWriter{File: f, h: h, rel: meta.rel, oldSize: oldSize}, nil
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
@@ -990,11 +1014,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 	switch r.Method {
 	case "Mkdir":
-		if err := h.checkMkdirLimit(meta.rel); err != nil {
-			return err
-		}
-		os.MkdirAll(meta.full, permDir)
-		return h.srv.store.EnsureDirectory(h.pubHash, meta.rel)
+		return h.prepareDirectory(meta.rel)
 
 	case "Remove", "Rmdir":
 		if err := h.canModify(meta); err != nil {
