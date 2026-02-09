@@ -63,12 +63,11 @@ import (
 //go:embed sftpguy.go fortunes.txt
 var embeddedSource embed.FS
 
-// path to number of uploaded bytes needed for permission to download
-var restrictedFiles = map[string]int64{
-	"README.txt":   0,
-	"fortunes.txt": contributorThresholdDefault,
-	"RULES.txt":    0,
-	"LICENSE.txt":  0,
+// Default files that are always downloadable
+var defaultUnrestrictedPaths = []string{
+	"README.txt",
+	"RULES.txt",
+	"LICENSE.txt",
 }
 
 // ============================================================================
@@ -76,7 +75,7 @@ var restrictedFiles = map[string]int64{
 // ============================================================================
 
 const (
-	AppVersion = "1.8.1"
+	AppVersion = "1.8.2"
 	envPrefix  = "SFTP_"
 
 	// System identifiers
@@ -114,12 +113,13 @@ const (
 	CREATE TABLE IF NOT EXISTS files ( 
 		path TEXT PRIMARY KEY,
 		owner_hash TEXT,
-		size INTEGER DEFAULT 0
+		size INTEGER DEFAULT 0,
+		is_dir INTEGER DEFAULT 0
 	);`
 )
 
 // ============================================================================
-// Translatable Errors
+// User Permission Errors
 // ============================================================================
 
 var errorPrefix = struct {
@@ -157,19 +157,20 @@ func (e UserPermissionError) Error() string {
 
 var (
 	errMsgSymlinksProhibited = UserPermissionError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
-	errMsgAccessLocked       = UserPermissionError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
+	errMsgAccessLocked       = UserPermissionError{EN: "Archive access locked. You must share files to reach contributor status.", ZH: "归档访问已锁定。您必须通过分享文件来获得贡献者身份。"}
 	errMsgContributorsLocked = UserPermissionError{
 		EN: "%s is only available to contributors who have uploaded at least %d bytes: upload %d more bytes.",
 		ZH: "文件 %s 仅对已上传至少 %d 字节的贡献者可用：再上传 %d 字节。"}
-	errMsgFileProtected      = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
-	errMsgCannotWriteToDir   = UserPermissionError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
-	errMsgFilenameClaimed    = UserPermissionError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
-	errMsgNoPermissionDelete = UserPermissionError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
-	errMsgNotOwner           = UserPermissionError{EN: "You do not own the source file or directory.", ZH: "您不是源文件 or 目录的所有者。"}
-	errMsgRenameFailed       = UserPermissionError{EN: "Rename failed.", ZH: "重命名失败。"}
-	errMsgMkdirRateLimit     = UserPermissionError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
-	errMsgFileSizeExceeded   = UserPermissionError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
-	errMsgPathTraversal      = UserPermissionError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
+	errMsgFileProtected    = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
+	errMsgCannotWriteToDir = UserPermissionError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
+	errMsgFilenameClaimed  = UserPermissionError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
+	errMsgNoPermissionDel  = UserPermissionError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
+	errMsgNotOwner         = UserPermissionError{EN: "You do not own the source file or directory.", ZH: "您不是源文件或目录的所有者。"}
+	errMsgRenameFailed     = UserPermissionError{EN: "Rename failed.", ZH: "重命名失败。"}
+	errMsgMkdirRateLimit   = UserPermissionError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
+	errMsgMaxDirsReached   = UserPermissionError{EN: "Maximum directory limit reached for this archive.", ZH: "已达到此归档的最大目录限制。"}
+	errMsgFileSizeExceeded = UserPermissionError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
+	errMsgPathTraversal    = UserPermissionError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
 )
 
 // ============================================================================
@@ -183,6 +184,14 @@ type userStats struct {
 	DownloadCount int64
 	DownloadBytes int64
 	FirstTimer    bool
+}
+
+func (u userStats) IsContributor(threshold int64) (bool, int64) {
+	if u.UploadBytes >= threshold {
+		return true, 0
+	}
+	remaining := threshold - u.UploadBytes
+	return false, remaining
 }
 
 type Store struct {
@@ -243,7 +252,7 @@ func (s *Store) GetFileOwner(relPath string) (string, error) {
 
 func (s *Store) RegisterSystemFiles(filenames []string) error {
 	for _, f := range filenames {
-		if _, err := s.db.Exec("INSERT OR REPLACE INTO files(path, owner_hash) VALUES (?, ?)", f, systemOwner); err != nil {
+		if _, err := s.db.Exec("INSERT OR REPLACE INTO files(path, owner_hash, is_dir) VALUES (?, ?, 0)", f, systemOwner); err != nil {
 			return err
 		}
 	}
@@ -261,7 +270,7 @@ func (s *Store) ClaimFile(hash, relPath string) error {
 	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 
 	if err == sql.ErrNoRows {
-		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, 0)", relPath, hash); err != nil {
+		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash); err != nil {
 			return err
 		}
 		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", hash); err != nil {
@@ -289,11 +298,17 @@ func (s *Store) EnsureDirectory(hash, relPath string) error {
 	curr := ""
 	for _, p := range parts {
 		curr = path.Join(curr, p)
-		if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size) VALUES (?, ?, 0)", curr, hash); err != nil {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 1)", curr, hash); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) GetDirectoryCount() (int, error) {
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM files WHERE is_dir = 1").Scan(&count)
+	return count, err
 }
 
 func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) error {
@@ -335,7 +350,7 @@ func (s *Store) GetBannerStats(threshold int64) (u, c, f, b uint64) {
 			COUNT(*) FILTER (WHERE upload_bytes > ?)
 		FROM users
 	`, threshold).Scan(&u, &c)
-	s.db.QueryRow("SELECT count(*), sum(size) FROM files").Scan(&f, &b)
+	s.db.QueryRow("SELECT count(*), sum(size) FROM files WHERE is_dir = 0").Scan(&f, &b)
 	return
 }
 
@@ -359,10 +374,14 @@ type Config struct {
 	BannerFile              string
 	BannerStats             bool
 	MkdirRate               float64
+	MaxDirs                 int
+	Unrestricted            string
 	LockDirectoriesToOwners bool
 	Verbose                 bool
 	MaxFileSize             int64
 	ContributorThreshold    int64
+	unrestrictedMap         map[string]bool
+	BootstrapSrc            bool
 }
 
 func LoadConfig() (Config, error) {
@@ -376,7 +395,9 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
 	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
-	EnvFlag(&cfg.MkdirRate, "dir.rate", "MKDIR_RATE", 10.0, "Global mkdir rate limit in directories per second")
+	EnvFlag(&cfg.MkdirRate, "dir.rate", "MKDIR_RATE", 10.0, "Global mkdir rate limit (dirs/sec)")
+	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 1000, "Maximum total directories allowed in archive")
+	EnvFlag(&cfg.Unrestricted, "unrestricted", "UNRESTRICTED_PATHS", strings.Join(defaultUnrestrictedPaths, ","), "Comma-separated list of paths always available for download")
 	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
 	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable debug logging")
 
@@ -386,7 +407,7 @@ func LoadConfig() (Config, error) {
 	var contributorThresholdRaw string
 	EnvFlag(&contributorThresholdRaw, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock contributor status")
 
-	src := flag.Bool("src", false, "Show source code")
+	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code and fortunes to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
 
 	flag.Usage = func() {
@@ -397,12 +418,6 @@ func LoadConfig() (Config, error) {
 
 	if *v {
 		fmt.Printf("%s v%s\n", cfg.Name, AppVersion)
-		os.Exit(0)
-	}
-
-	if *src {
-		srcCode, _ := embeddedSource.ReadFile(sourceFile)
-		fmt.Printf("%s", srcCode)
 		os.Exit(0)
 	}
 
@@ -417,6 +432,17 @@ func LoadConfig() (Config, error) {
 		return cfg, fmt.Errorf("invalid contributor threshold: %w", err)
 	}
 	cfg.ContributorThreshold = contrib
+
+	// Process unrestricted paths
+	cfg.unrestrictedMap = make(map[string]bool)
+	for _, p := range strings.Split(cfg.Unrestricted, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			cfg.unrestrictedMap[p] = true
+		}
+	}
+	// Source code is always unrestricted
+	cfg.unrestrictedMap[fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion)] = true
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("configuration validation failed: %w", err)
@@ -459,10 +485,9 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	var sysFiles []string
-	for f := range restrictedFiles {
+	for f := range cfg.unrestrictedMap {
 		sysFiles = append(sysFiles, f)
 	}
-	sysFiles = append(sysFiles, fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion))
 	if err := store.RegisterSystemFiles(sysFiles); err != nil {
 		return nil, err
 	}
@@ -485,7 +510,40 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		cancel:       cancel,
 	}
 
+	if cfg.BootstrapSrc {
+		if err := srv.bootstrapSource(); err != nil {
+			logger.Error("failed to bootstrap source", "err", err)
+		}
+	}
+
 	return srv, nil
+}
+
+func (s *Server) bootstrapSource() error {
+	s.logger.Info("bootstrapping source files to upload directory")
+	// Copy sftpguy.go
+	srcData, err := embeddedSource.ReadFile(sourceFile)
+	if err != nil {
+		return err
+	}
+	destPath := filepath.Join(s.absUploadDir, s.sourceFileName())
+	if err := os.WriteFile(destPath, srcData, permFile); err != nil {
+		return err
+	}
+	s.store.db.Exec("INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, 0)", s.sourceFileName(), systemOwner, len(srcData))
+
+	// Copy fortunes.txt
+	fData, err := embeddedSource.ReadFile("fortunes.txt")
+	if err != nil {
+		return err
+	}
+	fPath := filepath.Join(s.absUploadDir, "fortunes.txt")
+	if err := os.WriteFile(fPath, fData, permFile); err != nil {
+		return err
+	}
+	s.store.db.Exec("INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, 0)", "fortunes.txt", systemOwner, len(fData))
+
+	return nil
 }
 
 func (s *Server) sourceFileName() string {
@@ -629,7 +687,7 @@ func (s *Server) getRandomFortune() string {
 
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
-	isContributor := stats.UploadBytes >= s.cfg.ContributorThreshold
+	isContributor, needed := stats.IsContributor(s.cfg.ContributorThreshold)
 	color := bold
 	if stats.FirstTimer {
 		color = blue
@@ -639,24 +697,21 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Fmt(userLabel))
 
 	if stats.FirstTimer {
-		fmt.Fprintln(w, "This is a share-first archive.  You must upload a file to unlock downloads.")
-		fmt.Fprintln(w, "You may always download:\r\n. %s", bold.Fmt(s.sourceFileName()))
-
-		for pathName, threshold := range restrictedFiles {
-			if threshold <= 0 {
-				fmt.Fprintln(w, "  "+bold.Fmt(pathName))
-			}
+		fmt.Fprintln(w, "This is a share-first archive. Reach contributor status to unlock all downloads.")
+		fmt.Fprintln(w, "Upload at least %d bytes to unlock contributor status.", s.cfg.ContributorThreshold)
+		fmt.Fprintln(w, "You may always download unrestricted files:")
+		for pathName := range s.cfg.unrestrictedMap {
+			fmt.Fprintln(w, "  "+bold.Fmt(pathName))
 		}
-
 	}
 
 	if isContributor {
-		fmt.Fprintln(w, yellow.Bold("★ Contributor status unlocked!"))
+		fmt.Fprintln(w, yellow.Bold("* Contributor status unlocked!"))
 		fmt.Fprintln(w, yellow.Italic(s.getRandomFortune()))
 	} else if stats.UploadCount > 0 {
-		fmt.Fprint(w, green.Fmt("Downloading is unlocked.\r\n"))
+		fmt.Fprintf(w, green.Fmt("Share %d more bytes to unlock downloads.\r\n"), needed)
 	} else {
-		fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
+		fmt.Fprint(w, red.Bold("Downloads are restricted to system files.\r\n"))
 	}
 	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes",
 		userLabel, stats.LastLogin, stats.UploadCount, stats.UploadBytes)
@@ -688,14 +743,18 @@ func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, err
 
 func (s *Server) reconcileOrphans() {
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || p == s.absUploadDir || d.IsDir() {
+		if err != nil || p == s.absUploadDir {
 			return nil
 		}
 		rel, _ := filepath.Rel(s.absUploadDir, p)
 		rel = filepath.ToSlash(rel)
 		if !s.store.FileExistsInDB(rel) {
 			fi, _ := d.Info()
-			s.store.db.Exec("INSERT INTO files (path, owner_hash, size) VALUES (?, ?, ?)", rel, systemOwner, fi.Size())
+			isDir := 0
+			if d.IsDir() {
+				isDir = 1
+			}
+			s.store.db.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, ?)", rel, systemOwner, fi.Size(), isDir)
 		}
 		return nil
 	})
@@ -743,43 +802,30 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	threshold, isRestricted := restrictedFiles[rel]
-	if rel == h.srv.sourceFileName() {
-		if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
-			return bytes.NewReader(data), nil
-		}
-	}
-
+	isUnrestricted := h.srv.cfg.unrestrictedMap[rel]
 	stats, _ := h.srv.store.GetUserStats(h.pubHash)
-	if isRestricted {
+	isContributor, remainingBytes := stats.IsContributor(h.srv.cfg.ContributorThreshold)
 
-		if stats.UploadBytes < threshold {
-			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold, threshold-stats.UploadBytes),
-				"path", rel,
-				"uploaded_bytes", stats.UploadBytes,
-				"required", threshold)
+	if isUnrestricted {
+		if rel == h.srv.sourceFileName() {
+			if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
+				return bytes.NewReader(data), nil
+			}
 		}
 
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
-			h.logger.Info("read system file", "path", rel)
 			return os.Open(full)
 		}
 
 		if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
 			return bytes.NewReader(data), nil
 		}
-
-		if rel == h.srv.sourceFileName() {
-			if data, err := embeddedSource.ReadFile(sourceFile); err == nil {
-				h.logger.Info("read embedded file", "path", rel)
-				return bytes.NewReader(data), nil
-			}
-		}
 		return nil, os.ErrNotExist
 	}
 
-	if stats.UploadCount == 0 {
-		return nil, h.deny(errMsgAccessLocked, "path", rel)
+	if !isContributor {
+		return nil, h.deny(errMsgContributorsLocked.Args(rel, h.srv.cfg.ContributorThreshold, remainingBytes),
+			"path", rel, "uploaded", stats.UploadBytes)
 	}
 
 	fi, err := os.Stat(full)
@@ -798,7 +844,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	if _, ok := restrictedFiles[rel]; ok || rel == h.srv.sourceFileName() {
+	if h.srv.cfg.unrestrictedMap[rel] {
 		return nil, h.deny(errMsgFileProtected.Args(rel), "path", rel)
 	}
 
@@ -812,6 +858,14 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 	if !h.srv.mkdirLimiter.Allow() {
 		return nil, h.deny(errMsgMkdirRateLimit, "path", rel)
+	}
+
+	// Check directory limit before creating parent
+	if parentRel != "." && !h.srv.store.FileExistsInDB(parentRel) {
+		count, _ := h.srv.store.GetDirectoryCount()
+		if count >= h.srv.cfg.MaxDirs {
+			return nil, h.deny(errMsgMaxDirsReached)
+		}
 	}
 
 	h.srv.store.EnsureDirectory(h.pubHash, parentRel)
@@ -849,7 +903,6 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, sftp.ErrSshFxPermissionDenied
 	}
 
-	// Handle Directory Listing
 	if r.Method == "List" {
 		entries, _ := os.ReadDir(full)
 		var files []os.FileInfo
@@ -871,7 +924,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 				seen[srcName] = true
 			}
 
-			for f := range restrictedFiles {
+			for f := range h.srv.cfg.unrestrictedMap {
 				if seen[f] {
 					continue
 				}
@@ -886,12 +939,11 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 	fi, err := os.Lstat(full)
 	if err != nil {
-		// Check if it's one of our virtual files before giving up
 		if rel == h.srv.sourceFileName() {
 			data, _ := h.srv.readFileWithFallback(rel, sourceFile)
 			return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
 		}
-		if _, isRestricted := restrictedFiles[rel]; isRestricted {
+		if h.srv.cfg.unrestrictedMap[rel] {
 			if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
 				return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
 			}
@@ -915,14 +967,18 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		if !h.srv.mkdirLimiter.Allow() {
 			return h.deny(errMsgMkdirRateLimit, "path", rel)
 		}
+		count, _ := h.srv.store.GetDirectoryCount()
+		if count >= h.srv.cfg.MaxDirs {
+			return h.deny(errMsgMaxDirsReached)
+		}
 		os.MkdirAll(full, permDir)
 		return h.srv.store.EnsureDirectory(h.pubHash, rel)
 	case "Remove", "Rmdir":
 		owner, _ := h.srv.store.GetFileOwner(rel)
 		if owner != "" && owner != h.pubHash {
-			return h.deny(errMsgNoPermissionDelete, "path", rel, "owner", shortID(owner))
+			return h.deny(errMsgNoPermissionDel, "path", rel, "owner", shortID(owner))
 		}
-		if _, ok := restrictedFiles[rel]; ok || rel == h.srv.sourceFileName() {
+		if h.srv.cfg.unrestrictedMap[rel] {
 			return h.deny(errMsgFileProtected.Args(rel), "path", rel)
 		}
 		os.RemoveAll(full)
@@ -936,7 +992,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		if owner != "" && owner != h.pubHash {
 			return h.deny(errMsgNotOwner, "path", rel)
 		}
-		if _, ok := restrictedFiles[relTgt]; ok || relTgt == h.srv.sourceFileName() {
+		if h.srv.cfg.unrestrictedMap[relTgt] {
 			return h.deny(errMsgFileProtected.Args(relTgt), "path", relTgt)
 		}
 		h.logger.Info("rename", "from", rel, "to", relTgt)
@@ -962,9 +1018,7 @@ type statWriter struct {
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	if sw.h.srv.cfg.MaxFileSize > 0 && off+int64(len(p)) > sw.h.srv.cfg.MaxFileSize {
 		return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
-			"path", sw.rel,
-			"offset", off,
-			"size", len(p))
+			"path", sw.rel, "offset", off, "size", len(p))
 	}
 	return sw.File.WriteAt(p, off)
 }
@@ -1133,28 +1187,20 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		lvl = slog.LevelDebug
 	}
 
-	// Open log file for appending, create if it doesn't exist
 	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
 
 	mw := io.MultiWriter(os.Stdout, f)
-
-	logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{
-		Level: lvl,
-	}))
+	logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
 
 	logger.Info("configuration",
 		"version", AppVersion,
 		"port", cfg.Port,
-		"upload_dir", cfg.UploadDir,
-		"db_path", cfg.DBPath,
-		"max_file_size", cfg.MaxFileSize,
-		"mkdir_rate", cfg.MkdirRate,
-		"verbose_logging", cfg.Verbose,
+		"max_dirs", cfg.MaxDirs,
 		"contributor_threshold", cfg.ContributorThreshold,
-		"lock_directories_to_owners", cfg.LockDirectoriesToOwners,
+		"unrestricted", cfg.Unrestricted,
 	)
 
 	return logger, f, nil
@@ -1175,6 +1221,7 @@ func main() {
 
 	srv, err := NewServer(cfg, logger)
 	if err != nil {
+		logger.Error("failed to start server", "err", err)
 		os.Exit(1)
 	}
 
