@@ -735,7 +735,7 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	h.logger.Debug("fileread", "path", r.Filepath)
+	h.logger.Debug("fileread", "method", r.Method, "path", r.Filepath)
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
@@ -790,6 +790,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	h.logger.Debug("Filewrite", "method", r.Method, "path", r.Filepath)
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
@@ -840,6 +841,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	h.logger.Debug("Filelist", "method", r.Method, "path", r.Filepath)
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return nil, sftp.ErrSshFxPermissionDenied
@@ -900,6 +902,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
+	h.logger.Debug("Filecmd", "method", r.Method, "path", r.Filepath)
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return h.deny(errMsgPathTraversal, "path", r.Filepath)
@@ -1148,6 +1151,8 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"max_file_size", cfg.MaxFileSize,
 		"mkdir_rate", cfg.MkdirRate,
 		"verbose_logging", cfg.Verbose,
+		"contributor_threshold", cfg.ContributorThreshold,
+		"lock_directories_to_owners", cfg.LockDirectoriesToOwners,
 	)
 
 	return logger, f, nil
