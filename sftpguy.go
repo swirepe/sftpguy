@@ -280,6 +280,7 @@ func (s *Store) RegisterSystemFiles(filenames []string) error {
 func (s *Store) ClaimFile(hash, relPath string) error {
 	return s.transact(func(tx *sql.Tx) error {
 		var owner string
+		err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 
 		if err == sql.ErrNoRows {
 			if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash); err != nil {
@@ -465,7 +466,6 @@ func (c Config) Validate() error {
 // ============================================================================
 // Server
 // ============================================================================
-// ============================================================================
 type UserStatus struct {
 	IsContributor bool
 	BytesNeeded   int64
@@ -475,7 +475,7 @@ type UserStatus struct {
 func (s *Server) UserStatus(pubHashash string) (userStatus UserStatus, err error) {
 	stats, err := s.store.GetUserStats(pubHashash)
 	if err != nil {
-		return nil, err
+		return UserStatus{}, err
 	}
 	isContributor, remaining := stats.IsContributor(s.cfg.ContributorThreshold)
 	userStatus.Stats = stats
@@ -829,6 +829,24 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 	return meta, nil
 }
 
+func (h *fsHandler) canRead(meta *pathMeta) error {
+	if meta.isUnrestricted {
+		return nil
+	}
+
+	status, err := h.srv.UserStatus(h.pubHash)
+	if err != nil {
+		return err
+	}
+
+	if !status.IsContributor {
+		return h.deny(errMsgContributorsLocked.Args(meta.rel, h.srv.cfg.ContributorThreshold, status.BytesNeeded),
+			"path", meta.rel, "uploaded", status.Stats.UploadBytes)
+	}
+
+	return nil
+}
+
 func (h *fsHandler) canModify(meta *pathMeta) error {
 	if meta.isUnrestricted {
 		return h.deny(errMsgFileProtected.Args(meta.rel))
@@ -919,33 +937,31 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	h.logger.Debug("fileread", "method", r.Method, "path", r.Filepath)
-	rel, full, err := h.resolve(r.Filepath)
-	if err != nil {
-		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
-	}
 
-	isUnrestricted := h.srv.cfg.unrestrictedMap[rel]
-	status, _ := h.srv.UserStatus(h.pubHash)
-
-	if isUnrestricted {
-		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
-			return os.Open(full)
-		}
-		return nil, os.ErrNotExist
-	}
-
-	if !status.IsContributor {
-		return nil, h.deny(errMsgContributorsLocked.Args(rel, h.srv.cfg.ContributorThreshold, status.BytesNeeded),
-			"path", rel, "uploaded", status.Stats.UploadBytes)
-	}
-
-	fi, err := os.Stat(full)
+	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return nil, err
 	}
-	h.logger.Info("file download", "path", rel, "size", fi.Size())
+
+	// 1. Permission Check
+	if err := h.canRead(meta); err != nil {
+		return nil, err
+	}
+
+	// 2. Existence/Type Check
+	fi, err := os.Stat(meta.full)
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+	if fi.IsDir() {
+		return nil, sftp.ErrSSHFxNoSuchFile
+	}
+
+	// 3. Logging and Records
+	h.logger.Info("file download", "path", meta.rel, "size", fi.Size())
 	h.srv.store.RecordDownload(h.pubHash, fi.Size())
-	return os.Open(full)
+
+	return os.Open(meta.full)
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
@@ -1021,7 +1037,11 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 	owner, _ := h.srv.store.GetFileOwner(relPath)
-	return &sftpFile{FileInfo: fi, owner: owner}
+	return &sftpFile{
+		FileInfo:       fi,
+		owner:          owner,
+		isUnrestricted: h.srv.cfg.unrestrictedMap[relPath],
+	}
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
@@ -1092,12 +1112,19 @@ func (sw *statWriter) Close() error {
 
 type sftpFile struct {
 	os.FileInfo
-	owner string
+	owner          string
+	isUnrestricted bool
 }
 
 func (s *sftpFile) Sys() interface{} {
 	uid := hashToUid(s.owner)
-	return &sftp.FileStat{UID: uid, GID: uid}
+	gid := uid
+
+	if s.isUnrestricted {
+		uid = unrestrictedUID
+		gid = unrestrictedGID
+	}
+	return &sftp.FileStat{UID: uid, GID: gid}
 }
 
 type listerAt []os.FileInfo
