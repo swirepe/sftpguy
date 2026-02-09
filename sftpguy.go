@@ -738,13 +738,13 @@ func (s *Server) ensureHostKey() error {
 	return pem.Encode(keyFile, pemBlock)
 }
 
-func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
-	physicalPath := filepath.Join(s.absUploadDir, relPath)
-	if data, err := os.ReadFile(physicalPath); err == nil {
-		return data, nil
-	}
-	return embeddedSource.ReadFile(embeddedPath)
-}
+// func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
+// 	physicalPath := filepath.Join(s.absUploadDir, relPath)
+// 	if data, err := os.ReadFile(physicalPath); err == nil {
+// 		return data, nil
+// 	}
+// 	return embeddedSource.ReadFile(embeddedPath)
+// }
 
 func (s *Server) reconcileOrphans() {
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
@@ -812,19 +812,9 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	isContributor, remainingBytes := stats.IsContributor(h.srv.cfg.ContributorThreshold)
 
 	if isUnrestricted {
-		// if rel == h.srv.sourceFileName() {
-		// 	if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
-		// 		return bytes.NewReader(data), nil
-		// 	}
-		// }
-
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
 			return os.Open(full)
 		}
-
-		// if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
-		// 	return bytes.NewReader(data), nil
-		// }
 		return nil, os.ErrNotExist
 	}
 
@@ -911,48 +901,19 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	if r.Method == "List" {
 		entries, _ := os.ReadDir(full)
 		var files []os.FileInfo
-		// seen := make(map[string]bool)
 
 		for _, e := range entries {
 			fi, _ := e.Info()
 			name := e.Name()
 			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, name))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
-			// seen[name] = true
 		}
 
-		// if rel == "." {
-		// 	srcName := h.srv.sourceFileName()
-		// 	if !seen[srcName] {
-		// 		data, _ := h.srv.readFileWithFallback(srcName, sourceFile)
-		// 		files = append(files, &virtualFileInfo{name: srcName, size: int64(len(data))})
-		// 		seen[srcName] = true
-		// 	}
-
-		// 	for f := range h.srv.cfg.unrestrictedMap {
-		// 		if seen[f] {
-		// 			continue
-		// 		}
-		// 		if data, err := h.srv.readFileWithFallback(f, f); err == nil {
-		// 			files = append(files, &virtualFileInfo{name: f, size: int64(len(data))})
-		// 			seen[f] = true
-		// 		}
-		// 	}
-		// }
 		return listerAt(files), nil
 	}
 
 	fi, err := os.Lstat(full)
 	if err != nil {
-		if rel == h.srv.sourceFileName() {
-			data, _ := h.srv.readFileWithFallback(rel, sourceFile)
-			return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
-		}
-		if h.srv.cfg.unrestrictedMap[rel] {
-			if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
-				return listerAt{&virtualFileInfo{name: rel, size: int64(len(data))}}, nil
-			}
-		}
 		return nil, os.ErrNotExist
 	}
 
@@ -1046,18 +1007,6 @@ func (s *sftpFile) Sys() interface{} {
 	uid := hashToUid(s.owner)
 	return &sftp.FileStat{UID: uid, GID: uid}
 }
-
-type virtualFileInfo struct {
-	name string
-	size int64
-}
-
-func (v *virtualFileInfo) Name() string       { return v.name }
-func (v *virtualFileInfo) Size() int64        { return v.size }
-func (v *virtualFileInfo) Mode() fs.FileMode  { return permReadOnly }
-func (v *virtualFileInfo) ModTime() time.Time { return time.Now() }
-func (v *virtualFileInfo) IsDir() bool        { return false }
-func (v *virtualFileInfo) Sys() interface{}   { return &sftp.FileStat{UID: defaultUID, GID: defaultGID} }
 
 type listerAt []os.FileInfo
 
