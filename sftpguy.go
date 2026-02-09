@@ -204,10 +204,11 @@ func (u userStats) IsContributor(threshold int64) (bool, int64) {
 }
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	logger *slog.Logger
 }
 
-func NewStore(path string) (*Store, error) {
+func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -216,19 +217,58 @@ func NewStore(path string) (*Store, error) {
 	if _, err := db.Exec(Schema); err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, logger: logger}, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
 	tx, err := s.db.Begin()
 	if err != nil {
+		s.logger.Error("failed to begin transaction", "err", err)
 		return err
 	}
 	defer tx.Rollback()
 	if err := fn(tx); err != nil {
+		s.logger.Error("transaction failed", "err", err)
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		s.logger.Error("failed to commit transaction", "err", err)
+	}
+	return nil
+}
+
+func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+	res, err := s.db.Exec(query, args...)
+	if err != nil {
+		s.logger.Error("database exec failed",
+			"err", err,
+			"query", query,
+			"args", args,
+		)
+		return nil, err
+	}
+	return res, nil
+}
+
+func (s *Store) RegisterFile(path, owner string, size int64, isDir bool) {
+	if owner == "" {
+		owner = systemOwner
+	}
+
+	isDirVal := 0
+	if isDir {
+		isDirVal = 1
+	}
+
+	s.exec(`INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) 
+	        VALUES (?, ?, ?, ?)`, path, owner, size, isDirVal)
+}
+
+func (s *Store) RegisterSystemFiles(paths []string) {
+	for _, p := range paths {
+		// Register as system-owned, 0 size (until scanned), not a directory
+		s.RegisterFile(p, systemOwner, 0, false)
+	}
 }
 
 func (s *Store) Close() error {
@@ -249,7 +289,7 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 
 func (s *Store) UpsertUserSession(hash string) (userStats, error) {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 		INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)
 		ON CONFLICT(pubkey_hash) DO UPDATE SET last_login = excluded.last_login
 	`, hash, now)
@@ -266,15 +306,6 @@ func (s *Store) GetFileOwner(relPath string) (string, error) {
 		return "", nil
 	}
 	return owner, err
-}
-
-func (s *Store) RegisterSystemFiles(filenames []string) error {
-	for _, f := range filenames {
-		if _, err := s.db.Exec("INSERT OR REPLACE INTO files(path, owner_hash, is_dir) VALUES (?, ?, 0)", f, systemOwner); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (s *Store) ClaimFile(hash, relPath string) error {
@@ -339,14 +370,14 @@ func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) erro
 }
 
 func (s *Store) RecordDownload(hash string, bytes int64) error {
-	_, err := s.db.Exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", bytes, hash)
+	_, err := s.exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", bytes, hash)
 	return err
 }
 
 func (s *Store) RenamePath(oldRel, newRel string) error {
 	prefixLen := len(oldRel) + 1 // "oldRel" + "/"
 
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 		UPDATE files 
 		SET path = ? || substr(path, ?)
 		WHERE path = ? OR substr(path, 1, ?) = ?`,
@@ -529,7 +560,7 @@ type Server struct {
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
-	store, err := NewStore(cfg.DBPath)
+	store, err := NewStore(cfg.DBPath, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init store: %w", err)
 	}
@@ -538,9 +569,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	for f := range cfg.unrestrictedMap {
 		sysFiles = append(sysFiles, f)
 	}
-	if err := store.RegisterSystemFiles(sysFiles); err != nil {
-		return nil, err
-	}
+	store.RegisterSystemFiles(sysFiles)
 
 	absDir, err := filepath.Abs(cfg.UploadDir)
 	if err != nil {
@@ -581,7 +610,8 @@ func (s *Server) bootstrapSource() error {
 	if err := os.WriteFile(destPath, srcData, permFile); err != nil {
 		return err
 	}
-	s.store.db.Exec("INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, 0)", s.sourceFileName(), systemOwner, len(srcData))
+
+	s.store.RegisterFile(s.sourceFileName(), systemOwner, int64(len(srcData)), false)
 	s.cfg.unrestrictedMap[s.sourceFileName()] = true
 
 	// Copy fortunes.txt
@@ -593,8 +623,7 @@ func (s *Server) bootstrapSource() error {
 	if err := os.WriteFile(fPath, fData, permFile); err != nil {
 		return err
 	}
-	s.store.db.Exec("INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, 0)", "fortunes.txt", systemOwner, len(fData))
-
+	s.store.RegisterFile("fortunes.txt", systemOwner, int64(len(fData)), false)
 	return nil
 }
 
@@ -789,11 +818,8 @@ func (s *Server) reconcileOrphans() {
 		rel = filepath.ToSlash(rel)
 		if !s.store.FileExistsInDB(rel) {
 			fi, _ := d.Info()
-			isDir := 0
-			if d.IsDir() {
-				isDir = 1
-			}
-			s.store.db.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, ?)", rel, systemOwner, fi.Size(), isDir)
+			s.store.RegisterFile(rel, systemOwner, fi.Size(), d.IsDir())
+			s.logger.Info("reconciled orphan file", "path", rel)
 		}
 		return nil
 	})
