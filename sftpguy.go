@@ -235,17 +235,14 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 
 func (s *Store) UpsertUserSession(hash string) (userStats, error) {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	st, err := s.GetUserStats(hash)
+	_, err := s.db.Exec(`
+		INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)
+		ON CONFLICT(pubkey_hash) DO UPDATE SET last_login = excluded.last_login
+	`, hash, now)
 	if err != nil {
-		return st, err
+		return userStats{}, err
 	}
-
-	if st.FirstTimer {
-		_, err = s.db.Exec("INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)", hash, now)
-	} else {
-		_, err = s.db.Exec("UPDATE users SET last_login = ? WHERE pubkey_hash = ?", now, hash)
-	}
-	return st, err
+	return s.GetUserStats(hash)
 }
 
 func (s *Store) GetFileOwner(relPath string) (string, error) {
@@ -780,6 +777,67 @@ type fsHandler struct {
 	logger    slog.Logger
 }
 
+type pathMeta struct {
+	rel            string
+	full           string
+	owner          string
+	exists         bool
+	isDir          bool
+	isUnrestricted bool
+}
+
+func (h *fsHandler) examine(p string) (*pathMeta, error) {
+	rel, full, err := h.resolve(p)
+	if err != nil {
+		return nil, err
+	}
+
+	meta := &pathMeta{
+		rel:            rel,
+		full:           full,
+		isUnrestricted: h.srv.cfg.unrestrictedMap[rel],
+	}
+
+	// Single DB hit for ownership and existence
+	err = h.srv.store.db.QueryRow("SELECT owner_hash, is_dir FROM files WHERE path = ?", rel).
+		Scan(&meta.owner, &meta.isDir)
+
+	if err == nil {
+		meta.exists = true
+	} else if err == sql.ErrNoRows {
+		// Check filesystem if not in DB (orphans or new files)
+		if fi, err := os.Stat(full); err == nil {
+			meta.exists = true
+			meta.isDir = fi.IsDir()
+		}
+	}
+	return meta, nil
+}
+
+func (h *fsHandler) canModify(meta *pathMeta) error {
+	if meta.isUnrestricted {
+		return h.deny(errMsgFileProtected.Args(meta.rel))
+	}
+	if meta.owner != "" && meta.owner != systemOwner && meta.owner != h.pubHash {
+		return h.deny(errMsgNoPermissionDel.Args(meta.rel, hashToUid(meta.owner), hashToUid(h.pubHash)))
+	}
+	return nil
+}
+
+func (h *fsHandler) checkMkdirLimit(rel string) error {
+	if !h.srv.mkdirLimiter.Allow() {
+		return h.deny(errMsgMkdirRateLimit, "path", rel)
+	}
+
+	if !h.srv.store.FileExistsInDB(rel) {
+		count, _ := h.srv.store.GetDirectoryCount()
+		if count >= h.srv.cfg.MaxDirs {
+			return h.deny(errMsgMaxDirsReached, "path", rel)
+		}
+	}
+	return nil
+}
+
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	logArgs := make([]any, 0, 2+len(args))
 	logArgs = append(logArgs, "reason", err.LogString())
@@ -860,9 +918,8 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 	// Check directory limit before creating parent
 	if parentRel != "." && !h.srv.store.FileExistsInDB(parentRel) {
-		count, _ := h.srv.store.GetDirectoryCount()
-		if count >= h.srv.cfg.MaxDirs {
-			return nil, h.deny(errMsgMaxDirsReached)
+		if err := h.checkMkdirLimit(parentRel); err != nil {
+			return nil, err
 		}
 	}
 
@@ -926,49 +983,42 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	h.logger.Debug("Filecmd", "method", r.Method, "path", r.Filepath)
-	rel, full, err := h.resolve(r.Filepath)
+	meta, err := h.examine(r.Filepath)
 	if err != nil {
-		return h.deny(errMsgPathTraversal, "path", r.Filepath)
+		return h.deny(errMsgPathTraversal, r.Filepath)
 	}
 
 	switch r.Method {
 	case "Mkdir":
-		if !h.srv.mkdirLimiter.Allow() {
-			return h.deny(errMsgMkdirRateLimit, "path", rel)
+		if err := h.checkMkdirLimit(meta.rel); err != nil {
+			return err
 		}
-		count, _ := h.srv.store.GetDirectoryCount()
-		if count >= h.srv.cfg.MaxDirs {
-			return h.deny(errMsgMaxDirsReached)
-		}
-		os.MkdirAll(full, permDir)
-		return h.srv.store.EnsureDirectory(h.pubHash, rel)
+		os.MkdirAll(meta.full, permDir)
+		return h.srv.store.EnsureDirectory(h.pubHash, meta.rel)
+
 	case "Remove", "Rmdir":
-		owner, _ := h.srv.store.GetFileOwner(rel)
-		if owner != "" && owner != h.pubHash {
-			return h.deny(errMsgNoPermissionDel.Args(rel, hashToUid(owner), hashToUid(h.pubHash)), "path", rel, "owner", shortID(owner))
+		if err := h.canModify(meta); err != nil {
+			return err
 		}
-		if h.srv.cfg.unrestrictedMap[rel] {
-			return h.deny(errMsgFileProtected.Args(rel), "path", rel)
-		}
-		os.RemoveAll(full)
-		return h.srv.store.DeletePath(rel)
+		os.RemoveAll(meta.full)
+		return h.srv.store.DeletePath(meta.rel)
+
 	case "Rename":
-		relTgt, fullTgt, err := h.resolve(r.Target)
+		targetMeta, err := h.examine(r.Target)
 		if err != nil {
-			return h.deny(errMsgPathTraversal, "from", rel, "to", r.Target)
+			return h.deny(errMsgPathTraversal, r.Target)
 		}
-		owner, _ := h.srv.store.GetFileOwner(rel)
-		if owner != "" && owner != h.pubHash {
-			return h.deny(errMsgNotOwner.Args(rel, hashToUid(owner), hashToUid(h.pubHash)), "path", rel)
+		if err := h.canModify(meta); err != nil {
+			return err
 		}
-		if h.srv.cfg.unrestrictedMap[relTgt] {
-			return h.deny(errMsgFileProtected.Args(relTgt), "path", relTgt)
+		if targetMeta.isUnrestricted {
+			return h.deny(errMsgFileProtected, targetMeta.rel)
 		}
-		h.logger.Info("rename", "from", rel, "to", relTgt)
-		if err := os.Rename(full, fullTgt); err != nil {
+
+		if err := os.Rename(meta.full, targetMeta.full); err != nil {
 			return h.deny(errMsgRenameFailed)
 		}
-		return h.srv.store.RenamePath(rel, relTgt)
+		return h.srv.store.RenamePath(meta.rel, targetMeta.rel)
 	}
 	return sftp.ErrSshFxOpUnsupported
 }
@@ -1078,16 +1128,28 @@ func parseSize(s string) (int64, error) {
 	if s == "" || s == "0" {
 		return 0, nil
 	}
-	mult := int64(1)
-	if strings.HasSuffix(s, "gb") {
-		mult = 1024 * 1024 * 1024
-		s = s[:len(s)-2]
-	} else if strings.HasSuffix(s, "mb") {
-		mult = 1024 * 1024
-		s = s[:len(s)-2]
+
+	var mult int64 = 1
+	switch {
+	case strings.HasSuffix(s, "gb") || strings.HasSuffix(s, "g"):
+		mult = 1 << 30 // 1024^3
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "gb"), "g")
+	case strings.HasSuffix(s, "mb") || strings.HasSuffix(s, "m"):
+		mult = 1 << 20 // 1024^2
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "mb"), "m")
+	case strings.HasSuffix(s, "kb") || strings.HasSuffix(s, "k"):
+		mult = 1 << 10 // 1024^1
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "kb"), "k")
+	case strings.HasSuffix(s, "b"):
+		s = strings.TrimSuffix(s, "b")
 	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	return v * mult, err
+
+	// TrimSpace again in case of "100 MB" format
+	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format: %w", err)
+	}
+	return v * mult, nil
 }
 
 func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
