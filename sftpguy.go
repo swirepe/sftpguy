@@ -89,8 +89,10 @@ const (
 	permReadOnly = 0444
 
 	// System defaults
-	defaultUID = 1000
-	defaultGID = 1000
+	defaultUID      = 1000
+	defaultGID      = 1000
+	unrestrictedUID = 1337
+	unrestrictedGID = 1337
 
 	// Port limits
 	minPort = 1
@@ -217,6 +219,18 @@ func NewStore(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+func (s *Store) transact(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -264,27 +278,21 @@ func (s *Store) RegisterSystemFiles(filenames []string) error {
 }
 
 func (s *Store) ClaimFile(hash, relPath string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return s.transact(func(tx *sql.Tx) error {
+		var owner string
 
-	var owner string
-	err = tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
-
-	if err == sql.ErrNoRows {
-		if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash); err != nil {
+		if err == sql.ErrNoRows {
+			if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash); err != nil {
+				return err
+			}
 			return err
 		}
-		if _, err := tx.Exec("UPDATE users SET upload_count = upload_count + 1 WHERE pubkey_hash = ?", hash); err != nil {
-			return err
-		}
-	} else if owner != hash {
-		return fmt.Errorf("claimed")
-	}
 
-	return tx.Commit()
+		if owner != hash {
+			return fmt.Errorf("claimed")
+		}
+		return nil
+	})
 }
 
 func (s *Store) EnsureDirectory(hash, relPath string) error {
@@ -292,21 +300,17 @@ func (s *Store) EnsureDirectory(hash, relPath string) error {
 		return nil
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	parts := strings.Split(relPath, "/")
-	curr := ""
-	for _, p := range parts {
-		curr = path.Join(curr, p)
-		if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 1)", curr, hash); err != nil {
-			return err
+	return s.transact(func(tx *sql.Tx) error {
+		parts := strings.Split(relPath, "/")
+		curr := ""
+		for _, p := range parts {
+			curr = path.Join(curr, p)
+			if _, err := tx.Exec("INSERT OR IGNORE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 1)", curr, hash); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 func (s *Store) GetDirectoryCount() (int, error) {
@@ -316,19 +320,12 @@ func (s *Store) GetDirectoryCount() (int, error) {
 }
 
 func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, relPath); err != nil {
-		return err
-	}
-	if _, err := tx.Exec("UPDATE users SET upload_bytes = upload_bytes + ? WHERE pubkey_hash = ?", delta, hash); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.transact(func(tx *sql.Tx) error {
+		if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, relPath); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) RecordDownload(hash string, bytes int64) error {
@@ -468,6 +465,24 @@ func (c Config) Validate() error {
 // ============================================================================
 // Server
 // ============================================================================
+// ============================================================================
+type UserStatus struct {
+	IsContributor bool
+	BytesNeeded   int64
+	Stats         userStats
+}
+
+func (s *Server) UserStatus(pubHashash string) (userStatus UserStatus, err error) {
+	stats, err := s.store.GetUserStats(pubHashash)
+	if err != nil {
+		return nil, err
+	}
+	isContributor, remaining := stats.IsContributor(s.cfg.ContributorThreshold)
+	userStatus.Stats = stats
+	userStatus.IsContributor = isContributor
+	userStatus.BytesNeeded = remaining
+	return userStatus, nil
+}
 
 type FortuneGenerator struct {
 	fortunes []string
@@ -893,11 +908,13 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 	if rel == "" {
 		rel = "."
 	}
-	full = filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
-	if !isPathSafe(full, h.srv.absUploadDir) {
-		return "", "", fmt.Errorf("traversal")
+	abs := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+
+	// Combine the check here
+	if !strings.HasPrefix(abs, h.srv.absUploadDir) {
+		return "", "", h.deny(errMsgPathTraversal, p)
 	}
-	return rel, full, nil
+	return rel, abs, nil
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -908,8 +925,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	}
 
 	isUnrestricted := h.srv.cfg.unrestrictedMap[rel]
-	stats, _ := h.srv.store.GetUserStats(h.pubHash)
-	isContributor, remainingBytes := stats.IsContributor(h.srv.cfg.ContributorThreshold)
+	status, _ := h.srv.UserStatus(h.pubHash)
 
 	if isUnrestricted {
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
@@ -918,9 +934,9 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, os.ErrNotExist
 	}
 
-	if !isContributor {
-		return nil, h.deny(errMsgContributorsLocked.Args(rel, h.srv.cfg.ContributorThreshold, remainingBytes),
-			"path", rel, "uploaded", stats.UploadBytes)
+	if !status.IsContributor {
+		return nil, h.deny(errMsgContributorsLocked.Args(rel, h.srv.cfg.ContributorThreshold, status.BytesNeeded),
+			"path", rel, "uploaded", status.Stats.UploadBytes)
 	}
 
 	fi, err := os.Stat(full)
@@ -989,8 +1005,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		for _, e := range entries {
 			fi, _ := e.Info()
 			name := e.Name()
-			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, name))
-			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
+			files = append(files, h.newSftpFile(fi, path.Join(rel, name)))
 		}
 
 		return listerAt(files), nil
@@ -1001,8 +1016,12 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, os.ErrNotExist
 	}
 
-	owner, _ := h.srv.store.GetFileOwner(rel)
-	return listerAt{&sftpFile{FileInfo: fi, owner: owner}}, nil
+	return listerAt{h.newSftpFile(fi, rel)}, nil
+}
+
+func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
+	owner, _ := h.srv.store.GetFileOwner(relPath)
+	return &sftpFile{FileInfo: fi, owner: owner}
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
@@ -1124,15 +1143,6 @@ func (s asciiStyle) Italic(str string) string {
 // ============================================================================
 // Utilities
 // ============================================================================
-
-func isPathSafe(fullPath, baseDir string) bool {
-	absP, err1 := filepath.Abs(fullPath)
-	absB, err2 := filepath.Abs(baseDir)
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	return strings.HasPrefix(absP, absB)
-}
 
 func hashToUid(hash string) uint32 {
 	if hash == "" || hash == systemOwner {
