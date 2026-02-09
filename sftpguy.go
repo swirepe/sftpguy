@@ -67,6 +67,7 @@ var defaultUnrestrictedPaths = []string{
 	"README.txt",
 	"RULES.txt",
 	"LICENSE.txt",
+	"public",
 }
 
 // ============================================================================
@@ -855,7 +856,7 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 	meta := &pathMeta{
 		rel:            rel,
 		full:           full,
-		isUnrestricted: h.srv.cfg.unrestrictedMap[rel],
+		isUnrestricted: h.checkUnrestricted(rel),
 	}
 
 	// Single DB hit for ownership and existence
@@ -872,6 +873,19 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 		}
 	}
 	return meta, nil
+}
+
+func (h *fsHandler) checkUnrestricted(rel string) bool {
+	if h.srv.cfg.unrestrictedMap[rel] {
+		return true
+	}
+	// Walk up the directory tree
+	for d := rel; d != "." && d != "/"; d = path.Dir(d) {
+		if h.srv.cfg.unrestrictedMap[d] {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *fsHandler) prepareDirectory(rel string) error {
@@ -1077,7 +1091,7 @@ func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 	return &sftpFile{
 		FileInfo:       fi,
 		owner:          owner,
-		isUnrestricted: h.srv.cfg.unrestrictedMap[relPath],
+		isUnrestricted: h.checkUnrestricted(relPath),
 	}
 }
 
