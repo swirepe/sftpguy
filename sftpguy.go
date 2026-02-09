@@ -130,18 +130,18 @@ var errorPrefix = struct {
 	ZH: red.Fmt("访问被拒绝:  "),
 }
 
-type TranslatableError struct {
+type UserPermissionError struct {
 	EN   string
 	ZH   string
 	args []any
 }
 
-func (e TranslatableError) Args(args ...any) TranslatableError {
+func (e UserPermissionError) Args(args ...any) UserPermissionError {
 	e.args = args
 	return e
 }
 
-func (e TranslatableError) String() string {
+func (e UserPermissionError) Error() string {
 	en := e.EN
 	zh := e.ZH
 
@@ -156,18 +156,20 @@ func (e TranslatableError) String() string {
 }
 
 var (
-	errMsgSymlinksProhibited = TranslatableError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
-	errMsgAccessLocked       = TranslatableError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
-	errMsgContributorsLocked = TranslatableError{EN: "%s is only available to contributors who have uploaded at least %d bytes.", ZH: "%s 仅对上传量至少为 %d 字节的贡献者开放。"}
-	errMsgFileProtected      = TranslatableError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
-	errMsgCannotWriteToDir   = TranslatableError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
-	errMsgFilenameClaimed    = TranslatableError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
-	errMsgNoPermissionDelete = TranslatableError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
-	errMsgNotOwner           = TranslatableError{EN: "You do not own the source file or directory.", ZH: "您不是源文件 or 目录的所有者。"}
-	errMsgRenameFailed       = TranslatableError{EN: "Rename failed.", ZH: "重命名失败。"}
-	errMsgMkdirRateLimit     = TranslatableError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
-	errMsgFileSizeExceeded   = TranslatableError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
-	errMsgPathTraversal      = TranslatableError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
+	errMsgSymlinksProhibited = UserPermissionError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
+	errMsgAccessLocked       = UserPermissionError{EN: "Archive access locked. You must share a file first.", ZH: "归档访问已锁定。您必须先分享一个文件。"}
+	errMsgContributorsLocked = UserPermissionError{
+		EN: "%s is only available to contributors who have uploaded at least %d bytes: upload %d more bytes.",
+		ZH: "文件 %s 仅对已上传至少 %d 字节的贡献者可用：再上传 %d 字节。"}
+	errMsgFileProtected      = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
+	errMsgCannotWriteToDir   = UserPermissionError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
+	errMsgFilenameClaimed    = UserPermissionError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
+	errMsgNoPermissionDelete = UserPermissionError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
+	errMsgNotOwner           = UserPermissionError{EN: "You do not own the source file or directory.", ZH: "您不是源文件 or 目录的所有者。"}
+	errMsgRenameFailed       = UserPermissionError{EN: "Rename failed.", ZH: "重命名失败。"}
+	errMsgMkdirRateLimit     = UserPermissionError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
+	errMsgFileSizeExceeded   = UserPermissionError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
+	errMsgPathTraversal      = UserPermissionError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
 )
 
 // ============================================================================
@@ -711,13 +713,13 @@ type fsHandler struct {
 	logger    slog.Logger
 }
 
-func (h *fsHandler) deny(err TranslatableError, args ...any) error {
+func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	logArgs := make([]any, 0, 2+len(args))
 	logArgs = append(logArgs, "reason", err.EN)
 	logArgs = append(logArgs, args...)
 
 	h.logger.Info("permission denied", logArgs...)
-	fmt.Fprintln(h.stderr, err.String())
+	fmt.Fprintln(h.stderr, err.Error())
 	return sftp.ErrSSHFxPermissionDenied
 }
 
@@ -752,7 +754,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	if isRestricted {
 
 		if stats.UploadBytes < threshold {
-			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold),
+			return nil, h.deny(errMsgContributorsLocked.Args(rel, threshold, threshold-stats.UploadBytes),
 				"path", rel,
 				"uploaded_bytes", stats.UploadBytes,
 				"required", threshold)
