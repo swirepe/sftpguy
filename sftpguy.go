@@ -356,7 +356,12 @@ func (s *Store) RenamePath(oldRel, newRel string) error {
 }
 
 func (s *Store) DeletePath(relPath string) error {
-	_, err := s.db.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", relPath, relPath+"/%")
+	prefixLen := len(relPath) + 1 // "relPath" + "/"
+
+	_, err := s.db.Exec(`
+		DELETE FROM files 
+		WHERE path = ? OR substr(path, 1, ?) = ?`,
+		relPath, prefixLen, relPath+"/")
 	return err
 }
 
