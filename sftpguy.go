@@ -26,7 +26,6 @@ SOFTWARE.
 */
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
@@ -88,9 +87,6 @@ const (
 	permHostKey  = 0600
 	permLogFile  = 0644
 	permReadOnly = 0444
-
-	// User thresholds
-	contributorThresholdDefault = 1024 * 1024 // 1MB uploaded = contributor
 
 	// System defaults
 	defaultUID = 1000
@@ -157,7 +153,7 @@ func (e UserPermissionError) Error() string {
 
 var (
 	errMsgSymlinksProhibited = UserPermissionError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
-	errMsgAccessLocked       = UserPermissionError{EN: "Archive access locked. You must share files to reach contributor status.", ZH: "归档访问已锁定。您必须通过分享文件来获得贡献者身份。"}
+	// errMsgAccessLocked       = UserPermissionError{EN: "Archive access locked. You must share files to reach contributor status.", ZH: "归档访问已锁定。您必须通过分享文件来获得贡献者身份。"}
 	errMsgContributorsLocked = UserPermissionError{
 		EN: "%s is only available to contributors who have uploaded at least %d bytes: upload %d more bytes.",
 		ZH: "文件 %s 仅对已上传至少 %d 字节的贡献者可用：再上传 %d 字节。"}
@@ -465,17 +461,30 @@ func (c Config) Validate() error {
 // Server
 // ============================================================================
 
+type FortuneGenerator struct {
+	fortunes []string
+}
+
+func (f *FortuneGenerator) Random() string {
+	if len(f.fortunes) == 0 {
+		data, _ := embeddedSource.ReadFile("fortunes.txt")
+		f.fortunes = strings.Split(string(data), "\n%\n")
+	}
+	return strings.TrimSpace(f.fortunes[rand.Intn(len(f.fortunes))])
+}
+
 type Server struct {
-	store        *Store
-	logger       *slog.Logger
-	mkdirLimiter *rate.Limiter
-	cfg          Config
-	absUploadDir string
-	listener     net.Listener
-	wg           sync.WaitGroup
-	shutdown     chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
+	store            *Store
+	logger           *slog.Logger
+	mkdirLimiter     *rate.Limiter
+	fortuneGenerator *FortuneGenerator
+	cfg              Config
+	absUploadDir     string
+	listener         net.Listener
+	wg               sync.WaitGroup
+	shutdown         chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -500,14 +509,15 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &Server{
-		store:        store,
-		logger:       logger,
-		mkdirLimiter: rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1),
-		cfg:          cfg,
-		absUploadDir: absDir,
-		shutdown:     make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
+		store:            store,
+		logger:           logger,
+		mkdirLimiter:     rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1),
+		fortuneGenerator: &FortuneGenerator{},
+		cfg:              cfg,
+		absUploadDir:     absDir,
+		shutdown:         make(chan struct{}),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 
 	if cfg.BootstrapSrc {
@@ -608,7 +618,7 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 
 func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 	banner := ""
-	if data, err := s.readFileWithFallback(s.cfg.BannerFile, s.cfg.BannerFile); err == nil {
+	if data, err := os.ReadFile(s.cfg.BannerFile); err == nil {
 		banner = string(data)
 	} else {
 		banner = fmt.Sprintf("=== %s v%s ===", s.cfg.Name, AppVersion)
@@ -677,12 +687,7 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 }
 
 func (s *Server) getRandomFortune() string {
-	data, _ := embeddedSource.ReadFile("fortunes.txt")
-	fortunes := strings.Split(string(data), "\n%\n")
-	if len(fortunes) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(fortunes[rand.Intn(len(fortunes))])
+	return s.fortuneGenerator.Random()
 }
 
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
@@ -807,19 +812,19 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	isContributor, remainingBytes := stats.IsContributor(h.srv.cfg.ContributorThreshold)
 
 	if isUnrestricted {
-		if rel == h.srv.sourceFileName() {
-			if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
-				return bytes.NewReader(data), nil
-			}
-		}
+		// if rel == h.srv.sourceFileName() {
+		// 	if data, err := h.srv.readFileWithFallback(rel, sourceFile); err == nil {
+		// 		return bytes.NewReader(data), nil
+		// 	}
+		// }
 
 		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
 			return os.Open(full)
 		}
 
-		if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
-			return bytes.NewReader(data), nil
-		}
+		// if data, err := h.srv.readFileWithFallback(rel, rel); err == nil {
+		// 	return bytes.NewReader(data), nil
+		// }
 		return nil, os.ErrNotExist
 	}
 
@@ -906,34 +911,34 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	if r.Method == "List" {
 		entries, _ := os.ReadDir(full)
 		var files []os.FileInfo
-		seen := make(map[string]bool)
+		// seen := make(map[string]bool)
 
 		for _, e := range entries {
 			fi, _ := e.Info()
 			name := e.Name()
 			owner, _ := h.srv.store.GetFileOwner(path.Join(rel, name))
 			files = append(files, &sftpFile{FileInfo: fi, owner: owner})
-			seen[name] = true
+			// seen[name] = true
 		}
 
-		if rel == "." {
-			srcName := h.srv.sourceFileName()
-			if !seen[srcName] {
-				data, _ := h.srv.readFileWithFallback(srcName, sourceFile)
-				files = append(files, &virtualFileInfo{name: srcName, size: int64(len(data))})
-				seen[srcName] = true
-			}
+		// if rel == "." {
+		// 	srcName := h.srv.sourceFileName()
+		// 	if !seen[srcName] {
+		// 		data, _ := h.srv.readFileWithFallback(srcName, sourceFile)
+		// 		files = append(files, &virtualFileInfo{name: srcName, size: int64(len(data))})
+		// 		seen[srcName] = true
+		// 	}
 
-			for f := range h.srv.cfg.unrestrictedMap {
-				if seen[f] {
-					continue
-				}
-				if data, err := h.srv.readFileWithFallback(f, f); err == nil {
-					files = append(files, &virtualFileInfo{name: f, size: int64(len(data))})
-					seen[f] = true
-				}
-			}
-		}
+		// 	for f := range h.srv.cfg.unrestrictedMap {
+		// 		if seen[f] {
+		// 			continue
+		// 		}
+		// 		if data, err := h.srv.readFileWithFallback(f, f); err == nil {
+		// 			files = append(files, &virtualFileInfo{name: f, size: int64(len(data))})
+		// 			seen[f] = true
+		// 		}
+		// 	}
+		// }
 		return listerAt(files), nil
 	}
 
