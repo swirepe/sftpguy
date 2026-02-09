@@ -325,6 +325,15 @@ func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) erro
 		if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, relPath); err != nil {
 			return err
 		}
+		if delta > 0 {
+			if _, err := tx.Exec(`
+				UPDATE users 
+				SET upload_count = upload_count + 1, 
+				    upload_bytes = upload_bytes + ? 
+				WHERE pubkey_hash = ?`, delta, hash); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -335,8 +344,14 @@ func (s *Store) RecordDownload(hash string, bytes int64) error {
 }
 
 func (s *Store) RenamePath(oldRel, newRel string) error {
-	_, err := s.db.Exec(`UPDATE files SET path = ? || substr(path, length(?) + 1) WHERE path = ? OR path LIKE ?`,
-		newRel, oldRel, oldRel, oldRel+"/%")
+	prefixLen := len(oldRel) + 1 // "oldRel" + "/"
+
+	_, err := s.db.Exec(`
+		UPDATE files 
+		SET path = ? || substr(path, ?)
+		WHERE path = ? OR substr(path, 1, ?) = ?`,
+		newRel, prefixLen+1,
+		oldRel, prefixLen, oldRel+"/")
 	return err
 }
 
@@ -443,8 +458,6 @@ func LoadConfig() (Config, error) {
 			cfg.unrestrictedMap[p] = true
 		}
 	}
-	// Source code is always unrestricted
-	cfg.unrestrictedMap[fmt.Sprintf("%s-v%s.go", cfg.Name, AppVersion)] = true
 
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("configuration validation failed: %w", err)
@@ -564,6 +577,7 @@ func (s *Server) bootstrapSource() error {
 		return err
 	}
 	s.store.db.Exec("INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, ?, 0)", s.sourceFileName(), systemOwner, len(srcData))
+	s.cfg.unrestrictedMap[s.sourceFileName()] = true
 
 	// Copy fortunes.txt
 	fData, err := embeddedSource.ReadFile("fortunes.txt")
@@ -829,51 +843,6 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 	return meta, nil
 }
 
-func (h *fsHandler) canRead(meta *pathMeta) error {
-	if meta.isUnrestricted {
-		return nil
-	}
-
-	status, err := h.srv.UserStatus(h.pubHash)
-	if err != nil {
-		return err
-	}
-
-	if !status.IsContributor {
-		return h.deny(errMsgContributorsLocked.Args(meta.rel, h.srv.cfg.ContributorThreshold, status.BytesNeeded),
-			"path", meta.rel, "uploaded", status.Stats.UploadBytes)
-	}
-
-	return nil
-}
-
-func (h *fsHandler) canModify(meta *pathMeta) error {
-	if meta.isUnrestricted {
-		return h.deny(errMsgFileProtected.Args(meta.rel))
-	}
-
-	// If the file/dir doesn't exist yet, there are no ownership
-	// restrictions on the target itself (directory rules still apply later).
-	if !meta.exists {
-		return nil
-	}
-
-	// Orphaned files on disk (exists=true, owner="") are treated as system files.
-	effectiveOwner := meta.owner
-	if effectiveOwner == "" {
-		effectiveOwner = systemOwner
-	}
-
-	if effectiveOwner != h.pubHash {
-		if effectiveOwner == systemOwner {
-			return h.deny(errMsgFileProtected.Args(meta.rel))
-		}
-		return h.deny(errMsgFilenameClaimed, "path", meta.rel)
-	}
-
-	return nil
-}
-
 func (h *fsHandler) prepareDirectory(rel string) error {
 	if rel == "." || rel == "" {
 		return nil
@@ -943,12 +912,10 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, err
 	}
 
-	// 1. Permission Check
 	if err := h.canRead(meta); err != nil {
 		return nil, err
 	}
 
-	// 2. Existence/Type Check
 	fi, err := os.Stat(meta.full)
 	if err != nil {
 		return nil, os.ErrNotExist
@@ -957,38 +924,50 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, sftp.ErrSSHFxNoSuchFile
 	}
 
-	// 3. Logging and Records
 	h.logger.Info("file download", "path", meta.rel, "size", fi.Size())
 	h.srv.store.RecordDownload(h.pubHash, fi.Size())
 
 	return os.Open(meta.full)
 }
 
+func (h *fsHandler) canRead(meta *pathMeta) error {
+	if meta.isUnrestricted {
+		return nil
+	}
+
+	status, err := h.srv.UserStatus(h.pubHash)
+	if err != nil {
+		return err
+	}
+
+	if !status.IsContributor {
+		return h.deny(errMsgContributorsLocked.Args(meta.rel, h.srv.cfg.ContributorThreshold, status.BytesNeeded),
+			"path", meta.rel, "uploaded", status.Stats.UploadBytes)
+	}
+
+	return nil
+}
+
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	h.logger.Debug("Filewrite", "method", r.Method, "path", r.Filepath)
 
-	// 1. Identity of the target file
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
 	}
 
-	// 2. Authorization (Check ownership/orphans/system protection)
 	if err := h.canModify(meta); err != nil {
 		return nil, err
 	}
 
-	// 3. Prepare the Container (Parent Directory)
 	if err := h.prepareDirectory(path.Dir(meta.rel)); err != nil {
 		return nil, err
 	}
 
-	// 4. Database Claim
 	if err := h.srv.store.ClaimFile(h.pubHash, meta.rel); err != nil {
 		return nil, h.deny(errMsgFilenameClaimed, "path", meta.rel)
 	}
 
-	// 5. IO Handle
 	flags := os.O_RDWR | os.O_CREATE
 	if !r.Pflags().Append {
 		flags |= os.O_TRUNC
@@ -1005,6 +984,33 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 
 	return &statWriter{File: f, h: h, rel: meta.rel, oldSize: oldSize}, nil
+}
+
+func (h *fsHandler) canModify(meta *pathMeta) error {
+	if meta.isUnrestricted {
+		return h.deny(errMsgFileProtected.Args(meta.rel))
+	}
+
+	// If the file/dir doesn't exist yet, there are no ownership
+	// restrictions on the target itself (directory rules still apply later).
+	if !meta.exists {
+		return nil
+	}
+
+	// Orphaned files on disk (exists=true, owner="") are treated as system files.
+	effectiveOwner := meta.owner
+	if effectiveOwner == "" {
+		effectiveOwner = systemOwner
+	}
+
+	if effectiveOwner != h.pubHash {
+		if effectiveOwner == systemOwner {
+			return h.deny(errMsgFileProtected.Args(meta.rel))
+		}
+		return h.deny(errMsgFilenameClaimed, "path", meta.rel)
+	}
+
+	return nil
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
