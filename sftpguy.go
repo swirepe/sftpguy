@@ -132,6 +132,13 @@ type UserPermissionError struct {
 	args []any
 }
 
+func (e UserPermissionError) LogString() string {
+	if len(e.args) > 0 {
+		return fmt.Sprintf(e.EN, e.args...)
+	}
+	return e.EN
+}
+
 func (e UserPermissionError) Args(args ...any) UserPermissionError {
 	e.args = args
 	return e
@@ -160,8 +167,12 @@ var (
 	errMsgFileProtected    = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
 	errMsgCannotWriteToDir = UserPermissionError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
 	errMsgFilenameClaimed  = UserPermissionError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
-	errMsgNoPermissionDel  = UserPermissionError{EN: "You do not have permission to delete this.", ZH: "您没有删除此项的权限。"}
-	errMsgNotOwner         = UserPermissionError{EN: "You do not own the source file or directory.", ZH: "您不是源文件或目录的所有者。"}
+	errMsgNoPermissionDel  = UserPermissionError{
+		EN: "You do not have permission to delete this. (%s UID [owner] %d != [you] %d)",
+		ZH: "您没有删除此项的权限。(%s UID [所有者] %d != [你] %d)"}
+	errMsgNotOwner = UserPermissionError{
+		EN: "You do not own the source file or directory. (UID [owner] %d != [you] %d)",
+		ZH: "您不是源文件或目录的所有者。(UID [所有者] %d != [你] %d)"}
 	errMsgRenameFailed     = UserPermissionError{EN: "Rename failed.", ZH: "重命名失败。"}
 	errMsgMkdirRateLimit   = UserPermissionError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
 	errMsgMaxDirsReached   = UserPermissionError{EN: "Maximum directory limit reached for this archive.", ZH: "已达到此归档的最大目录限制。"}
@@ -738,14 +749,6 @@ func (s *Server) ensureHostKey() error {
 	return pem.Encode(keyFile, pemBlock)
 }
 
-// func (s *Server) readFileWithFallback(relPath, embeddedPath string) ([]byte, error) {
-// 	physicalPath := filepath.Join(s.absUploadDir, relPath)
-// 	if data, err := os.ReadFile(physicalPath); err == nil {
-// 		return data, nil
-// 	}
-// 	return embeddedSource.ReadFile(embeddedPath)
-// }
-
 func (s *Server) reconcileOrphans() {
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == s.absUploadDir {
@@ -779,7 +782,7 @@ type fsHandler struct {
 
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	logArgs := make([]any, 0, 2+len(args))
-	logArgs = append(logArgs, "reason", err.EN)
+	logArgs = append(logArgs, "reason", err.LogString())
 	logArgs = append(logArgs, args...)
 
 	h.logger.Info("permission denied", logArgs...)
@@ -942,7 +945,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	case "Remove", "Rmdir":
 		owner, _ := h.srv.store.GetFileOwner(rel)
 		if owner != "" && owner != h.pubHash {
-			return h.deny(errMsgNoPermissionDel, "path", rel, "owner", shortID(owner))
+			return h.deny(errMsgNoPermissionDel.Args(rel, hashToUid(owner), hashToUid(h.pubHash)), "path", rel, "owner", shortID(owner))
 		}
 		if h.srv.cfg.unrestrictedMap[rel] {
 			return h.deny(errMsgFileProtected.Args(rel), "path", rel)
@@ -956,7 +959,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		}
 		owner, _ := h.srv.store.GetFileOwner(rel)
 		if owner != "" && owner != h.pubHash {
-			return h.deny(errMsgNotOwner, "path", rel)
+			return h.deny(errMsgNotOwner.Args(rel, hashToUid(owner), hashToUid(h.pubHash)), "path", rel)
 		}
 		if h.srv.cfg.unrestrictedMap[relTgt] {
 			return h.deny(errMsgFileProtected.Args(relTgt), "path", relTgt)
