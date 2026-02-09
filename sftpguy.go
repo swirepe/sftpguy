@@ -265,10 +265,15 @@ func (s *Store) RegisterFile(path, owner string, size int64, isDir bool) {
 	        VALUES (?, ?, ?, ?)`, path, owner, size, isDirVal)
 }
 
-func (s *Store) RegisterSystemFiles(paths []string) {
+func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
 	for _, p := range paths {
-		// Register as system-owned, 0 size (until scanned), not a directory
-		s.RegisterFile(p, systemOwner, 0, false)
+		full := filepath.Join(absBase, filepath.FromSlash(p))
+		isDir := false
+		if fi, err := os.Stat(full); err == nil {
+			isDir = fi.IsDir()
+		}
+		// Register as system-owned
+		s.RegisterFile(p, systemOwner, 0, isDir)
 	}
 }
 
@@ -315,15 +320,18 @@ func (s *Store) ClaimFile(hash, relPath string) error {
 		err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
 
 		if err == sql.ErrNoRows {
-			if _, err := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash); err != nil {
-				return err
-			}
+			_, insertErr := tx.Exec("INSERT INTO files (path, owner_hash, size, is_dir) VALUES (?, ?, 0, 0)", relPath, hash)
+			return insertErr
+		}
+
+		if err != nil {
 			return err
 		}
 
 		if owner != hash {
 			return fmt.Errorf("claimed")
 		}
+
 		return nil
 	})
 }
@@ -566,17 +574,17 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		return nil, fmt.Errorf("failed to init store: %w", err)
 	}
 
-	var sysFiles []string
-	for f := range cfg.unrestrictedMap {
-		sysFiles = append(sysFiles, f)
-	}
-	store.RegisterSystemFiles(sysFiles)
-
 	absDir, err := filepath.Abs(cfg.UploadDir)
 	if err != nil {
 		return nil, err
 	}
 	os.MkdirAll(absDir, permDir)
+
+	var sysFiles []string
+	for f := range cfg.unrestrictedMap {
+		sysFiles = append(sysFiles, f)
+	}
+	store.RegisterSystemFiles(absDir, sysFiles)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &Server{
@@ -788,7 +796,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	} else if stats.UploadCount > 0 {
 		fmt.Fprintf(w, green.Fmt("Share %d more bytes to unlock downloads.\r\n"), needed)
 	} else {
-		fmt.Fprint(w, red.Bold("Downloads are restricted to system files.\r\n"))
+		fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
 	}
 	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %d bytes",
 		userLabel, stats.LastLogin, stats.UploadCount, stats.UploadBytes)
@@ -859,7 +867,6 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 		isUnrestricted: h.checkUnrestricted(rel),
 	}
 
-	// Single DB hit for ownership and existence
 	err = h.srv.store.db.QueryRow("SELECT owner_hash, is_dir FROM files WHERE path = ?", rel).
 		Scan(&meta.owner, &meta.isDir)
 
@@ -1032,26 +1039,15 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 }
 
 func (h *fsHandler) canModify(meta *pathMeta) error {
-	if meta.isUnrestricted {
-		return h.deny(errMsgFileProtected.Args(meta.rel))
-	}
-
-	// If the file/dir doesn't exist yet, there are no ownership
-	// restrictions on the target itself (directory rules still apply later).
-	if !meta.exists {
+	if !meta.exists || meta.owner == "" {
 		return nil
 	}
 
-	// Orphaned files on disk (exists=true, owner="") are treated as system files.
-	effectiveOwner := meta.owner
-	if effectiveOwner == "" {
-		effectiveOwner = systemOwner
+	if meta.owner == systemOwner {
+		return h.deny(errMsgFileProtected.Args(meta.rel))
 	}
 
-	if effectiveOwner != h.pubHash {
-		if effectiveOwner == systemOwner {
-			return h.deny(errMsgFileProtected.Args(meta.rel))
-		}
+	if meta.owner != h.pubHash {
 		return h.deny(errMsgFilenameClaimed, "path", meta.rel)
 	}
 
@@ -1121,11 +1117,12 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		if err := h.canModify(meta); err != nil {
 			return err
 		}
-		if targetMeta.isUnrestricted {
-			return h.deny(errMsgFileProtected, targetMeta.rel)
+		if err := h.canModify(targetMeta); err != nil {
+			return err
 		}
 
 		if err := os.Rename(meta.full, targetMeta.full); err != nil {
+			h.logger.Error("rename rename error", "from", meta.rel, "to", targetMeta.rel, "err", err)
 			return h.deny(errMsgRenameFailed)
 		}
 		return h.srv.store.RenamePath(meta.rel, targetMeta.rel)
@@ -1323,8 +1320,10 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
 
 	logger.Info("configuration",
+		"name", cfg.Name,
 		"version", AppVersion,
 		"port", cfg.Port,
+		"upload_path", cfg.UploadDir,
 		"max_dirs", cfg.MaxDirs,
 		"contributor_threshold", cfg.ContributorThreshold,
 		"unrestricted", cfg.Unrestricted,
