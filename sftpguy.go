@@ -870,47 +870,21 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 
 	// Use Lstat so we don't follow symlinks to the host filesystem
 	fi, err := os.Lstat(full)
-	if err == nil {
-		mode := fi.Mode()
-
-		if mode.IsDir() {
-			meta.isDir = true
-		} else if !mode.IsRegular() {
-			return nil, h.deny(errMsgSymlinksProhibited, "path", rel, "type", mode.String())
-		}
-
-		meta.exists = true
+	if err != nil {
+		return nil, err
 	}
+	mode := fi.Mode()
+
+	if mode.IsDir() {
+		meta.isDir = true
+	} else if !mode.IsRegular() {
+		return nil, h.deny(errMsgSymlinksProhibited, "path", rel, "type", mode.String())
+	}
+
+	meta.exists = true
 
 	return meta, nil
 }
-
-// func (h *fsHandler) examine(p string) (*pathMeta, error) {
-// 	rel, full, err := h.resolve(p)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	meta := &pathMeta{
-// 		rel:            rel,
-// 		full:           full,
-// 		isUnrestricted: h.checkUnrestricted(rel),
-// 	}
-
-// 	err = h.srv.store.db.QueryRow("SELECT owner_hash, is_dir FROM files WHERE path = ?", rel).
-// 		Scan(&meta.owner, &meta.isDir)
-
-// 	if err == nil {
-// 		meta.exists = true
-// 	} else if err == sql.ErrNoRows {
-// 		// Check filesystem if not in DB (orphans or new files)
-// 		if fi, err := os.Stat(full); err == nil {
-// 			meta.exists = true
-// 			meta.isDir = fi.IsDir()
-// 		}
-// 	}
-// 	return meta, nil
-// }
 
 func (h *fsHandler) checkUnrestricted(rel string) bool {
 	if h.srv.cfg.unrestrictedMap[rel] || h.srv.cfg.unrestrictedMap[rel+"/"] {
