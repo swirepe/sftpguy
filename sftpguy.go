@@ -26,6 +26,8 @@ SOFTWARE.
 */
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
@@ -33,6 +35,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -300,6 +303,7 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 func (s *Store) UpsertUserSession(hash string) (userStats, error) {
 	stats, err := s.GetUserStats(hash)
 	if err != nil {
+		s.logger.Debug("Error upserting user session", "err", err)
 		return userStats{}, err
 	}
 
@@ -796,8 +800,9 @@ const firstTimeBanner = `
 ┗┻┛┗━╸┗━╸┗━╸┗━┛╹ ╹┗━╸`
 
 const firstTimeMessage = `%s
-This is your first time visiting.
-This is a share-first archive. Upload at least %s to unlock all downloads.
+* You are %s
+* This is your first time visiting.
+* This is a share-first archive. Upload at least %s to unlock all downloads.
 `
 
 const contributorBanner = `
@@ -807,9 +812,11 @@ const contributorBanner = `
 
 const contributorMessage = `%s
 %s
+* Welcome back, %s
 `
 
-func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
+func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
+	w := bufio.NewWriter(wUnbuf)
 	uid := hashToUid(hash)
 	userLabel := fmt.Sprintf("anonymous-%d", uid)
 	isContributor, needed := stats.IsContributor(s.cfg.ContributorThreshold)
@@ -818,16 +825,15 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	welcomeMsg := ""
 	if stats.FirstTimer {
 		color = magenta
-		welcomeMsg = fmt.Sprintf(firstTimeMessage, color.Bold(firstTimeBanner), yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
+		welcomeMsg = fmt.Sprintf(firstTimeMessage, color.Bold(firstTimeBanner), color.Fmt(userLabel), yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
 	} else if isContributor {
 		color = yellow
-		welcomeMsg = fmt.Sprintf(contributorMessage, color.Bold(contributorBanner), color.Italic(s.getRandomFortune()))
+		welcomeMsg = fmt.Sprintf(contributorMessage, color.Bold(contributorBanner), color.Fmt(userLabel), color.Italic(s.getRandomFortune()))
 	} else {
 		welcomeMsg = fmt.Sprintf("\r\nWelcome, %s\r\n", color.Bold(userLabel))
 	}
 
 	fmt.Fprintf(w, welcomeMsg)
-	fmt.Fprintf(w, "* You have been identified by your public key as %s.\r\n", color.Bold(userLabel))
 	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
 
 	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
@@ -837,18 +843,20 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	fmt.Fprintln(w, "* You may always modify or delete files or directories you have created.")
 
 	files, err := s.store.FilesByOwner(hash)
+
 	if err == nil && len(files) > 0 {
-		fmt.Fprintln(w, "Your files:")
-		numDirs := 0
+		var buffer bytes.Buffer
+		var NumDirectories = 0
 		for _, f := range files {
 			if strings.HasSuffix(f, "/") {
-				numDirs += 1
-				fmt.Fprintln(w, "  "+bold.Fmt(f))
+				NumDirectories += 1
+				buffer.WriteString("   " + underline.Fmt(f) + "\r\n")
 			} else {
-				fmt.Fprintf(w, "  %-20s\r\n", f)
+				buffer.WriteString(fmt.Sprintf("   %-20s\r\n", f))
 			}
 		}
-		fmt.Fprintf(w, "%d files, %d directories\n", len(files)-numDirs, numDirs)
+		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-NumDirectories, NumDirectories)
+		fmt.Fprintln(w, buffer.String())
 	}
 
 	if isContributor {
@@ -869,6 +877,7 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 		fmt.Fprintf(w, " | Downloaded: %d files, %s", stats.DownloadCount, formatBytes(stats.DownloadBytes))
 	}
 	fmt.Fprintf(w, "\r\n")
+	w.Flush()
 }
 
 func (s *Server) ensureHostKey() error {
@@ -1248,12 +1257,24 @@ func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	return sw.File.WriteAt(p, off)
 }
 
+func (sw *statWriter) reportUserStatus(pubHash string) {
+	userStats, err := sw.h.srv.store.GetUserStats(pubHash)
+	if err != nil {
+		return
+	}
+	isContributor, remaining := userStats.IsContributor(sw.h.srv.cfg.ContributorThreshold)
+	if !isContributor {
+		fmt.Fprintf(sw.h.stderr, "Upload %s more bytes to unlock downloads.\r\n", formatBytes(remaining))
+	}
+}
+
 func (sw *statWriter) Close() error {
 	fi, _ := sw.File.Stat()
 	size := fi.Size()
 	delta := size - sw.oldSize
 	sw.h.logger.Info("file write closed", "path", sw.rel, "final_size", size, "delta", delta)
 	sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.rel, size, delta)
+	sw.reportUserStatus(sw.h.pubHash)
 	return sw.File.Close()
 }
 
@@ -1294,22 +1315,33 @@ func (l listerAt) ListAt(ls []os.FileInfo, off int64) (int, error) {
 type asciiStyle string
 
 const (
-	asciiReset            = "\033[0m"
-	bold       asciiStyle = "1"
-	red        asciiStyle = "31"
-	green      asciiStyle = "32"
-	yellow     asciiStyle = "33"
-	blue       asciiStyle = "34"
-	magenta    asciiStyle = "35"
-	gray       asciiStyle = "90"
+	asciiReset              = "\033[0m"
+	bold         asciiStyle = "1"
+	underline    asciiStyle = "4"
+	red          asciiStyle = "31"
+	green        asciiStyle = "32"
+	yellow       asciiStyle = "33"
+	blue         asciiStyle = "34"
+	magenta      asciiStyle = "35"
+	cyan         asciiStyle = "36"
+	lightGray    asciiStyle = "37"
+	darkGray     asciiStyle = "90"
+	lightRed     asciiStyle = "91"
+	lightGreen   asciiStyle = "92"
+	lightYellow  asciiStyle = "93"
+	lightBlue    asciiStyle = "94"
+	lightMagenta asciiStyle = "95"
+	lightCyan    asciiStyle = "96"
+	white        asciiStyle = "97"
 )
 
 func (s asciiStyle) apply(str, mode string) string {
 	return fmt.Sprintf("\033[%s;%sm%s%s", mode, s, str, asciiReset)
 }
-func (s asciiStyle) Fmt(str string) string    { return s.apply(str, "0") }
-func (s asciiStyle) Bold(str string) string   { return s.apply(str, "1") }
-func (s asciiStyle) Italic(str string) string { return s.apply(str, "3") }
+func (s asciiStyle) Fmt(str string) string       { return s.apply(str, "0") }
+func (s asciiStyle) Bold(str string) string      { return s.apply(str, "1") }
+func (s asciiStyle) Italic(str string) string    { return s.apply(str, "3") }
+func (s asciiStyle) Underline(str string) string { return s.apply(str, "4") }
 
 // ============================================================================
 // Utilities
@@ -1458,29 +1490,114 @@ func (m *MultiLogHandler) WithGroup(name string) slog.Handler {
 	return &MultiLogHandler{handlers: newHandlers}
 }
 
-func newConsoleHandler(lvl slog.Level) slog.Handler {
-	return slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: lvl,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			// Colorize the level value
-			if a.Key == slog.LevelKey {
-				level := a.Value.Any().(slog.Level)
-				var coloredLevel string
-				switch {
-				case level >= slog.LevelError:
-					coloredLevel = red.Bold(level.String())
-				case level >= slog.LevelWarn:
-					coloredLevel = yellow.Fmt(level.String())
-				case level >= slog.LevelInfo:
-					coloredLevel = blue.Fmt(level.String())
-				default:
-					coloredLevel = gray.Fmt(level.String())
-				}
-				return slog.Attr{Key: a.Key, Value: slog.StringValue(coloredLevel)}
-			}
+type PrettyHandler struct {
+	h slog.Handler
+	b *bytes.Buffer
+	m *sync.Mutex
+}
+
+func (h *PrettyHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.h.Enabled(ctx, level)
+}
+
+func (h *PrettyHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &PrettyHandler{h: h.h.WithAttrs(attrs), b: h.b, m: h.m}
+}
+
+func (h *PrettyHandler) WithGroup(name string) slog.Handler {
+	return &PrettyHandler{h: h.h.WithGroup(name), b: h.b, m: h.m}
+}
+
+const (
+	// timeFormat = "[2006-01-02 15:04:05.000]"
+	timeFormat = "[15:04:05.000]"
+)
+
+func (h *PrettyHandler) Handle(ctx context.Context, r slog.Record) error {
+	level := r.Level.String() + ":"
+
+	switch r.Level {
+	case slog.LevelDebug:
+		level = lightGray.Fmt(level)
+	case slog.LevelInfo:
+		level = cyan.Fmt(level)
+	case slog.LevelWarn:
+		level = lightYellow.Fmt(level)
+	case slog.LevelError:
+		level = lightRed.Fmt(level)
+	}
+
+	attrs, err := h.computeAttrs(ctx, r)
+	if err != nil {
+		return err
+	}
+
+	bytes, err := json.MarshalIndent(attrs, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error when marshaling attrs: %w", err)
+	}
+
+	fmt.Println(
+		lightGray.Fmt(r.Time.Format(timeFormat)),
+		level,
+		white.Fmt(r.Message),
+		darkGray.Fmt(string(bytes)),
+	)
+
+	return nil
+}
+
+func (h *PrettyHandler) computeAttrs(
+	ctx context.Context,
+	r slog.Record,
+) (map[string]any, error) {
+	h.m.Lock()
+	defer func() {
+		h.b.Reset()
+		h.m.Unlock()
+	}()
+	if err := h.h.Handle(ctx, r); err != nil {
+		return nil, fmt.Errorf("error when calling inner handler's Handle: %w", err)
+	}
+
+	var attrs map[string]any
+	err := json.Unmarshal(h.b.Bytes(), &attrs)
+	if err != nil {
+		return nil, fmt.Errorf("error when unmarshaling inner handler's Handle result: %w", err)
+	}
+	return attrs, nil
+}
+
+func suppressDefaults(
+	next func([]string, slog.Attr) slog.Attr,
+) func([]string, slog.Attr) slog.Attr {
+	return func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey ||
+			a.Key == slog.LevelKey ||
+			a.Key == slog.MessageKey {
+			return slog.Attr{}
+		}
+		if next == nil {
 			return a
-		},
-	})
+		}
+		return next(groups, a)
+	}
+}
+
+func newConsoleHandler(opts *slog.HandlerOptions) *PrettyHandler {
+	if opts == nil {
+		opts = &slog.HandlerOptions{}
+	}
+	b := &bytes.Buffer{}
+	return &PrettyHandler{
+		b: b,
+		h: slog.NewJSONHandler(b, &slog.HandlerOptions{
+			Level:       opts.Level,
+			AddSource:   opts.AddSource,
+			ReplaceAttr: suppressDefaults(opts.ReplaceAttr),
+		}),
+		m: &sync.Mutex{},
+	}
 }
 
 func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
@@ -1494,7 +1611,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
 	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: lvl})
-	consoleHandler := newConsoleHandler(lvl)
+	consoleHandler := newConsoleHandler(&slog.HandlerOptions{Level: lvl})
 	// logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
 	logger := slog.New(&MultiLogHandler{
 		handlers: []slog.Handler{fileHandler, consoleHandler},
