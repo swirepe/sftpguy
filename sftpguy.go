@@ -272,6 +272,8 @@ func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
 		isDir := false
 		if fi, err := os.Stat(full); err == nil {
 			isDir = fi.IsDir()
+		} else {
+			s.logger.Warn("Registering a path that does not exist on disk.  Nobody will be able to upload to this path.", "path", p, "err", err)
 		}
 		// Register as system-owned
 		s.RegisterFile(p, systemOwner, 0, isDir)
