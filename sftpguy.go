@@ -135,30 +135,24 @@ type UserPermissionError struct {
 	args []any
 }
 
-func (e UserPermissionError) LogString() string {
-	if len(e.args) > 0 {
-		return fmt.Sprintf(e.EN, e.args...)
-	}
-	return e.EN
-}
-
 func (e UserPermissionError) Args(args ...any) UserPermissionError {
 	e.args = args
 	return e
 }
 
-func (e UserPermissionError) Error() string {
-	en := e.EN
-	zh := e.ZH
-
+func (e UserPermissionError) format(tmpl string) string {
 	if len(e.args) > 0 {
-		en = fmt.Sprintf(e.EN, e.args...)
-		zh = fmt.Sprintf(e.ZH, e.args...)
+		return fmt.Sprintf(tmpl, e.args...)
 	}
+	return tmpl
+}
 
+func (e UserPermissionError) LogString() string { return e.format(e.EN) }
+
+func (e UserPermissionError) Error() string {
 	return fmt.Sprintf("%s%s\n%s%s",
-		errorPrefix.EN, en,
-		errorPrefix.ZH, zh)
+		errorPrefix.EN, e.format(e.EN),
+		errorPrefix.ZH, e.format(e.ZH))
 }
 
 var (
@@ -707,7 +701,14 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	stats, _ := s.store.UpsertUserSession(pubHash)
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 
-	s.logger.Info("login", "user", shortID(pubHash), "addr", sConn.RemoteAddr())
+	logger := s.logger.With(slog.Group("user",
+		"id", shortID(pubHash),
+		"uid", hashToUid(pubHash),
+		"session", sessionID[:16],
+		"remote_address", sConn.RemoteAddr(),
+	))
+
+	logger.Info("login")
 	go ssh.DiscardRequests(reqs)
 
 	for newCh := range chans {
@@ -717,11 +718,11 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn)
+		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger)
 	}
 }
 
-func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn) {
+func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn, logger *slog.Logger) {
 	defer ch.Close()
 	for req := range reqs {
 		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
@@ -729,18 +730,10 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 			s.Welcome(ch.Stderr(), pubHash, stats)
 
 			handler := &fsHandler{
-				srv:       s,
-				pubHash:   pubHash,
-				stderr:    ch.Stderr(),
-				sessionID: sessionID,
-				logger: *s.logger.With(
-					slog.Group("user",
-						"id", shortID(pubHash),
-						"uid", hashToUid(pubHash),
-						"session", sessionID[:16],
-						"remote_address", sConn.RemoteAddr(),
-					),
-				),
+				srv:     s,
+				pubHash: pubHash,
+				stderr:  ch.Stderr(),
+				logger:  *logger,
 			}
 			server := sftp.NewRequestServer(ch, sftp.Handlers{
 				FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
@@ -778,15 +771,14 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	if isContributor {
 		fmt.Fprintln(w, color.Bold("* Contributor status unlocked!"))
 		fmt.Fprintln(w, color.Italic(s.getRandomFortune()))
-	} else if stats.UploadCount > 0 {
-		fmt.Fprintf(w, magenta.Bold("Share %d more bytes (%s) to unlock downloads.\r\n"), needed, formatBytes(needed))
 	} else {
 		fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
+		fmt.Fprintf(w, magenta.Bold("Share %s more to unlock all downloads.\r\n"), formatBytes(needed))
 	}
 	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %s",
 		userLabel, stats.LastLogin, stats.UploadCount, formatBytes(stats.UploadBytes))
 	if stats.DownloadCount > 0 {
-		fmt.Fprintf(w, " |  Downloaded: %d files, %d bytes", stats.DownloadCount, stats.DownloadBytes)
+		fmt.Fprintf(w, " | Downloaded: %d files, %s", stats.DownloadCount, formatBytes(stats.DownloadBytes))
 	}
 	fmt.Fprintf(w, "\r\n")
 }
@@ -834,11 +826,10 @@ func (s *Server) reconcileOrphans() {
 // ============================================================================
 
 type fsHandler struct {
-	srv       *Server
-	pubHash   string
-	sessionID string
-	stderr    io.Writer
-	logger    slog.Logger
+	srv     *Server
+	pubHash string
+	stderr  io.Writer
+	logger  slog.Logger
 }
 
 type pathMeta struct {
@@ -848,43 +839,71 @@ type pathMeta struct {
 	exists         bool
 	isDir          bool
 	isUnrestricted bool
+	fi             os.FileInfo
 }
 
 func (h *fsHandler) examine(p string) (*pathMeta, error) {
-	rel, full, err := h.resolve(p)
-	if err != nil {
-		return nil, err
+	virt := path.Clean("/" + p)
+	rel := strings.TrimPrefix(virt, "/")
+	if rel == "" {
+		rel = "."
 	}
 
-	owner, err := h.srv.store.GetFileOwner(rel)
-	if err != nil {
-		return nil, err
+	full := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+	if !strings.HasPrefix(full, h.srv.absUploadDir) {
+		return nil, h.deny(errMsgPathTraversal, p)
 	}
 
+	owner, _ := h.srv.store.GetFileOwner(rel)
 	meta := &pathMeta{
-		rel:            rel,
-		full:           full,
-		owner:          owner,
+		rel: rel, full: full, owner: owner,
 		isUnrestricted: h.checkUnrestricted(rel),
 	}
 
-	// Use Lstat so we don't follow symlinks to the host filesystem
-	fi, err := os.Lstat(full)
-	if err != nil {
-		return nil, err
+	if fi, err := os.Lstat(full); err == nil {
+		if !fi.Mode().IsRegular() && !fi.IsDir() {
+			return nil, h.deny(errMsgSymlinksProhibited, "path", rel)
+		}
+		meta.exists, meta.isDir, meta.fi = true, fi.IsDir(), fi
 	}
-	mode := fi.Mode()
-
-	if mode.IsDir() {
-		meta.isDir = true
-	} else if !mode.IsRegular() {
-		return nil, h.deny(errMsgSymlinksProhibited, "path", rel, "type", mode.String())
-	}
-
-	meta.exists = true
-
 	return meta, nil
 }
+
+// func (h *fsHandler) examine(p string) (*pathMeta, error) {
+// 	rel, full, err := h.resolve(p)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	owner, err := h.srv.store.GetFileOwner(rel)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	meta := &pathMeta{
+// 		rel:            rel,
+// 		full:           full,
+// 		owner:          owner,
+// 		isUnrestricted: h.checkUnrestricted(rel),
+// 	}
+
+// 	// Use Lstat so we don't follow symlinks to the host filesystem
+// 	fi, err := os.Lstat(full)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	mode := fi.Mode()
+
+// 	if mode.IsDir() {
+// 		meta.isDir = true
+// 	} else if !mode.IsRegular() {
+// 		return nil, h.deny(errMsgSymlinksProhibited, "path", rel, "type", mode.String())
+// 	}
+
+// 	meta.exists = true
+
+// 	return meta, nil
+// }
 
 func (h *fsHandler) checkUnrestricted(rel string) bool {
 	if h.srv.cfg.unrestrictedMap[rel] || h.srv.cfg.unrestrictedMap[rel+"/"] {
@@ -953,19 +972,19 @@ func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	return sftp.ErrSSHFxPermissionDenied
 }
 
-func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
-	virt := path.Clean("/" + p)
-	rel = strings.TrimPrefix(virt, "/")
-	if rel == "" {
-		rel = "."
-	}
-	abs := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
+// func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
+// 	virt := path.Clean("/" + p)
+// 	rel = strings.TrimPrefix(virt, "/")
+// 	if rel == "" {
+// 		rel = "."
+// 	}
+// 	abs := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
 
-	if !strings.HasPrefix(abs, h.srv.absUploadDir) {
-		return "", "", h.deny(errMsgPathTraversal, p)
-	}
-	return rel, abs, nil
-}
+// 	if !strings.HasPrefix(abs, h.srv.absUploadDir) {
+// 		return "", "", h.deny(errMsgPathTraversal, p)
+// 	}
+// 	return rel, abs, nil
+// }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	defer h.Trace("fileread", "method", r.Method, "path", r.Filepath)()
@@ -1065,44 +1084,86 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 	return nil
 }
 
+// func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+// 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
+// 	rel, full, err := h.resolve(r.Filepath)
+// 	if err != nil {
+// 		return nil, sftp.ErrSshFxPermissionDenied
+// 	}
+
+// 	if r.Method == "List" {
+// 		entries, _ := os.ReadDir(full)
+// 		var files []os.FileInfo
+
+// 		for _, e := range entries {
+// 			fi, _ := e.Info()
+// 			if fi == nil {
+// 				continue
+// 			}
+// 			name := e.Name()
+// 			relPath := path.Join(rel, name)
+// 			if fi.Mode()&os.ModeSymlink != 0 {
+// 				h.logger.Warn("skipping prohibited symlink in listing", "path", relPath)
+// 				continue
+// 			}
+
+// 			files = append(files, h.newSftpFile(fi, relPath))
+// 		}
+
+// 		return listerAt(files), nil
+// 	}
+
+// 	fi, err := os.Lstat(full)
+// 	if err != nil {
+// 		return nil, os.ErrNotExist
+// 	}
+// 	if fi.Mode()&os.ModeSymlink != 0 {
+// 		return nil, h.deny(errMsgSymlinksProhibited, "path", rel)
+// 	}
+
+// 	return listerAt{h.newSftpFile(fi, rel)}, nil
+// }
+
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
-	rel, full, err := h.resolve(r.Filepath)
+
+	meta, err := h.examine(r.Filepath)
 	if err != nil {
-		return nil, sftp.ErrSshFxPermissionDenied
+		return nil, err
+	}
+	if !meta.exists {
+		return nil, os.ErrNotExist
 	}
 
 	if r.Method == "List" {
-		entries, _ := os.ReadDir(full)
+		if !meta.isDir {
+			return nil, sftp.ErrSSHFxFailure
+		}
+
+		entries, err := os.ReadDir(meta.full)
+		if err != nil {
+			return nil, err
+		}
+
 		var files []os.FileInfo
-
 		for _, e := range entries {
-			fi, _ := e.Info()
-			if fi == nil {
-				continue
-			}
-			name := e.Name()
-			relPath := path.Join(rel, name)
-			if fi.Mode()&os.ModeSymlink != 0 {
-				h.logger.Warn("skipping prohibited symlink in listing", "path", relPath)
+			fi, err := e.Info()
+			if err != nil {
 				continue
 			}
 
+			if !fi.Mode().IsRegular() && !fi.IsDir() {
+				continue
+			}
+
+			relPath := path.Join(meta.rel, e.Name())
 			files = append(files, h.newSftpFile(fi, relPath))
 		}
 
 		return listerAt(files), nil
 	}
 
-	fi, err := os.Lstat(full)
-	if err != nil {
-		return nil, os.ErrNotExist
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, h.deny(errMsgSymlinksProhibited, "path", rel)
-	}
-
-	return listerAt{h.newSftpFile(fi, rel)}, nil
+	return listerAt{h.newSftpFile(meta.fi, meta.rel)}, nil
 }
 
 func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
@@ -1238,17 +1299,12 @@ const (
 	magenta    asciiStyle = "35"
 )
 
-func (s asciiStyle) Fmt(str string) string {
-	return fmt.Sprintf("\033[%sm%s%s", s, str, asciiReset)
+func (s asciiStyle) apply(str, mode string) string {
+	return fmt.Sprintf("\033[%s;%sm%s%s", mode, s, str, asciiReset)
 }
-
-func (s asciiStyle) Bold(str string) string {
-	return fmt.Sprintf("\033[1;%sm%s%s", s, str, asciiReset)
-}
-
-func (s asciiStyle) Italic(str string) string {
-	return fmt.Sprintf("\033[3;%sm%s%s", s, str, asciiReset)
-}
+func (s asciiStyle) Fmt(str string) string    { return s.apply(str, "0") }
+func (s asciiStyle) Bold(str string) string   { return s.apply(str, "1") }
+func (s asciiStyle) Italic(str string) string { return s.apply(str, "3") }
 
 // ============================================================================
 // Utilities
@@ -1305,63 +1361,51 @@ func formatBytes(b int64) string {
 	}
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
-
-func EnvSizeFlag(ptr *int64, name string, env string, def string, usage string) {
-	val, ok := os.LookupEnv(envPrefix + env)
-	if !ok {
-		val, ok = os.LookupEnv(env)
+func getEnv(key string) (string, bool) {
+	if val, ok := os.LookupEnv(envPrefix + key); ok {
+		return val, true
 	}
-	if !ok {
-		val = def
-	}
-
-	intVal, err := parseSize(val)
-	if err != nil {
-		panic(err)
-	}
-
-	flag.Int64Var(ptr, name, intVal, usage)
+	return os.LookupEnv(key)
 }
 
 func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
-	val, ok := os.LookupEnv(envPrefix + env)
-	if !ok {
-		val, ok = os.LookupEnv(env)
-	}
+	val, ok := getEnv(env)
 
 	switch p := any(ptr).(type) {
 	case *string:
+		*p = any(def).(string)
 		if ok {
 			*p = val
-		} else {
-			*p = any(def).(string)
 		}
 		flag.StringVar(p, name, *p, usage)
 	case *int:
+		*p = any(def).(int)
 		if ok {
-			iv, _ := strconv.Atoi(val)
-			*p = iv
-		} else {
-			*p = any(def).(int)
+			*p, _ = strconv.Atoi(val)
 		}
 		flag.IntVar(p, name, *p, usage)
 	case *bool:
+		*p = any(def).(bool)
 		if ok {
-			bv, _ := strconv.ParseBool(val)
-			*p = bv
-		} else {
-			*p = any(def).(bool)
+			*p, _ = strconv.ParseBool(val)
 		}
 		flag.BoolVar(p, name, *p, usage)
 	case *float64:
+		*p = any(def).(float64)
 		if ok {
-			fv, _ := strconv.ParseFloat(val, 64)
-			*p = fv
-		} else {
-			*p = any(def).(float64)
+			*p, _ = strconv.ParseFloat(val, 64)
 		}
 		flag.Float64Var(p, name, *p, usage)
 	}
+}
+
+func EnvSizeFlag(ptr *int64, name string, env string, def string, usage string) {
+	val, ok := getEnv(env)
+	if !ok {
+		val = def
+	}
+	intVal, _ := parseSize(val)
+	flag.Int64Var(ptr, name, intVal, usage)
 }
 
 func shortID(id string) string {
