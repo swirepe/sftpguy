@@ -604,12 +604,6 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 	os.MkdirAll(absDir, permDir)
 
-	var sysFiles []string
-	for f := range cfg.unrestrictedMap {
-		sysFiles = append(sysFiles, f)
-	}
-	store.RegisterSystemFiles(absDir, sysFiles)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := &Server{
 		store:            store,
@@ -871,6 +865,7 @@ func (s *Server) ensureHostKey() error {
 }
 
 func (s *Server) reconcileOrphans() {
+	var sysFiles []string
 	for p := range s.cfg.unrestrictedMap {
 		if strings.HasSuffix(p, "/") {
 			cleanPath := path.Clean(strings.TrimSuffix(p, "/"))
@@ -878,8 +873,11 @@ func (s *Server) reconcileOrphans() {
 
 			os.MkdirAll(full, permDir)
 			s.store.EnsureDirectory(systemOwner, cleanPath)
+		} else {
+			sysFiles = append(sysFiles, p)
 		}
 	}
+	s.store.RegisterSystemFiles(s.absUploadDir, sysFiles)
 
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == s.absUploadDir {
@@ -1010,20 +1008,6 @@ func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	fmt.Fprintln(h.stderr, err.Error())
 	return sftp.ErrSSHFxPermissionDenied
 }
-
-// func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
-// 	virt := path.Clean("/" + p)
-// 	rel = strings.TrimPrefix(virt, "/")
-// 	if rel == "" {
-// 		rel = "."
-// 	}
-// 	abs := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
-
-// 	if !strings.HasPrefix(abs, h.srv.absUploadDir) {
-// 		return "", "", h.deny(errMsgPathTraversal, p)
-// 	}
-// 	return rel, abs, nil
-// }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	defer h.Trace("fileread", "method", r.Method, "path", r.Filepath)()
