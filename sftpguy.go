@@ -47,6 +47,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,7 +76,7 @@ var defaultUnrestrictedPaths = []string{
 // ============================================================================
 
 const (
-	AppVersion = "1.8.5"
+	AppVersion = "1.8.9"
 	envPrefix  = "SFTP_"
 
 	// System identifiers
@@ -458,6 +459,7 @@ func (s *Store) FilesByOwner(pubHash string) ([]string, error) {
 		return nil, err
 	}
 
+	sort.Strings(paths)
 	return paths, nil
 }
 
@@ -793,27 +795,45 @@ const firstTimeBanner = `
 ┃╻┃┣╸ ┃  ┃  ┃ ┃┃┃┃┣╸
 ┗┻┛┗━╸┗━╸┗━╸┗━┛╹ ╹┗━╸`
 
+const firstTimeMessage = `%s
+This is your first time visiting.
+This is a share-first archive. Upload at least %s to unlock all downloads.
+`
+
+const contributorBanner = `
+╻ ╻┏━╸╻  ┏━╸┏━┓┏┳┓┏━╸     ┏━╸┏━┓┏┓╻╺┳╸┏━┓╻┏┓ ╻ ╻╺┳╸┏━┓┏━┓
+┃╻┃┣╸ ┃  ┃  ┃ ┃┃┃┃┣╸      ┃  ┃ ┃┃┗┫ ┃ ┣┳┛┃┣┻┓┃ ┃ ┃ ┃ ┃┣┳┛
+┗┻┛┗━╸┗━╸┗━╸┗━┛╹ ╹┗━╸ ┛   ┗━╸┗━┛╹ ╹ ╹ ╹┗╸╹┗━┛┗━┛ ╹ ┗━┛╹┗╸`
+
+const contributorMessage = `%s
+%s
+`
+
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	uid := hashToUid(hash)
 	userLabel := fmt.Sprintf("anonymous-%d", uid)
 	isContributor, needed := stats.IsContributor(s.cfg.ContributorThreshold)
 	color := blue
+
+	welcomeMsg := ""
 	if stats.FirstTimer {
 		color = magenta
+		welcomeMsg = fmt.Sprintf(firstTimeMessage, color.Bold(firstTimeBanner), yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
 	} else if isContributor {
 		color = yellow
-	}
-
-	if stats.FirstTimer {
-		fmt.Fprintln(w, color.Bold(firstTimeBanner))
-		fmt.Fprintln(w, "This is your first time visiting.")
-		fmt.Fprintf(w, "This is a share-first archive. Upload at least %s to unlock all downloads.\r\n", yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
+		welcomeMsg = fmt.Sprintf(contributorMessage, color.Bold(contributorBanner), color.Italic(s.getRandomFortune()))
 	} else {
-		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
+		welcomeMsg = fmt.Sprintf("\r\nWelcome, %s\r\n", color.Bold(userLabel))
 	}
 
+	fmt.Fprintf(w, welcomeMsg)
 	fmt.Fprintf(w, "* You have been identified by your public key as %s.\r\n", color.Bold(userLabel))
 	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
+
+	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
+		fmt.Fprintf(w, "* The maximum permitted file size is %s\r\n", bold.Fmt(formatBytes(maxSize)))
+	}
+
 	fmt.Fprintln(w, "* You may always modify or delete files or directories you have created.")
 
 	files, err := s.store.FilesByOwner(hash)
@@ -833,7 +853,6 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 
 	if isContributor {
 		fmt.Fprintln(w, color.Bold("* Thank you for contributing."))
-		fmt.Fprintln(w, color.Italic(s.getRandomFortune()))
 		fmt.Fprint(w, green.Bold("* Downloads are unrestricted.\r\n"))
 	} else {
 		fmt.Fprint(w, red.Bold("* Downloads are restricted.\r\n"))
@@ -1177,6 +1196,8 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	}
 
 	switch r.Method {
+	case "Setstat":
+		return nil
 	case "Mkdir":
 		return h.prepareDirectory(meta.rel)
 
@@ -1280,6 +1301,7 @@ const (
 	yellow     asciiStyle = "33"
 	blue       asciiStyle = "34"
 	magenta    asciiStyle = "35"
+	gray       asciiStyle = "90"
 )
 
 func (s asciiStyle) apply(str, mode string) string {
@@ -1398,6 +1420,69 @@ func shortID(id string) string {
 	return id[:12]
 }
 
+type MultiLogHandler struct {
+	handlers []slog.Handler
+}
+
+func (m *MultiLogHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, l) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MultiLogHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m.handlers {
+		if h.Enabled(ctx, r.Level) {
+			_ = h.Handle(ctx, r)
+		}
+	}
+	return nil
+}
+
+func (m *MultiLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	newHandlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		newHandlers[i] = h.WithAttrs(attrs)
+	}
+	return &MultiLogHandler{handlers: newHandlers}
+}
+
+func (m *MultiLogHandler) WithGroup(name string) slog.Handler {
+	newHandlers := make([]slog.Handler, len(m.handlers))
+	for i, h := range m.handlers {
+		newHandlers[i] = h.WithGroup(name)
+	}
+	return &MultiLogHandler{handlers: newHandlers}
+}
+
+func newConsoleHandler(lvl slog.Level) slog.Handler {
+	return slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: lvl,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Colorize the level value
+			if a.Key == slog.LevelKey {
+				level := a.Value.Any().(slog.Level)
+				var coloredLevel string
+				switch {
+				case level >= slog.LevelError:
+					coloredLevel = red.Bold(level.String())
+				case level >= slog.LevelWarn:
+					coloredLevel = yellow.Fmt(level.String())
+				case level >= slog.LevelInfo:
+					coloredLevel = blue.Fmt(level.String())
+				default:
+					coloredLevel = gray.Fmt(level.String())
+				}
+				return slog.Attr{Key: a.Key, Value: slog.StringValue(coloredLevel)}
+			}
+			return a
+		},
+	})
+}
+
 func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	lvl := slog.LevelInfo
 	if cfg.Verbose {
@@ -1408,16 +1493,19 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-
-	mw := io.MultiWriter(os.Stdout, f)
-	logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
-
+	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: lvl})
+	consoleHandler := newConsoleHandler(lvl)
+	// logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
+	logger := slog.New(&MultiLogHandler{
+		handlers: []slog.Handler{fileHandler, consoleHandler},
+	})
 	logger.Info("configuration",
 		"name", cfg.Name,
 		"version", AppVersion,
 		"port", cfg.Port,
 		"upload_path", cfg.UploadDir,
 		"max_dirs", cfg.MaxDirs,
+		"max_file_size", cfg.MaxFileSize,
 		"contributor_threshold", cfg.ContributorThreshold,
 		"unrestricted", cfg.Unrestricted,
 	)
