@@ -1115,7 +1115,6 @@ func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 }
 
 func (h *fsHandler) Trace(msg string, args ...any) func() {
-	h.logger.Debug(msg, args...)
 	start := time.Now()
 	return func() {
 		durationArgs := make([]any, 0, 2+len(args))
