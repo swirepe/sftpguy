@@ -219,7 +219,11 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.Exec("PRAGMA journal_mode=WAL;")
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, err
+	}
+
 	if _, err := db.Exec(Schema); err != nil {
 		return nil, err
 	}
@@ -421,13 +425,17 @@ func (s *Store) DeletePath(relPath string) error {
 }
 
 func (s *Store) GetBannerStats(threshold int64) (u, c, f, b uint64) {
-	s.db.QueryRow(`
+	if err := s.db.QueryRow(`
 		SELECT 
 			COUNT(*) FILTER (WHERE upload_count > 0),
 			COUNT(*) FILTER (WHERE upload_bytes > ?)
 		FROM users
-	`, threshold).Scan(&u, &c)
-	s.db.QueryRow("SELECT count(*), sum(size) FROM files WHERE is_dir = 0").Scan(&f, &b)
+	`, threshold).Scan(&u, &c); err != nil {
+		s.logger.Warn("Could not get user/contributor banner stats", "err", err)
+	}
+	if err := s.db.QueryRow("SELECT count(*), sum(size) FROM files WHERE is_dir = 0").Scan(&f, &b); err != nil {
+		s.logger.Warn("Could not get file size/count banner stats", "err", err)
+	}
 	return
 }
 
@@ -1620,6 +1628,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"version", AppVersion,
 		"port", cfg.Port,
 		"upload_path", cfg.UploadDir,
+		"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
 		"max_dirs", cfg.MaxDirs,
 		"max_file_size", cfg.MaxFileSize,
 		"contributor_threshold", cfg.ContributorThreshold,
