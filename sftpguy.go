@@ -968,7 +968,7 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
-	h.logger.Debug("fileread", "method", r.Method, "path", r.Filepath)
+	defer h.Trace("fileread", "method", r.Method, "path", r.Filepath)()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -1012,7 +1012,7 @@ func (h *fsHandler) canRead(meta *pathMeta) error {
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
-	h.logger.Debug("Filewrite", "method", r.Method, "path", r.Filepath)
+	defer h.Trace("Filewrite", "method", r.Method, "path", r.Filepath)()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -1066,7 +1066,7 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-	h.logger.Debug("Filelist", "method", r.Method, "path", r.Filepath)
+	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
 	rel, full, err := h.resolve(r.Filepath)
 	if err != nil {
 		return nil, sftp.ErrSshFxPermissionDenied
@@ -1114,8 +1114,20 @@ func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 	}
 }
 
+func (h *fsHandler) Trace(msg string, args ...any) func() {
+	h.logger.Debug(msg, args...)
+	start := time.Now()
+	return func() {
+		durationArgs := make([]any, 0, 2+len(args))
+		durationArgs = append(durationArgs, "duration", time.Since(start))
+		durationArgs = append(durationArgs, args...)
+
+		h.logger.Debug(msg, durationArgs...)
+	}
+}
+
 func (h *fsHandler) Filecmd(r *sftp.Request) error {
-	h.logger.Debug("Filecmd", "method", r.Method, "path", r.Filepath)
+	defer h.Trace("Filecmd", "method", r.Method, "path", r.Filepath)()
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return h.deny(errMsgPathTraversal, r.Filepath)
