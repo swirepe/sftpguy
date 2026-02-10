@@ -843,19 +843,18 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	fmt.Fprintln(w, "* You may always modify or delete files or directories you have created.")
 
 	files, err := s.store.FilesByOwner(hash)
-
 	if err == nil && len(files) > 0 {
 		var buffer bytes.Buffer
-		var NumDirectories = 0
+		var ownedDirs = 0
 		for _, f := range files {
 			if strings.HasSuffix(f, "/") {
-				NumDirectories += 1
+				ownedDirs += 1
 				buffer.WriteString("   " + underline.Fmt(f) + "\r\n")
 			} else {
 				buffer.WriteString(fmt.Sprintf("   %-20s\r\n", f))
 			}
 		}
-		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-NumDirectories, NumDirectories)
+		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-ownedDirs, ownedDirs)
 		fmt.Fprintln(w, buffer.String())
 	}
 
