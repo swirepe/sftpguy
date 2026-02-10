@@ -655,6 +655,7 @@ func (s *Server) Listen() error {
 	s.listener = listener
 
 	s.logger.Info("SFTP archive online", "port", s.cfg.Port)
+	fmt.Fprintln(os.Stderr, green.Bold("==========  READY  =========="))
 
 	for {
 		conn, err := listener.Accept()
@@ -690,7 +691,7 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 
 	if s.cfg.BannerStats {
 		u, c, f, b := s.store.GetBannerStats(s.cfg.ContributorThreshold)
-		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %d bytes\r\n", u, c, f, b)
+		banner += fmt.Sprintf("\r\nUsers: %d | Contributors: %d | Files: %d | Size: %s\r\n", u, c, f, formatBytes(int64(b)))
 	}
 	return banner
 }
@@ -803,6 +804,16 @@ func (s *Server) ensureHostKey() error {
 }
 
 func (s *Server) reconcileOrphans() {
+	for p := range s.cfg.unrestrictedMap {
+		if strings.HasSuffix(p, "/") {
+			cleanPath := path.Clean(strings.TrimSuffix(p, "/"))
+			full := filepath.Join(s.absUploadDir, filepath.FromSlash(cleanPath))
+
+			os.MkdirAll(full, permDir)
+			s.store.EnsureDirectory(systemOwner, cleanPath)
+		}
+	}
+
 	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == s.absUploadDir {
 			return nil
@@ -845,9 +856,15 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 		return nil, err
 	}
 
+	owner, err := h.srv.store.GetFileOwner(rel)
+	if err != nil {
+		return nil, err
+	}
+
 	meta := &pathMeta{
 		rel:            rel,
 		full:           full,
+		owner:          owner,
 		isUnrestricted: h.checkUnrestricted(rel),
 	}
 
@@ -864,9 +881,6 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 
 		meta.exists = true
 	}
-
-	_ = h.srv.store.db.QueryRow("SELECT owner_hash, is_dir FROM files WHERE path = ?", rel).
-		Scan(&meta.owner, &meta.isDir)
 
 	return meta, nil
 }
@@ -899,16 +913,24 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 // }
 
 func (h *fsHandler) checkUnrestricted(rel string) bool {
-	if h.srv.cfg.unrestrictedMap[rel] {
+	if h.srv.cfg.unrestrictedMap[rel] || h.srv.cfg.unrestrictedMap[rel+"/"] {
 		return true
 	}
 	// Walk up the directory tree
 	for d := rel; d != "." && d != "/"; d = path.Dir(d) {
-		if h.srv.cfg.unrestrictedMap[d] {
+		if h.srv.cfg.unrestrictedMap[d+"/"] {
 			return true
 		}
 	}
 	return false
+}
+
+func (h *fsHandler) isExplicitUnrestrictedDir(rel string) bool {
+	if !h.srv.cfg.unrestrictedMap[rel] {
+		return false
+	}
+	meta, err := h.examine(rel)
+	return err == nil && meta.exists && meta.isDir
 }
 
 func (h *fsHandler) prepareDirectory(rel string) error {
@@ -965,7 +987,6 @@ func (h *fsHandler) resolve(p string) (rel string, full string, err error) {
 	}
 	abs := filepath.Join(h.srv.absUploadDir, filepath.FromSlash(rel))
 
-	// Combine the check here
 	if !strings.HasPrefix(abs, h.srv.absUploadDir) {
 		return "", "", h.deny(errMsgPathTraversal, p)
 	}
@@ -1392,18 +1413,29 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	return logger, f, nil
 }
 
+const startupBanner = `
+┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
+┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
+┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹   ` + "v" + AppVersion
+
 func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
 		os.Exit(1)
 	}
+	fmt.Fprintln(os.Stderr, yellow.Bold(startupBanner))
+
+	start := time.Now()
 
 	logger, logFile, err := setupLogger(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Logger setup error: %v\n", err)
 		os.Exit(1)
 	}
-	defer logFile.Close()
+	defer func() {
+		logger.Info("execution complete", "uptime", time.Since(start))
+		logFile.Close()
+	}()
 
 	srv, err := NewServer(cfg, logger)
 	if err != nil {
@@ -1420,4 +1452,6 @@ func main() {
 	<-sigChan
 	logger.Info("Shutting down...")
 	srv.Shutdown()
+	//                       ==========  READY  ==========
+	fmt.Fprintln(os.Stderr, magenta.Bold("==========  DONE   =========="))
 }
