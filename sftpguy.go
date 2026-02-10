@@ -100,7 +100,9 @@ const (
 	maxPort = 65535
 
 	// Database Schema
-	Schema = `CREATE TABLE IF NOT EXISTS users ( 
+	Schema = `PRAGMA foreign_keys = ON;
+
+	CREATE TABLE IF NOT EXISTS users ( 
 		pubkey_hash TEXT PRIMARY KEY, 
 		last_login DATETIME, 
 		upload_count INTEGER DEFAULT 0, 
@@ -109,11 +111,17 @@ const (
 		download_bytes INTEGER DEFAULT 0 
 	);
 	
+	INSERT OR IGNORE INTO users (pubkey_hash) VALUES('system');
+
 	CREATE TABLE IF NOT EXISTS files ( 
 		path TEXT PRIMARY KEY,
 		owner_hash TEXT,
 		size INTEGER DEFAULT 0,
-		is_dir INTEGER DEFAULT 0
+		is_dir INTEGER DEFAULT 0,
+		    
+		FOREIGN KEY (owner_hash) REFERENCES users (pubkey_hash) 
+			ON DELETE CASCADE 
+			ON UPDATE CASCADE
 	);`
 )
 
@@ -287,15 +295,22 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 }
 
 func (s *Store) UpsertUserSession(hash string) (userStats, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
-	_, err := s.exec(`
-		INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)
-		ON CONFLICT(pubkey_hash) DO UPDATE SET last_login = excluded.last_login
-	`, hash, now)
+	stats, err := s.GetUserStats(hash)
 	if err != nil {
 		return userStats{}, err
 	}
-	return s.GetUserStats(hash)
+
+	now := time.Now().Format("2006-01-02 15:04:05")
+	_, err = s.exec(`
+		INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)
+		ON CONFLICT(pubkey_hash) DO UPDATE SET last_login = excluded.last_login
+	`, hash, now)
+
+	if err != nil {
+		return stats, err
+	}
+
+	return stats, nil
 }
 
 func (s *Store) GetFileOwner(relPath string) (string, error) {
@@ -413,6 +428,35 @@ func (s *Store) FileExistsInDB(relPath string) bool {
 	var exists bool
 	s.db.QueryRow("SELECT 1 FROM files WHERE path = ?", relPath).Scan(&exists)
 	return exists
+}
+
+func (s *Store) FilesByOwner(pubHash string) ([]string, error) {
+	rows, err := s.db.Query("SELECT path, is_dir FROM files WHERE owner_hash = ?", pubHash)
+	if err != nil {
+		s.logger.Error("failed to query files by owner", "err", err, "hash", pubHash)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		var d bool
+		if err := rows.Scan(&p, &d); err != nil {
+			s.logger.Error("failed to scan path row", "err", err)
+			return nil, err
+		}
+		if d {
+			p = strings.TrimSuffix(p, "/") + "/"
+		}
+		paths = append(paths, p)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return paths, nil
 }
 
 // ============================================================================
@@ -748,8 +792,14 @@ func (s *Server) getRandomFortune() string {
 	return s.fortuneGenerator.Random()
 }
 
+const firstTimeBanner = `
+╻ ╻┏━╸╻  ┏━╸┏━┓┏┳┓┏━╸
+┃╻┃┣╸ ┃  ┃  ┃ ┃┃┃┃┣╸
+┗┻┛┗━╸┗━╸┗━╸┗━┛╹ ╹┗━╸`
+
 func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
-	userLabel := fmt.Sprintf("anonymous-%d", hashToUid(hash))
+	uid := hashToUid(hash)
+	userLabel := fmt.Sprintf("anonymous-%d", uid)
 	isContributor, needed := stats.IsContributor(s.cfg.ContributorThreshold)
 	color := blue
 	if stats.FirstTimer {
@@ -757,24 +807,47 @@ func (s *Server) Welcome(w io.Writer, hash string, stats userStats) {
 	} else if isContributor {
 		color = yellow
 	}
-	fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
 
 	if stats.FirstTimer {
-		fmt.Fprintln(w, "This is a share-first archive. Reach contributor status to unlock all downloads.")
-		fmt.Fprintln(w, "Upload at least %s to unlock contributor status.", formatBytes(s.cfg.ContributorThreshold))
-		fmt.Fprintln(w, "You may always download unrestricted files:")
+		fmt.Fprintln(w, color.Bold(firstTimeBanner))
+		fmt.Fprintln(w, "This is your first time visiting.")
+		fmt.Fprintf(w, "This is a share-first archive. Upload at least %s to unlock all downloads.\r\n", yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
+	} else {
+		fmt.Fprintf(w, "\r\nWelcome, %s\r\n", color.Bold(userLabel))
+	}
+
+	fmt.Fprintf(w, "* You have been identified by your public key as %s.\r\n", color.Bold(userLabel))
+	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
+	fmt.Fprintln(w, "* You may always modify or delete files or directories you have created.")
+
+	files, err := s.store.FilesByOwner(hash)
+	if err == nil && len(files) > 0 {
+		fmt.Fprintln(w, "Your files:")
+		numDirs := 0
+		for _, f := range files {
+			if strings.HasSuffix(f, "/") {
+				numDirs += 1
+				fmt.Fprintln(w, "  "+bold.Fmt(f))
+			} else {
+				fmt.Fprintf(w, "  %-20s\r\n", f)
+			}
+		}
+		fmt.Fprintf(w, "%d files, %d directories\n", len(files)-numDirs, numDirs)
+	}
+
+	if isContributor {
+		fmt.Fprintln(w, color.Bold("* Thank you for contributing."))
+		fmt.Fprintln(w, color.Italic(s.getRandomFortune()))
+		fmt.Fprint(w, green.Bold("* Downloads are unrestricted.\r\n"))
+	} else {
+		fmt.Fprint(w, red.Bold("* Downloads are restricted.\r\n"))
+		fmt.Fprintf(w, "Share %s more to unlock all downloads.\r\n", color.Bold(formatBytes(needed)))
+		fmt.Fprintln(w, "You may always download from unrestricted files or directories:")
 		for pathName := range s.cfg.unrestrictedMap {
 			fmt.Fprintln(w, "  "+bold.Fmt(pathName))
 		}
 	}
 
-	if isContributor {
-		fmt.Fprintln(w, color.Bold("* Contributor status unlocked!"))
-		fmt.Fprintln(w, color.Italic(s.getRandomFortune()))
-	} else {
-		fmt.Fprint(w, red.Bold("Downloads are restricted.\r\n"))
-		fmt.Fprintf(w, magenta.Bold("Share %s more to unlock all downloads.\r\n"), formatBytes(needed))
-	}
 	fmt.Fprintf(w, "\r\nID: %s | Last: %s | Shared: %d files, %s",
 		userLabel, stats.LastLogin, stats.UploadCount, formatBytes(stats.UploadBytes))
 	if stats.DownloadCount > 0 {
@@ -868,42 +941,6 @@ func (h *fsHandler) examine(p string) (*pathMeta, error) {
 	}
 	return meta, nil
 }
-
-// func (h *fsHandler) examine(p string) (*pathMeta, error) {
-// 	rel, full, err := h.resolve(p)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	owner, err := h.srv.store.GetFileOwner(rel)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	meta := &pathMeta{
-// 		rel:            rel,
-// 		full:           full,
-// 		owner:          owner,
-// 		isUnrestricted: h.checkUnrestricted(rel),
-// 	}
-
-// 	// Use Lstat so we don't follow symlinks to the host filesystem
-// 	fi, err := os.Lstat(full)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	mode := fi.Mode()
-
-// 	if mode.IsDir() {
-// 		meta.isDir = true
-// 	} else if !mode.IsRegular() {
-// 		return nil, h.deny(errMsgSymlinksProhibited, "path", rel, "type", mode.String())
-// 	}
-
-// 	meta.exists = true
-
-// 	return meta, nil
-// }
 
 func (h *fsHandler) checkUnrestricted(rel string) bool {
 	if h.srv.cfg.unrestrictedMap[rel] || h.srv.cfg.unrestrictedMap[rel+"/"] {
@@ -1083,46 +1120,6 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 
 	return nil
 }
-
-// func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
-// 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
-// 	rel, full, err := h.resolve(r.Filepath)
-// 	if err != nil {
-// 		return nil, sftp.ErrSshFxPermissionDenied
-// 	}
-
-// 	if r.Method == "List" {
-// 		entries, _ := os.ReadDir(full)
-// 		var files []os.FileInfo
-
-// 		for _, e := range entries {
-// 			fi, _ := e.Info()
-// 			if fi == nil {
-// 				continue
-// 			}
-// 			name := e.Name()
-// 			relPath := path.Join(rel, name)
-// 			if fi.Mode()&os.ModeSymlink != 0 {
-// 				h.logger.Warn("skipping prohibited symlink in listing", "path", relPath)
-// 				continue
-// 			}
-
-// 			files = append(files, h.newSftpFile(fi, relPath))
-// 		}
-
-// 		return listerAt(files), nil
-// 	}
-
-// 	fi, err := os.Lstat(full)
-// 	if err != nil {
-// 		return nil, os.ErrNotExist
-// 	}
-// 	if fi.Mode()&os.ModeSymlink != 0 {
-// 		return nil, h.deny(errMsgSymlinksProhibited, "path", rel)
-// 	}
-
-// 	return listerAt{h.newSftpFile(fi, rel)}, nil
-// }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
@@ -1481,6 +1478,5 @@ func main() {
 	<-sigChan
 	logger.Info("Shutting down...")
 	srv.Shutdown()
-	//                       ==========  READY  ==========
 	fmt.Fprintln(os.Stderr, magenta.Bold("==========  DONE   =========="))
 }
