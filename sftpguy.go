@@ -79,7 +79,7 @@ var defaultUnrestrictedPaths = []string{
 // ============================================================================
 
 const (
-	AppVersion = "1.8.9"
+	AppVersion = "1.8.10"
 	envPrefix  = "SFTP_"
 
 	// System identifiers
@@ -1689,7 +1689,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
-┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹   ` + "v" + AppVersion
+┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹  ` + "v" + AppVersion
 
 func main() {
 	cfg, err := LoadConfig()
