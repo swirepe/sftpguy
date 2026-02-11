@@ -276,14 +276,14 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	// Atomically check ownership and claim the file record.
-	if err := h.withTx(func(tx *sql.Tx) error {
+	err = h.withTx(func(tx *sql.Tx) error {
 		if err := h.ownerCheck(tx, rel); err != nil {
 			return err
 		}
 		_, err := tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, 0, 0)", rel, h.hash)
 		return err
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(path.Dir(full), 0755); err != nil {
@@ -330,40 +330,46 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 	if err != nil {
 		return sftp.ErrSSHFxPermissionDenied
 	}
-	if r.Method == "Mkdir" {
-		if parent := path.Dir(rel); parent != "." && parent != "" {
-			if err := h.ownerCheck(h.db, parent); err != nil {
+
+	switch r.Method {
+	case "Mkdir":
+		return h.withTx(func(tx *sql.Tx) error {
+			if err := h.ownerCheck(tx, rel); err != nil {
 				return err
 			}
-		}
-		if err := os.MkdirAll(full, 0755); err != nil {
+			os.MkdirAll(full, 0755)
+			_, err := tx.Exec("INSERT OR REPLACE INTO files (path, owner, is_dir) VALUES (?, ?, 1)", rel, h.hash)
 			return err
-		}
-		h.dbExec("INSERT OR REPLACE INTO files (path, owner, is_dir) VALUES (?, ?, 1)", rel, h.hash)
-		return nil
-	}
-	if _, err := os.Lstat(full); err != nil {
-		return os.ErrNotExist
-	}
-	if err := h.ownerCheck(h.db, rel); err != nil {
-		return err
-	}
-	switch r.Method {
+		})
+
 	case "Remove", "Rmdir":
-		if err := os.RemoveAll(full); err != nil {
+		return h.withTx(func(tx *sql.Tx) error {
+			if err := h.ownerCheck(tx, rel); err != nil {
+				return err
+			}
+			os.RemoveAll(full)
+			_, err := tx.Exec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
 			return err
-		}
-		h.dbExec("DELETE FROM files WHERE path = ? OR path LIKE ?", rel, rel+"/%")
+		})
 	case "Rename":
 		tRel := h.clean(r.Target)
 		tFull, err := h.safePath(tRel)
 		if err != nil {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := os.Rename(full, tFull); err != nil {
+		return h.withTx(func(tx *sql.Tx) error {
+			if err := h.ownerCheck(tx, rel); err != nil {
+				return err
+			}
+			if err := h.ownerCheck(tx, tRel); err != nil {
+				return err
+			}
+			if err := os.Rename(full, tFull); err != nil {
+				return err
+			}
+			_, err := tx.Exec("UPDATE files SET path = ? WHERE path = ?", tRel, rel)
 			return err
-		}
-		h.dbExec("UPDATE files SET path = ? WHERE path = ?", tRel, rel)
+		})
 	}
 	return nil
 }
@@ -383,28 +389,46 @@ func (w *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	return w.File.WriteAt(p, off)
 }
 
-func (w *statWriter) Close() error {
-	defer w.File.Close()
-	fi, err := w.Stat()
-	if err != nil {
-		return err
+func (w *statWriter) Close() (err error) {
+	defer func() {
+		closeErr := w.File.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
+
+	if syncErr := w.Sync(); syncErr != nil {
+		return syncErr
+	}
+
+	fi, statErr := w.Stat()
+	if statErr != nil {
+		return statErr
 	}
 	newSize := fi.Size()
-	return w.h.withTx(func(tx *sql.Tx) error {
+
+	dbErr := w.h.withTx(func(tx *sql.Tx) error {
 		var oldSize int64
 		tx.QueryRow("SELECT size FROM files WHERE path = ?", w.rel).Scan(&oldSize)
 		delta := max(newSize-oldSize, 0)
-		if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, w.rel); err != nil {
+
+		_, err := tx.Exec("UPDATE files SET size = ?, owner = ? WHERE path = ?", newSize, w.h.hash, w.rel)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash); err != nil {
-			return err
-		}
+		_, err = tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash)
 		log.Printf("[UPLOAD] Path: %q, Size: %d, Delta: %d, UserHash: %s, Address: %s",
 			w.rel, newSize, delta, w.h.hash, w.h.remoteAddr)
-		w.h.printStatus()
-		return nil
+
+		return err
 	})
+
+	if dbErr != nil {
+		return dbErr
+	}
+
+	w.h.printStatus()
+	return nil
 }
 
 // --- misc helpers ---
@@ -449,31 +473,12 @@ func hashToUid(h string) uint32 {
 
 func getSigner(keyPath string) (ssh.Signer, error) {
 	if data, err := os.ReadFile(keyPath); err == nil {
-		s, err := ssh.ParsePrivateKey(data)
-		if err != nil {
-			return nil, fmt.Errorf("parse host key: %w", err)
-		}
-		return s, nil
+		return ssh.ParsePrivateKey(data)
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
-	}
-	b, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("marshal key: %w", err)
-	}
-	f, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("write host key: %w", err)
-	}
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	b, _ := x509.MarshalPKCS8PrivateKey(priv)
+	f, _ := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE, 0600)
 	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: "PRIVATE KEY", Bytes: b}); err != nil {
-		return nil, fmt.Errorf("encode key: %w", err)
-	}
-	s, err := ssh.NewSignerFromKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("create signer: %w", err)
-	}
-	return s, nil
+	pem.Encode(f, &pem.Block{Type: "PRIVATE KEY", Bytes: b})
+	return ssh.NewSignerFromKey(priv)
 }
