@@ -58,6 +58,16 @@ func main() {
 			db.Exec("INSERT OR IGNORE INTO users (hash) VALUES (?)", h)
 			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": h}}, nil
 		},
+		BannerCallback: func(conn ssh.ConnMetadata) string {
+			return "\r\n" +
+				"░█▀▀░█░█░█▀█░█▀▄░█▀▀░░░█▀▀░▀█▀░█▀▄░█▀▀░▀█▀░░░█▀▀░█▀▀░▀█▀░█▀█\r\n" +
+				"░▀▀█░█▀█░█▀█░█▀▄░█▀▀░░░█▀▀░░█░░█▀▄░▀▀█░░█░░░░▀▀█░█▀▀░░█░░█▀▀\r\n" +
+				"░▀▀▀░▀░▀░▀░▀░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░░░▀▀▀░▀░░░░▀░░▀░░\r\n" +
+				"Welcome.\r\n" +
+				"This is a share first sftp archive.\r\n" +
+				"Please upload 1MB to unlock full downloads.\r\n\r\n"
+
+		},
 	}
 	cfg.AddHostKey(signer)
 
@@ -80,12 +90,10 @@ func main() {
 						switch req.Type {
 						case "subsystem":
 							if string(req.Payload[4:]) == "sftp" {
-
-								fmt.Fprint(sChan.Stderr(), "Share first archive\r\n")
-
 								req.Reply(true, nil)
+								addr := sConn.RemoteAddr().String()
 								h := sConn.Permissions.Extensions["pubkey-hash"]
-								handler := &fsHandler{db: db, hash: h, cfg: c, stderr: channel.Stderr()}
+								handler := &fsHandler{db: db, hash: h, remoteAddr: addr, cfg: c, stderr: channel.Stderr()}
 								server := sftp.NewRequestServer(channel, sftp.Handlers{FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler})
 								server.Serve()
 								return
@@ -113,10 +121,11 @@ func main() {
 }
 
 type fsHandler struct {
-	db     *sql.DB
-	hash   string
-	cfg    Config
-	stderr io.Writer
+	db         *sql.DB
+	hash       string
+	remoteAddr string
+	cfg        Config
+	stderr     io.Writer
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -232,9 +241,17 @@ type statWriter struct {
 }
 
 func (w *statWriter) Close() error {
-	fi, _ := w.Stat()
-	w.h.db.Exec("UPDATE files SET size = ? WHERE path = ?", fi.Size(), w.rel)
-	w.h.db.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", fi.Size(), w.h.hash)
+	fi, err := w.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
+	w.h.db.Exec("UPDATE files SET size = ? WHERE path = ?", size, w.rel)
+	w.h.db.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", size, w.h.hash)
+
+	log.Printf("[UPLOAD] Path: %q, Size: %d, UserHash: %s, Address: %s",
+		w.rel, size, w.h.hash, w.h.remoteAddr)
+
 	return w.File.Close()
 }
 
