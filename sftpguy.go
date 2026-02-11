@@ -493,6 +493,7 @@ type Config struct {
 	Unrestricted            string
 	LockDirectoriesToOwners bool
 	Verbose                 bool
+	Debug                   bool
 	MaxFileSize             int64
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
@@ -510,11 +511,12 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
 	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
-	EnvFlag(&cfg.MkdirRate, "dir.rate", "MKDIR_RATE", 10.0, "Global mkdir rate limit (dirs/sec)")
-	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 1000, "Maximum total directories allowed in archive")
+	EnvFlag(&cfg.MkdirRate, "dir.rate", "MKDIR_RATE", 100.0, "Global mkdir rate limit (dirs/sec)")
+	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 10000, "Maximum total directories allowed in archive")
 	EnvFlag(&cfg.Unrestricted, "unrestricted", "UNRESTRICTED_PATHS", strings.Join(defaultUnrestrictedPaths, ","), "Comma-separated list of paths always available for download")
 	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
-	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable debug logging")
+	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable verbose logging")
+	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Enable debug logging")
 
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
@@ -622,7 +624,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	srv := &Server{
 		store:            store,
 		logger:           logger,
-		mkdirLimiter:     rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1),
+		mkdirLimiter:     rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1000),
 		fortuneGenerator: &FortuneGenerator{},
 		cfg:              cfg,
 		absUploadDir:     absDir,
@@ -836,7 +838,7 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		welcomeMsg = fmt.Sprintf(firstTimeMessage, color.Bold(firstTimeBanner), color.Fmt(userLabel), yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
 	} else if isContributor {
 		color = yellow
-		welcomeMsg = fmt.Sprintf(contributorMessage, color.Bold(contributorBanner), color.Fmt(userLabel), color.Italic(s.getRandomFortune()))
+		welcomeMsg = fmt.Sprintf(contributorMessage, color.Bold(contributorBanner), color.Italic(s.getRandomFortune()), color.Fmt(userLabel))
 	} else {
 		welcomeMsg = fmt.Sprintf("\r\nWelcome, %s\r\n", color.Bold(userLabel))
 	}
@@ -854,14 +856,15 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	if err == nil && len(files) > 0 {
 		var buffer bytes.Buffer
 		var ownedDirs = 0
-		for _, f := range files {
-			if strings.HasSuffix(f, "/") {
-				ownedDirs += 1
-				buffer.WriteString("   " + underline.Fmt(f) + "\r\n")
-			} else {
-				buffer.WriteString(fmt.Sprintf("   %-20s\r\n", f))
-			}
-		}
+		printGrid(&buffer, files)
+		// for _, f := range files {
+		// 	if strings.HasSuffix(f, "/") {
+		// 		ownedDirs += 1
+		// 		buffer.WriteString("   " + underline.Fmt(f) + "\r\n")
+		// 	} else {
+		// 		buffer.WriteString(fmt.Sprintf("   %-20s\r\n", f))
+		// 	}
+		// }
 		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-ownedDirs, ownedDirs)
 		fmt.Fprintln(w, buffer.String())
 	}
@@ -885,6 +888,40 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	}
 	fmt.Fprintf(w, "\r\n")
 	w.Flush()
+}
+
+func printGrid(w io.Writer, files []string) {
+	sort.Strings(files)
+	max := 0
+	for _, f := range files {
+		if len(f) > max {
+			max = len(f)
+		}
+	}
+	max += 2 // Column spacing
+
+	cols := 80 / max
+	if cols <= 0 {
+		cols = 1
+	}
+	rows := (len(files) + cols - 1) / cols
+
+	for r := 0; r < rows; r++ {
+		for c := 0; c < cols; c++ {
+			i := c*rows + r
+			if i < len(files) {
+				f := files[i]
+				color := ""
+				if strings.HasSuffix(f, "/") {
+					color = "\033[1;34m"
+				}
+				// %-*s pads the string, but we subtract ANSI length manually
+				// by printing color separately and padding an empty string
+				fmt.Fprintf(w, "%s%s\033[0m%*s", color, f, max-len(f), "")
+			}
+		}
+		fmt.Fprint(w, "\r\n")
+	}
 }
 
 func (s *Server) ensureHostKey() error {
@@ -1363,35 +1400,6 @@ func hashToUid(hash string) uint32 {
 	return h.Sum32() & 0x7FFFFFFF
 }
 
-func parseSize(s string) (int64, error) {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-
-	var mult int64 = 1
-	switch {
-	case strings.HasSuffix(s, "gb") || strings.HasSuffix(s, "g"):
-		mult = 1 << 30 // 1024^3
-		s = strings.TrimSuffix(strings.TrimSuffix(s, "gb"), "g")
-	case strings.HasSuffix(s, "mb") || strings.HasSuffix(s, "m"):
-		mult = 1 << 20 // 1024^2
-		s = strings.TrimSuffix(strings.TrimSuffix(s, "mb"), "m")
-	case strings.HasSuffix(s, "kb") || strings.HasSuffix(s, "k"):
-		mult = 1 << 10 // 1024^1
-		s = strings.TrimSuffix(strings.TrimSuffix(s, "kb"), "k")
-	case strings.HasSuffix(s, "b"):
-		s = strings.TrimSuffix(s, "b")
-	}
-
-	// TrimSpace again in case of "100 MB" format
-	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size format: %w", err)
-	}
-	return v * mult, nil
-}
-
 // turns 1024 into "1.00 KB", etc.
 func formatBytes(b int64) string {
 	const unit = 1024
@@ -1450,6 +1458,35 @@ func EnvSizeFlag(ptr *int64, name string, env string, def string, usage string) 
 	}
 	intVal, _ := parseSize(val)
 	flag.Int64Var(ptr, name, intVal, usage)
+}
+
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+
+	var mult int64 = 1
+	switch {
+	case strings.HasSuffix(s, "gb") || strings.HasSuffix(s, "g"):
+		mult = 1 << 30 // 1024^3
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "gb"), "g")
+	case strings.HasSuffix(s, "mb") || strings.HasSuffix(s, "m"):
+		mult = 1 << 20 // 1024^2
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "mb"), "m")
+	case strings.HasSuffix(s, "kb") || strings.HasSuffix(s, "k"):
+		mult = 1 << 10 // 1024^1
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "kb"), "k")
+	case strings.HasSuffix(s, "b"):
+		s = strings.TrimSuffix(s, "b")
+	}
+
+	// TrimSpace again in case of "100 MB" format
+	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format: %w", err)
+	}
+	return v * mult, nil
 }
 
 func shortID(id string) string {
@@ -1609,8 +1646,13 @@ func newConsoleHandler(opts *slog.HandlerOptions) *PrettyHandler {
 
 func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	lvl := slog.LevelInfo
-	if cfg.Verbose {
+	if cfg.Debug {
 		lvl = slog.LevelDebug
+	}
+
+	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	if cfg.Verbose {
+		consoleHandler = newConsoleHandler(&slog.HandlerOptions{Level: lvl})
 	}
 
 	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
@@ -1618,7 +1660,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
 	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: lvl})
-	consoleHandler := newConsoleHandler(&slog.HandlerOptions{Level: lvl})
+	// consoleHandler := newConsoleHandler(&slog.HandlerOptions{Level: lvl})
 	// logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
 	logger := slog.New(&MultiLogHandler{
 		handlers: []slog.Handler{fileHandler, consoleHandler},
