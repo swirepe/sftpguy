@@ -92,26 +92,13 @@ func main() {
 							}
 						case "env":
 							// Accept environment variables but ignore them
-							var kv struct{ Name, Value string }
-							if err := ssh.Unmarshal(req.Payload, &kv); err == nil {
-								log.Printf("[%s] ENV: %s=%s", sConn.RemoteAddr(), kv.Name, kv.Value)
-							}
 							req.Reply(true, nil)
 						case "shell":
-							// Accept the shell request, tell the user it's SFTP-only, then exit
 							req.Reply(true, nil)
 							fmt.Fprintln(sChan, "This server is SFTP-only. Shell access is not permitted.")
 							return
 						case "pty-req":
 							// Some clients request a terminal before a shell
-							var pty struct {
-								Term          string
-								Columns, Rows uint32
-								Width, Height uint32
-								Modes         string
-							}
-							ssh.Unmarshal(req.Payload, &pty)
-							log.Printf("[%s] PTY Request: %s (%dx%d)", sConn.RemoteAddr(), pty.Term, pty.Columns, pty.Rows)
 							req.Reply(true, nil)
 						default:
 							// Reject everything else (exec, x11, etc)

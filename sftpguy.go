@@ -747,10 +747,14 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 }
 
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
+	nConn.SetDeadline(time.Now().Add(30 * time.Second))
+
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
+		nConn.Close()
 		return
 	}
+	nConn.SetDeadline(time.Time{})
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
@@ -781,22 +785,67 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn, logger *slog.Logger) {
 	defer ch.Close()
 	for req := range reqs {
-		if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
-			req.Reply(true, nil)
-			s.Welcome(ch.Stderr(), pubHash, stats)
+		s.logger.Debug("handleChannel", "req", req)
+		switch req.Type {
+		case "subsystem":
+			if string(req.Payload[4:]) == "sftp" {
+				req.Reply(true, nil)
+				s.Welcome(ch.Stderr(), pubHash, stats)
 
-			handler := &fsHandler{
-				srv:     s,
-				pubHash: pubHash,
-				stderr:  ch.Stderr(),
-				logger:  *logger,
+				handler := &fsHandler{
+					srv:     s,
+					pubHash: pubHash,
+					stderr:  ch.Stderr(),
+					logger:  *logger,
+				}
+				server := sftp.NewRequestServer(ch, sftp.Handlers{
+					FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
+				})
+				server.Serve()
+				return
 			}
-			server := sftp.NewRequestServer(ch, sftp.Handlers{
-				FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
-			})
-			server.Serve()
+			logger.Debug("rejected subsystem", "subsystem", req.Payload[4:])
+			req.Reply(false, nil)
+
+		case "env":
+			// Accept environment variables but ignore them
+			var kv struct{ Name, Value string }
+			if err := ssh.Unmarshal(req.Payload, &kv); err == nil {
+				logger.Debug("env request", kv.Name, kv.Value)
+			}
+			req.Reply(true, nil)
+
+		case "shell":
+			// Accept the shell request, tell the user it's SFTP-only, then exit
+			req.Reply(true, nil)
+			fmt.Fprintln(ch, "This server is SFTP-only. Shell access is not permitted.")
 			return
+
+		case "pty-req":
+			// Some clients request a terminal before a shell
+			var pty struct {
+				Term          string
+				Columns, Rows uint32
+				Width, Height uint32
+				Modes         string
+			}
+			ssh.Unmarshal(req.Payload, &pty)
+			logger.Debug("pty-req", "term", pty.Term, "cols", pty.Columns, "rows", pty.Rows)
+
+			req.Reply(true, nil)
+
+		case "exec":
+			var cmd struct{ Value string }
+			ssh.Unmarshal(req.Payload, &cmd)
+			logger.Warn("exec", "cmd", cmd.Value)
+			req.Reply(false, nil)
+
+		default:
+			// Reject everything else (exec, x11, etc)
+			req.Reply(false, nil)
+
 		}
+
 	}
 }
 
@@ -855,7 +904,8 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	files, err := s.store.FilesByOwner(hash)
 	if err == nil && len(files) > 0 {
 		var buffer bytes.Buffer
-		ownedDirs := printGrid(&buffer, files)
+		const maxToDisplay = 50
+		ownedDirs, shownCount := printGrid(&buffer, files, maxToDisplay)
 
 		// for _, f := range files {
 		// 	if strings.HasSuffix(f, "/") {
@@ -867,6 +917,9 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		// }
 		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-ownedDirs, ownedDirs)
 		fmt.Fprintln(w, buffer.String())
+		if len(files) > shownCount {
+			fmt.Fprintf(w, "  ... and %d more items.\r\n", len(files)-shownCount)
+		}
 	}
 
 	if isContributor {
@@ -894,13 +947,13 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	w.Flush()
 }
 
-func printGrid(w io.Writer, files []string) (dirs int) {
+func printGrid(w io.Writer, files []string, limit int) (dirs int, shown int) {
 	sort.Strings(files)
-	max := 0
+	maxLen := 0
 	var filtered []string
 	for _, f := range files {
-		if len(f) > max {
-			max = len(f)
+		if len(f) > maxLen {
+			maxLen = len(f)
 		}
 		if strings.HasSuffix(f, "/") {
 			dirs++
@@ -910,28 +963,39 @@ func printGrid(w io.Writer, files []string) (dirs int) {
 		}
 	}
 
-	cell := max + 2
-	cols := 90 / cell
+	toShow := filtered
+	if limit > 0 && len(filtered) > limit {
+		toShow = filtered[:limit]
+	}
+	shown = len(toShow)
+
+	cellWidth := maxLen + 2
+	if cellWidth < 20 {
+		cellWidth = 20
+	}
+
+	cols := 90 / cellWidth
 	if cols < 1 {
 		cols = 1
 	}
-	rows := (len(filtered) + cols - 1) / cols
+	rows := (len(toShow) + cols - 1) / cols
 
 	for r := 0; r < rows; r++ {
 		fmt.Fprint(w, "  ")
 		for c := 0; c < cols; c++ {
-			if i := c*rows + r; i < len(filtered) {
-				f := filtered[i]
+			idx := c*rows + r
+			if idx < len(toShow) {
+				f := toShow[idx]
 				style := lightGray
 				if strings.HasSuffix(f, "/") {
 					style = blue
 				}
-				fmt.Fprint(w, style.Bold(fmt.Sprintf("%-*s", cell, f)))
+				fmt.Fprint(w, style.Bold(fmt.Sprintf("%-*s", cellWidth, f)))
 			}
 		}
 		fmt.Fprint(w, "\r\n")
 	}
-	return
+	return dirs, shown
 }
 
 func (s *Server) ensureHostKey() error {
@@ -1271,7 +1335,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			return err
 		}
 		if err := os.RemoveAll(meta.full); err != nil {
-			h.logger.Warn("could not remove path", "method", r.Method, "path", meta.full, "err", err)
+			h.logger.Error("could not remove path", "method", r.Method, "path", meta.full, "err", err)
 			return err
 		}
 		return h.srv.store.DeletePath(meta.rel)
@@ -1725,14 +1789,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	sigChan := make(chan os.Signal, 1)
+	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go srv.reconcileOrphans()
 	go srv.Listen()
 
-	<-sigChan
-	logger.Info("Shutting down...")
+	sig := <-sigChan
+	logger.Info("Shutdown signal received", "signal", sig.String())
+
+	go func() {
+		<-sigChan
+		logger.Error("Forced exit: Terminating immediately")
+		os.Exit(1)
+	}()
+
+	fmt.Fprintln(os.Stderr, yellow.Bold("==========  HALT   =========="))
+	fmt.Fprintln(os.Stderr, yellow.Fmt("Graceful shutdown started. (Press Ctrl-C again to force)"))
 	srv.Shutdown()
+
 	fmt.Fprintln(os.Stderr, magenta.Bold("==========  DONE   =========="))
 }
