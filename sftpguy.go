@@ -877,7 +877,11 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		fmt.Fprintf(w, "Share %s more to unlock all downloads.\r\n", color.Bold(formatBytes(needed)))
 		fmt.Fprintln(w, "You may always download from unrestricted files or directories:")
 		for pathName := range s.cfg.unrestrictedMap {
-			fmt.Fprintln(w, "  "+bold.Fmt(pathName))
+			if strings.HasSuffix(pathName, "/") {
+				fmt.Fprintln(w, "  "+cyan.Bold(pathName))
+			} else {
+				fmt.Fprintln(w, "  "+bold.Fmt(pathName))
+			}
 		}
 	}
 
@@ -1196,7 +1200,8 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 		return nil, os.ErrNotExist
 	}
 
-	if r.Method == "List" {
+	switch r.Method {
+	case "List":
 		if !meta.isDir {
 			return nil, sftp.ErrSSHFxFailure
 		}
@@ -1220,8 +1225,9 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 			relPath := path.Join(meta.rel, e.Name())
 			files = append(files, h.newSftpFile(fi, relPath))
 		}
-
 		return listerAt(files), nil
+	case "Stat", "Lstat", "Fstat":
+		return listerAt{h.newSftpFile(meta.fi, meta.rel)}, nil
 	}
 
 	return listerAt{h.newSftpFile(meta.fi, meta.rel)}, nil
@@ -1264,7 +1270,10 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		if err := h.canModify(meta); err != nil {
 			return err
 		}
-		os.RemoveAll(meta.full)
+		if err := os.RemoveAll(meta.full); err != nil {
+			h.logger.Warn("could not remove path", "method", r.Method, "path", meta.full, "err", err)
+			return err
+		}
 		return h.srv.store.DeletePath(meta.rel)
 
 	case "Rename":
@@ -1280,7 +1289,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		}
 
 		if err := os.Rename(meta.full, targetMeta.full); err != nil {
-			h.logger.Error("rename rename error", "from", meta.rel, "to", targetMeta.rel, "err", err)
+			h.logger.Error("could not rename file", "from", meta.rel, "to", targetMeta.rel, "err", err)
 			return h.deny(errMsgRenameFailed)
 		}
 		return h.srv.store.RenamePath(meta.rel, targetMeta.rel)
