@@ -855,8 +855,8 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	files, err := s.store.FilesByOwner(hash)
 	if err == nil && len(files) > 0 {
 		var buffer bytes.Buffer
-		var ownedDirs = 0
-		printGrid(&buffer, files)
+		ownedDirs := printGrid(&buffer, files)
+
 		// for _, f := range files {
 		// 	if strings.HasSuffix(f, "/") {
 		// 		ownedDirs += 1
@@ -890,38 +890,44 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	w.Flush()
 }
 
-func printGrid(w io.Writer, files []string) {
+func printGrid(w io.Writer, files []string) (dirs int) {
 	sort.Strings(files)
 	max := 0
+	var filtered []string
 	for _, f := range files {
 		if len(f) > max {
 			max = len(f)
 		}
+		if strings.HasSuffix(f, "/") {
+			dirs++
+		}
+		if !strings.Contains(f, ".git/") || strings.HasSuffix(f, ".git/") {
+			filtered = append(filtered, f)
+		}
 	}
-	max += 2 // Column spacing
 
-	cols := 80 / max
-	if cols <= 0 {
+	cell := max + 2
+	cols := 90 / cell
+	if cols < 1 {
 		cols = 1
 	}
-	rows := (len(files) + cols - 1) / cols
+	rows := (len(filtered) + cols - 1) / cols
 
 	for r := 0; r < rows; r++ {
+		fmt.Fprint(w, "  ")
 		for c := 0; c < cols; c++ {
-			i := c*rows + r
-			if i < len(files) {
-				f := files[i]
-				color := ""
+			if i := c*rows + r; i < len(filtered) {
+				f := filtered[i]
+				style := lightGray
 				if strings.HasSuffix(f, "/") {
-					color = "\033[1;34m"
+					style = blue
 				}
-				// %-*s pads the string, but we subtract ANSI length manually
-				// by printing color separately and padding an empty string
-				fmt.Fprintf(w, "%s%s\033[0m%*s", color, f, max-len(f), "")
+				fmt.Fprint(w, style.Bold(fmt.Sprintf("%-*s", cell, f)))
 			}
 		}
 		fmt.Fprint(w, "\r\n")
 	}
+	return
 }
 
 func (s *Server) ensureHostKey() error {
