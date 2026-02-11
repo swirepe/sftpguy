@@ -75,13 +75,11 @@ func main() {
 			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": h}}, nil
 		},
 		BannerCallback: func(conn ssh.ConnMetadata) string {
-			return fmt.Sprintf("\r\n"+
-				"░█▀▀░█░█░█▀█░█▀▄░█▀▀░░░█▀▀░▀█▀░█▀▄░█▀▀░▀█▀░░░█▀▀░█▀▀░▀█▀░█▀█\r\n"+
-				"░▀▀█░█▀█░█▀█░█▀▄░█▀▀░░░█▀▀░░█░░█▀▄░▀▀█░░█░░░░▀▀█░█▀▀░░█░░█▀▀\r\n"+
-				"░▀▀▀░▀░▀░▀░▀░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░░░▀▀▀░▀░░░░▀░░▀░░\r\n"+
-				"Welcome.\r\n"+
-				"This is a share first sftp archive.\r\n"+
-				"Please upload %s to unlock full downloads.\r\n\r\n", formatBytes(c.Threshold))
+			return "\r\n" +
+				"░█▀▀░█░█░█▀█░█▀▄░█▀▀░░░█▀▀░▀█▀░█▀▄░█▀▀░▀█▀░░░█▀▀░█▀▀░▀█▀░█▀█\r\n" +
+				"░▀▀█░█▀█░█▀█░█▀▄░█▀▀░░░█▀▀░░█░░█▀▄░▀▀█░░█░░░░▀▀█░█▀▀░░█░░█▀▀\r\n" +
+				"░▀▀▀░▀░▀░▀░▀░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░░░▀▀▀░▀░░░░▀░░▀░░\r\n" +
+				"Welcome. This is a share-first SFTP archive.\r\n\r\n"
 		},
 	}
 	cfg.AddHostKey(signer)
@@ -123,34 +121,23 @@ func handleConn(conn net.Conn, cfg *ssh.ServerConfig, db *sql.DB, c Config) {
 	}
 }
 
-func reportProgress(io.Writer, hash string) {
-	var uploaded int64
-	db.QueryRow("SELECT uploaded FROM users WHERE hash = ?", hash).Scan(&uploaded)
-	if uploaded >= c.Threshold {
-		fmt.Fprintf(channel.Stderr(), "\u2713 Downloads unlocked. You have uploaded %s.\r\n\r\n", formatBytes(uploaded))
-	} else {
-		fmt.Fprintf(channel.Stderr(), "\u2191 Upload progress: %s / %s \u2014 upload %s more to unlock downloads.\r\n\r\n",
-			formatBytes(uploaded), formatBytes(c.Threshold), formatBytes(c.Threshold-uploaded))
-	}
-}
-
 func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, sConn *ssh.ServerConn, db *sql.DB, c Config) {
 	defer channel.Close()
-	hash := sConn.Permissions.Extensions["pubkey-hash"]
 
+	h := &fsHandler{
+		db:         db,
+		hash:       sConn.Permissions.Extensions["pubkey-hash"],
+		remoteAddr: sConn.RemoteAddr().String(),
+		cfg:        c,
+		stderr:     channel.Stderr(),
+	}
+	h.printStatus()
 
 	for req := range requests {
 		switch req.Type {
 		case "subsystem":
 			if len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp" {
 				req.Reply(true, nil)
-				h := &fsHandler{
-					db:         db,
-					hash:       hash,
-					remoteAddr: sConn.RemoteAddr().String(),
-					cfg:        c,
-					stderr:     channel.Stderr(),
-				}
 				sftp.NewRequestServer(channel, sftp.Handlers{
 					FileGet: h, FilePut: h, FileCmd: h, FileList: h,
 				}).Serve()
@@ -192,20 +179,28 @@ type fsHandler struct {
 	stderr     io.Writer
 }
 
-// deny writes a message to the client's stderr and returns a permission error.
+func (h *fsHandler) printStatus() {
+	var uploaded int64
+	h.db.QueryRow("SELECT uploaded FROM users WHERE hash = ?", h.hash).Scan(&uploaded)
+	if uploaded >= h.cfg.Threshold {
+		fmt.Fprintf(h.stderr, "\u2713 Downloads unlocked. You have uploaded %s.\r\n", formatBytes(uploaded))
+	} else {
+		fmt.Fprintf(h.stderr, "\u2191 Upload progress: %s / %s \u2014 upload %s more to unlock downloads.\r\n",
+			formatBytes(uploaded), formatBytes(h.cfg.Threshold), formatBytes(h.cfg.Threshold-uploaded))
+	}
+}
+
 func (h *fsHandler) deny(format string, args ...any) error {
 	fmt.Fprintf(h.stderr, "Denied: "+format+"\n", args...)
 	return sftp.ErrSSHFxPermissionDenied
 }
 
-// dbExec runs a fire-and-forget DB statement, logging any error.
 func (h *fsHandler) dbExec(query string, args ...any) {
 	if _, err := h.db.Exec(query, args...); err != nil {
 		log.Printf("dbExec %q: %v", query, err)
 	}
 }
 
-// withTx runs fn inside a transaction, rolling back on error.
 func (h *fsHandler) withTx(fn func(*sql.Tx) error) error {
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -229,12 +224,10 @@ func (h *fsHandler) ownerCheck(q interface{ QueryRow(string, ...any) *sql.Row },
 	return nil
 }
 
-// clean normalises a client-supplied path to a relative form with no leading slash.
 func (h *fsHandler) clean(p string) string {
 	return strings.TrimPrefix(path.Clean("/"+p), "/")
 }
 
-// safePath resolves rel against the upload root and rejects traversal attempts.
 func (h *fsHandler) safePath(rel string) (string, error) {
 	base, err := filepath.Abs(h.cfg.Dir)
 	if err != nil {
@@ -409,6 +402,7 @@ func (w *statWriter) Close() error {
 		}
 		log.Printf("[UPLOAD] Path: %q, Size: %d, Delta: %d, UserHash: %s, Address: %s",
 			w.rel, newSize, delta, w.h.hash, w.h.remoteAddr)
+		w.h.printStatus()
 		return nil
 	})
 }
