@@ -75,11 +75,15 @@ func main() {
 			return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": h}}, nil
 		},
 		BannerCallback: func(conn ssh.ConnMetadata) string {
-			return "\r\n" +
-				"░█▀▀░█░█░█▀█░█▀▄░█▀▀░░░█▀▀░▀█▀░█▀▄░█▀▀░▀█▀░░░█▀▀░█▀▀░▀█▀░█▀█\r\n" +
-				"░▀▀█░█▀█░█▀█░█▀▄░█▀▀░░░█▀▀░░█░░█▀▄░▀▀█░░█░░░░▀▀█░█▀▀░░█░░█▀▀\r\n" +
-				"░▀▀▀░▀░▀░▀░▀░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░░░▀▀▀░▀░░░░▀░░▀░░\r\n" +
-				"Welcome. This is a share-first SFTP archive.\r\n\r\n"
+
+			var count, size int64
+			db.QueryRow("SELECT COUNT(*), SUM(size) FROM files").Scan(&count, &size)
+			return fmt.Sprintf("\r\n"+
+				"░█▀▀░█░█░█▀█░█▀▄░█▀▀░░░█▀▀░▀█▀░█▀▄░█▀▀░▀█▀░░░█▀▀░█▀▀░▀█▀░█▀█\r\n"+
+				"░▀▀█░█▀█░█▀█░█▀▄░█▀▀░░░█▀▀░░█░░█▀▄░▀▀█░░█░░░░▀▀█░█▀▀░░█░░█▀▀\r\n"+
+				"░▀▀▀░▀░▀░▀░▀░▀░▀░▀▀▀░░░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░░░▀▀▀░▀░░░░▀░░▀░░\r\n"+
+
+				"Welcome. Serving %d files, %s\r\n", count, formatBytes(size))
 		},
 	}
 	cfg.AddHostKey(signer)
@@ -389,45 +393,25 @@ func (w *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	return w.File.WriteAt(p, off)
 }
 
-func (w *statWriter) Close() (err error) {
-	defer func() {
-		closeErr := w.File.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	if syncErr := w.Sync(); syncErr != nil {
-		return syncErr
-	}
-
-	fi, statErr := w.Stat()
-	if statErr != nil {
-		return statErr
-	}
+func (w *statWriter) Close() error {
+	w.Sync()
+	fi, _ := w.Stat()
 	newSize := fi.Size()
 
-	dbErr := w.h.withTx(func(tx *sql.Tx) error {
-		var oldSize int64
-		tx.QueryRow("SELECT size FROM files WHERE path = ?", w.rel).Scan(&oldSize)
-		delta := max(newSize-oldSize, 0)
+	defer w.File.Close()
 
-		_, err := tx.Exec("UPDATE files SET size = ?, owner = ? WHERE path = ?", newSize, w.h.hash, w.rel)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash)
-		log.Printf("[UPLOAD] Path: %q, Size: %d, Delta: %d, UserHash: %s, Address: %s",
-			w.rel, newSize, delta, w.h.hash, w.h.remoteAddr)
+	tx, _ := w.h.db.Begin()
+	defer tx.Rollback()
+	var oldSize int64
+	tx.QueryRow("SELECT size FROM files WHERE path = ?", w.rel).Scan(&oldSize)
+	delta := max(newSize-oldSize, 0)
+	tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, ?, 0)", w.rel, w.h.hash, newSize)
+	tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash)
 
-		return err
-	})
-
-	if dbErr != nil {
-		return dbErr
+	if err := tx.Commit(); err == nil {
+		log.Printf("[UP] %s (%s) by %s", w.rel, formatBytes(newSize), w.h.hash[:8])
+		w.h.printStatus()
 	}
-
-	w.h.printStatus()
 	return nil
 }
 
