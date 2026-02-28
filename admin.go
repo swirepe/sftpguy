@@ -98,8 +98,6 @@ var (
 	styleCyanBold   = styleCyan.Bold(true)
 	styleBlueBold   = styleBlue.Bold(true)
 
-	styleHR = styleDarkGray.Render(strings.Repeat("─", 72))
-
 	styleBanner = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("1")).
@@ -336,10 +334,9 @@ func (a *adminConsole) dispatch(cmd string, args []string) (string, bool) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (a *adminConsole) Run() {
-	a.srv.store.LogEvent(EventAdmin, "admin", a.sessionID, nil, "action", "login")
+	a.srv.store.LogEvent(EventAdminLogin, "admin", a.sessionID, nil, "action", "login")
 
 	if a.hasPTY {
-		//a.logger.debug
 		a.runTUI()
 	} else {
 		a.runREPL()
@@ -354,12 +351,13 @@ func (a *adminConsole) Run() {
 
 // adminModel is the Bubble Tea model.
 type adminModel struct {
-	console   *adminConsole
-	input     textinput.Model
-	history   []string // command history
-	histIdx   int      // current position in history (-1 = new entry)
-	outputBuf string   // accumulated output rendered above the prompt
-	quitting  bool
+	console     *adminConsole
+	input       textinput.Model
+	history     []string // command history
+	histIdx     int      // current position in history (-1 = new entry)
+	outputBuf   string   // accumulated output rendered above the prompt
+	quitting    bool
+	windowWidth int // updated by tea.WindowSizeMsg; 0 means unknown
 
 	// confirmCmd holds a pending destructive command waiting for user input.
 	confirmCmd *pendingConfirm
@@ -367,8 +365,9 @@ type adminModel struct {
 
 // pendingConfirm represents a two-step confirmation prompt (purge, shutdown).
 type pendingConfirm struct {
-	prompt  string
-	onInput func(answer string) string // returns output to display
+	prompt     string
+	shouldQuit bool                       // set by onInput to request TUI exit
+	onInput    func(answer string) string // returns output to display
 }
 
 type cmdResultMsg struct {
@@ -383,16 +382,20 @@ func initialAdminModel(a *adminConsole) adminModel {
 	ti.CharLimit = 1024
 	ti.Width = 72
 
+	now := time.Now()
 	banner := styleBanner.Render("  sftpguy  ADMIN  CONSOLE  ") + "\n"
-	meta := styleDarkGray.Render(fmt.Sprintf("Session: %s   Time: %s",
-		a.sessionID[:16], time.Now().Format("2006-01-02 15:04:05"))) + "\n"
-	hint := styleCyan.Render(`Type "help" for a list of commands.`) + "\n"
+	serverLine := styleDarkGray.Render("Server: ") + styleWhiteBold.Render(a.srv.cfg.Name) +
+		styleDarkGray.Render("   Port: ") + styleWhite.Render(fmt.Sprintf("%d", a.srv.cfg.Port)) + "\n"
+	sessionLine := styleDarkGray.Render(fmt.Sprintf("Session: %s", a.sessionID[:16])) + "\n"
+	timeLine := styleDarkGray.Render(fmt.Sprintf("Time:    %s", now.Format("2006-01-02 15:04:05 MST"))) + "\n"
+	hint := styleCyan.Render(`Type "help" for a list of commands, "exit" to disconnect.`) + "\n"
 
 	return adminModel{
-		console:   a,
-		input:     ti,
-		histIdx:   -1,
-		outputBuf: banner + meta + hint,
+		console:     a,
+		input:       ti,
+		histIdx:     -1,
+		windowWidth: 0,
+		outputBuf:   banner + serverLine + sessionLine + timeLine + hrLine(72) + "\n" + hint,
 	}
 }
 
@@ -473,7 +476,11 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
-		m.input.Width = msg.Width - 20
+		m.windowWidth = msg.Width
+		promptOverhead := 20 // "admin@name /path » " approximate overhead
+		if w := msg.Width - promptOverhead; w > 20 {
+			m.input.Width = w
+		}
 		return m, nil
 	}
 
@@ -493,13 +500,19 @@ func (m adminModel) View() string {
 		" " + styleDarkGray.Render(m.console.cwdDisplay()) +
 		" " + styleCyanBold.Render("» ")
 
+	// Ensure outputBuf ends with exactly one newline before the prompt area.
+	buf := strings.TrimRight(m.outputBuf, "\n")
+	if buf != "" {
+		buf += "\n"
+	}
+
 	if m.confirmCmd != nil {
-		return m.outputBuf +
+		return buf + "\n" +
 			styleYellowBold.Render(m.confirmCmd.prompt) + "\n" +
 			prompt + m.input.View()
 	}
 
-	return m.outputBuf + "\n" + prompt + m.input.View()
+	return buf + "\n" + prompt + m.input.View()
 }
 
 // handleConfirm processes a keypress when we are waiting for confirmation.
@@ -512,11 +525,12 @@ func (m adminModel) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	answer := strings.TrimSpace(m.input.Value())
 	m.input.SetValue("")
 
-	output := m.confirmCmd.onInput(answer)
-	m.outputBuf += output
+	pending := m.confirmCmd
 	m.confirmCmd = nil
+	output := pending.onInput(answer)
+	m.outputBuf += output
 
-	if strings.Contains(output, "Shutting down") {
+	if pending.shouldQuit {
 		m.quitting = true
 		return m, tea.Quit
 	}
@@ -528,18 +542,19 @@ func (m adminModel) startConfirm(cmd string, args []string) (adminModel, tea.Cmd
 	switch cmd {
 	case "shutdown":
 		m.outputBuf += styleRedBold.Render("WARNING: This will shut down the server for ALL users.") + "\n"
-		m.confirmCmd = &pendingConfirm{
+		pending := &pendingConfirm{
 			prompt: `Type "SHUTDOWN" to confirm, or anything else to cancel:`,
-			onInput: func(answer string) string {
-				if answer != "SHUTDOWN" {
-					return styleYellow.Render("Cancelled.") + "\n"
-				}
-				out := styleRedBold.Render("Shutting down…") + "\n"
-				m.console.srv.store.LogEvent(EventAdmin, "admin", m.console.sessionID, nil, "action", "shutdown")
-				go m.console.srv.Shutdown()
-				return out
-			},
 		}
+		pending.onInput = func(answer string) string {
+			if answer != "SHUTDOWN" {
+				return styleYellow.Render("Cancelled.") + "\n"
+			}
+			pending.shouldQuit = true
+			m.console.srv.store.LogEvent(EventAdmin, "admin", m.console.sessionID, nil, "action", "shutdown")
+			go m.console.srv.Shutdown()
+			return styleRedBold.Render("Shutting down…") + "\n"
+		}
+		m.confirmCmd = pending
 
 	case "purge":
 		var sb strings.Builder
@@ -615,10 +630,12 @@ func (a *adminConsole) runREPL() {
 	write("\r\n" + styleRedBold.Render("╔══════════════════════════════════════════╗") + "\r\n")
 	write(styleRedBold.Render("║      sftpguy  ADMIN  CONSOLE             ║") + "\r\n")
 	write(styleRedBold.Render("╚══════════════════════════════════════════╝") + "\r\n")
-	write(styleYellow.Render("Logged in as: ") + styleWhiteBold.Render("ADMIN") + "\r\n")
-	write(styleDarkGray.Render(fmt.Sprintf("Session: %s   Time: %s\r\n",
-		a.sessionID[:16], time.Now().Format("2006-01-02 15:04:05"))))
-	write("\r\n" + styleCyan.Render(`Type "help" for a list of commands.`) + "\r\n")
+	write(styleDarkGray.Render("Server:  ") + styleWhiteBold.Render(a.srv.cfg.Name) +
+		styleDarkGray.Render("   Port: ") + styleWhite.Render(fmt.Sprintf("%d", a.srv.cfg.Port)) + "\r\n")
+	write(styleDarkGray.Render(fmt.Sprintf("Session: %s", a.sessionID[:16])) + "\r\n")
+	write(styleDarkGray.Render(fmt.Sprintf("Time:    %s", time.Now().Format("2006-01-02 15:04:05 MST"))) + "\r\n")
+	write(hrLine(72) + "\r\n")
+	write(styleCyan.Render(`Type "help" for a list of commands, "exit" to disconnect.`) + "\r\n")
 
 	for {
 		prompt := styleRedBold.Render("admin") +
@@ -739,12 +756,35 @@ func (a *adminConsole) replConfirm(cmd string, args []string,
 // Output helper — writes a styled, formatted line into a strings.Builder
 // ─────────────────────────────────────────────────────────────────────────────
 
+// writef renders a styled, formatted string into sb.
+// The format string should include its own trailing newline where appropriate.
 func writef(sb *strings.Builder, style lipgloss.Style, format string, args ...any) {
-	sb.WriteString(style.Render(fmt.Sprintf(format, args...)) + "\n")
+	msg := fmt.Sprintf(format, args...)
+	// Render strips trailing whitespace/newlines; put them back.
+	trail := ""
+	trimmed := strings.TrimRight(msg, "\n")
+	trail = strings.Repeat("\n", len(msg)-len(trimmed))
+	sb.WriteString(style.Render(trimmed) + trail)
+}
+
+// hrLine returns a horizontal rule styled for the given column width.
+// The width is clamped to a sensible range.
+func hrLine(width int) string {
+	if width < 40 {
+		width = 72
+	}
+	if width > 200 {
+		width = 200
+	}
+	return styleDarkGray.Render(strings.Repeat("─", width))
 }
 
 func writeHR(sb *strings.Builder) {
-	sb.WriteString(styleHR + "\n")
+	sb.WriteString(hrLine(72) + "\n")
+}
+
+func writeHRW(sb *strings.Builder, width int) {
+	sb.WriteString(hrLine(width) + "\n")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -885,7 +925,7 @@ func (s *Store) ListIPBans() ([]string, error) {
 		if err := rows.Scan(&ip, &at); err != nil {
 			continue
 		}
-		out = append(out, fmt.Sprintf("%-20s  banned at %s", ip, at))
+		out = append(out, fmt.Sprintf("  %-24s  %s", ip, at))
 	}
 	return out, rows.Err()
 }
@@ -988,6 +1028,7 @@ func (a *adminConsole) cmdLs(args []string, out *strings.Builder) {
 	displayPath := "/" + filepath.ToSlash(strings.TrimPrefix(full, a.srv.absUploadDir))
 	out.WriteString(styleCyan.Render(displayPath+":") + "\n")
 
+	fileCount, dirCount := 0, 0
 	for _, e := range entries {
 		fi, _ := e.Info()
 		if fi == nil {
@@ -999,8 +1040,10 @@ func (a *adminConsole) cmdLs(args []string, out *strings.Builder) {
 		if e.IsDir() {
 			name = styleBlueBold.Render(name + "/")
 			sizeStr = "        "
+			dirCount++
 		} else {
 			name = styleWhite.Render(name)
+			fileCount++
 		}
 		relPath := a.toRel(filepath.Join(full, e.Name()))
 		owner, _ := a.srv.store.GetFileOwner(relPath)
@@ -1013,6 +1056,7 @@ func (a *adminConsole) cmdLs(args []string, out *strings.Builder) {
 			styleDarkGray.Render(shortID(owner)),
 			name))
 	}
+	out.WriteString(styleDarkGray.Render(fmt.Sprintf("  %d file(s), %d dir(s)\n", fileCount, dirCount)))
 }
 
 func (a *adminConsole) cmdCat(args []string, out *strings.Builder) {
@@ -1156,12 +1200,17 @@ func (a *adminConsole) cmdInspect(args []string, out *strings.Builder) {
 	}
 
 	writeHR(out)
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Path:"), styleWhite.Render("/"+rel)))
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Type:"), typeStr))
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Size:"), formatBytes(fi.Size())))
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Modified:"), fi.ModTime().Format("2006-01-02 15:04:05")))
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Owner:"), shortID(owner)))
-	out.WriteString(fmt.Sprintf("  %-18s %s\n", styleCyan.Render("Permissions:"), fi.Mode().String()))
+	inspectRow := func(label, value string) {
+		out.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleCyan.Render(fmt.Sprintf("%-12s", label)),
+			styleWhite.Render(value)))
+	}
+	inspectRow("Path:", "/"+rel)
+	inspectRow("Type:", typeStr)
+	inspectRow("Size:", formatBytes(fi.Size()))
+	inspectRow("Modified:", fi.ModTime().Format("2006-01-02 15:04:05"))
+	inspectRow("Owner:", shortID(owner))
+	inspectRow("Permissions:", fi.Mode().String())
 	writeHR(out)
 }
 
@@ -1184,7 +1233,7 @@ func (a *adminConsole) cmdUsers(out *strings.Builder) {
 	defer rows.Close()
 
 	writeHR(out)
-	out.WriteString(fmt.Sprintf("  %-14s  %-20s  %-10s  %-10s  %-10s  %-6s\n",
+	out.WriteString(fmt.Sprintf("  %-14s  %-20s  %-10s  %-12s  %-12s  %-6s\n",
 		styleCyan.Render("ID (prefix)"), styleCyan.Render("Last login"),
 		styleCyan.Render("Uploads"), styleCyan.Render("Up bytes"),
 		styleCyan.Render("Dn bytes"), styleCyan.Render("Banned")))
@@ -1201,11 +1250,11 @@ func (a *adminConsole) cmdUsers(out *strings.Builder) {
 		if hash == "system" {
 			continue
 		}
-		banStr := ""
+		banStr := "      " // 6 spaces to preserve column alignment when not banned
 		if banned {
-			banStr = styleRedBold.Render("YES")
+			banStr = styleRedBold.Render("BANNED")
 		}
-		out.WriteString(fmt.Sprintf("  %-14s  %-20s  %-10d  %-10s  %-10s  %s\n",
+		out.WriteString(fmt.Sprintf("  %-14s  %-20s  %-10d  %-12s  %-12s  %s\n",
 			shortID(hash), lastLogin, upCount,
 			formatBytes(upBytes), formatBytes(dnBytes), banStr))
 		count++
@@ -1236,17 +1285,30 @@ func (a *adminConsole) cmdUser(args []string, out *strings.Builder) {
 	files, _ := a.srv.store.FilesByOwner(hash)
 
 	writeHR(out)
-	out.WriteString(styleYellowBold.Render(fmt.Sprintf("User: %s", hash)) + "\n")
-	out.WriteString(fmt.Sprintf("  Last login:    %s\n", stats.LastLogin))
-	out.WriteString(fmt.Sprintf("  Uploads:       %d files, %s\n", stats.UploadCount, formatBytes(stats.UploadBytes)))
-	out.WriteString(fmt.Sprintf("  Downloads:     %d files, %s\n", stats.DownloadCount, formatBytes(stats.DownloadBytes)))
+	out.WriteString(styleYellowBold.Render("User: "+hash) + "\n")
+	userRow := func(label, value string) {
+		out.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleCyan.Render(fmt.Sprintf("%-18s", label)),
+			styleWhite.Render(value)))
+	}
+	userRow("Last login:", stats.LastLogin)
+	userRow("Uploads:", fmt.Sprintf("%d files, %s", stats.UploadCount, formatBytes(stats.UploadBytes)))
+	userRow("Downloads:", fmt.Sprintf("%d files, %s", stats.DownloadCount, formatBytes(stats.DownloadBytes)))
+
 	contribStr := fmt.Sprintf("%v", isContrib)
 	if !isContrib {
 		contribStr += fmt.Sprintf(" (needs %s more)", formatBytes(needed))
 	}
-	out.WriteString(fmt.Sprintf("  Contributor:   %s\n", contribStr))
-	out.WriteString(fmt.Sprintf("  Shadow-banned: %v\n", isBanned))
-	out.WriteString(fmt.Sprintf("  Files owned:   %d\n", len(files)))
+	userRow("Contributor:", contribStr)
+
+	bannedStr := "no"
+	if isBanned {
+		bannedStr = styleRedBold.Render("YES — shadow-banned")
+	}
+	out.WriteString(fmt.Sprintf("  %s  %s\n",
+		styleCyan.Render(fmt.Sprintf("%-18s", "Shadow-banned:")),
+		bannedStr))
+	userRow("Files owned:", fmt.Sprintf("%d", len(files)))
 	if len(files) > 0 {
 		max := 20
 		if len(files) < max {
@@ -1320,14 +1382,18 @@ func (a *adminConsole) cmdBan(args []string, ban bool, out *strings.Builder) {
 			writef(out, styleRed, "Ban error: %v\n", err)
 			return
 		}
-		out.WriteString(styleRedBold.Render(fmt.Sprintf("Shadow-banned: %s", shortID(hash))) + "\n")
+		writeHR(out)
+		out.WriteString(styleRedBold.Render(fmt.Sprintf("  ✗  Shadow-banned: %s", shortID(hash))) + "\n")
+		writeHR(out)
 		a.srv.store.LogEvent(EventShadowBan, hash, a.sessionID, nil, "action", "ban")
 	} else {
 		if err := a.srv.store.Unban(hash); err != nil {
 			writef(out, styleRed, "Unban error: %v\n", err)
 			return
 		}
-		writef(out, styleGreen, "Unbanned: %s\n", shortID(hash))
+		writeHR(out)
+		out.WriteString(styleGreenBold.Render(fmt.Sprintf("  ✓  Unbanned: %s", shortID(hash))) + "\n")
+		writeHR(out)
 		a.srv.store.LogEvent(EventAdmin, hash, a.sessionID, nil, "action", "unban")
 	}
 }
@@ -1363,14 +1429,18 @@ func (a *adminConsole) cmdIPBan(args []string, ban bool, out *strings.Builder) {
 			writef(out, styleRed, "Error: %v\n", err)
 			return
 		}
-		out.WriteString(styleRedBold.Render(fmt.Sprintf("IP shadow-banned: %s", ip)) + "\n")
+		writeHR(out)
+		out.WriteString(styleRedBold.Render(fmt.Sprintf("  ✗  IP shadow-banned: %s", ip)) + "\n")
+		writeHR(out)
 		a.srv.store.LogEvent(EventAdmin, "admin", a.sessionID, nil, "action", "ip-ban", "ip", ip)
 	} else {
 		if err := a.srv.store.UnbanIP(ip); err != nil {
 			writef(out, styleRed, "Error: %v\n", err)
 			return
 		}
-		writef(out, styleGreen, "IP unbanned: %s\n", ip)
+		writeHR(out)
+		out.WriteString(styleGreenBold.Render(fmt.Sprintf("  ✓  IP unbanned: %s", ip)) + "\n")
+		writeHR(out)
 		a.srv.store.LogEvent(EventAdmin, "admin", a.sessionID, nil, "action", "ip-unban", "ip", ip)
 	}
 }
@@ -1386,10 +1456,15 @@ func (a *adminConsole) cmdIPList(out *strings.Builder) {
 		return
 	}
 	writeHR(out)
+	out.WriteString(fmt.Sprintf("  %s  %s\n",
+		styleCyan.Render(fmt.Sprintf("%-24s", "IP address")),
+		styleCyan.Render("Banned at")))
+	writeHR(out)
 	for _, b := range bans {
-		out.WriteString(" " + b + "\n")
+		out.WriteString(styleLightGray.Render(b) + "\n")
 	}
 	writeHR(out)
+	out.WriteString(fmt.Sprintf("  %d banned IPs\n", len(bans)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1462,8 +1537,32 @@ func (a *adminConsole) cmdLogs(args []string, userFilter, eventFilter, ipFilter 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ts < entries[j].ts })
 
 	writeHR(out)
+	out.WriteString(fmt.Sprintf("  %s  %-18s  %-16s  %-28s  %s\n",
+		styleCyan.Render("Timestamp"),
+		styleCyan.Render("IP"),
+		styleCyan.Render("User"),
+		styleCyan.Render("Event"),
+		styleCyan.Render("Detail")))
+	writeHR(out)
 	for _, e := range entries {
-		eventCol := styleCyan.Render(fmt.Sprintf("%-28s", e.event))
+		// Colour-code event kind; pad *before* styling to preserve column alignment.
+		eventPadded := fmt.Sprintf("%-28s", e.event)
+		var eventCol string
+		switch {
+		case strings.HasPrefix(e.event, "upload"):
+			eventCol = styleGreen.Render(eventPadded)
+		case strings.HasPrefix(e.event, "download"):
+			eventCol = styleBlue.Render(eventPadded)
+		case strings.HasPrefix(e.event, "admin"):
+			eventCol = styleYellow.Render(eventPadded)
+		case strings.HasPrefix(e.event, "ban"), strings.HasPrefix(e.event, "shadow"):
+			eventCol = styleRed.Render(eventPadded)
+		case strings.HasPrefix(e.event, "login"):
+			eventCol = styleCyan.Render(eventPadded)
+		default:
+			eventCol = styleLightGray.Render(eventPadded)
+		}
+
 		extra := e.path
 		if extra == "" {
 			extra = e.meta
@@ -1471,7 +1570,7 @@ func (a *adminConsole) cmdLogs(args []string, userFilter, eventFilter, ipFilter 
 		if len(extra) > 60 {
 			extra = extra[:60] + "…"
 		}
-		out.WriteString(fmt.Sprintf("  %s  %-16s  %-14s  %s  %s\n",
+		out.WriteString(fmt.Sprintf("  %s  %-18s  %-16s  %s  %s\n",
 			styleDarkGray.Render(e.ts),
 			styleLightGray.Render(e.ip),
 			styleDarkGray.Render(e.userID),
@@ -1505,7 +1604,9 @@ func (a *adminConsole) cmdStats(out *strings.Builder) {
 		{"Total stored bytes:", formatBytes(int64(b))},
 		{"Log entries:", fmt.Sprintf("%d", logCount)},
 	} {
-		out.WriteString(fmt.Sprintf("  %-30s %s\n", row[0], styleWhiteBold.Render(row[1])))
+		out.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleDarkGray.Render(fmt.Sprintf("%-30s", row[0])),
+			styleWhiteBold.Render(row[1])))
 	}
 	writeHR(out)
 }
@@ -1533,8 +1634,11 @@ func (a *adminConsole) cmdTopUsers(args []string, mode string, out *strings.Buil
 	defer rows.Close()
 
 	writeHR(out)
-	out.WriteString(fmt.Sprintf("  %-14s  %-14s  %-14s\n",
-		styleCyan.Render("ID (prefix)"), styleCyan.Render(label), styleCyan.Render("Files")))
+	out.WriteString(fmt.Sprintf("  %-4s  %-14s  %-14s  %s\n",
+		styleCyan.Render("Rank"),
+		styleCyan.Render("ID (prefix)"),
+		styleCyan.Render(label),
+		styleCyan.Render("Files")))
 	writeHR(out)
 	rank := 1
 	for rows.Next() {
@@ -1547,7 +1651,7 @@ func (a *adminConsole) cmdTopUsers(args []string, mode string, out *strings.Buil
 		if mode == "download" {
 			bytes, count = dnBytes, dnCount
 		}
-		out.WriteString(fmt.Sprintf("  %2d. %-14s  %-14s  %d\n", rank, shortID(hash), formatBytes(bytes), count))
+		out.WriteString(fmt.Sprintf("  %4d. %-14s  %-14s  %d\n", rank, shortID(hash), formatBytes(bytes), count))
 		rank++
 	}
 	writeHR(out)
@@ -1577,7 +1681,10 @@ func (a *adminConsole) cmdConfig(out *strings.Builder) {
 		{"Lock dirs to owners", fmt.Sprintf("%v", cfg.LockDirectoriesToOwners)},
 		{"Unrestricted paths", fmt.Sprintf("%v", cfg.Unrestricted)},
 	} {
-		out.WriteString(fmt.Sprintf("  %-28s %s\n", styleCyan.Render(r[0]), styleWhite.Render(r[1])))
+		// Pad the label before styling so ANSI codes don't corrupt column width.
+		out.WriteString(fmt.Sprintf("  %s  %s\n",
+			styleCyan.Render(fmt.Sprintf("%-28s", r[0])),
+			styleWhite.Render(r[1])))
 	}
 	writeHR(out)
 }
@@ -1639,8 +1746,10 @@ func (a *adminConsole) cmdHelp(args []string, out *strings.Builder) {
 	for _, cat := range categoryOrder {
 		out.WriteString("\n" + styleYellowBold.Render(cat) + "\n")
 		for _, c := range byCategory[cat] {
-			out.WriteString(fmt.Sprintf("  %-36s %s\n",
-				styleCyan.Render(c.Usage), styleDarkGray.Render(c.Help)))
+			// Pad usage before styling so column widths are accurate.
+			usagePadded := fmt.Sprintf("%-36s", c.Usage)
+			out.WriteString(fmt.Sprintf("  %s %s\n",
+				styleCyan.Render(usagePadded), styleDarkGray.Render(c.Help)))
 		}
 	}
 	writeHR(out)
