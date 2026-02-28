@@ -32,7 +32,6 @@ import (
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -47,6 +46,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -63,7 +63,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-//go:embed sftpguy.go fortunes.txt
+//go:embed sftpguy.go admin.go fortunes.txt
 var embeddedSource embed.FS
 
 // Default files that are always downloadable
@@ -126,12 +126,66 @@ const (
 		FOREIGN KEY (owner_hash) REFERENCES users (pubkey_hash) 
 			ON DELETE CASCADE 
 			ON UPDATE CASCADE
-	);`
+	);
+
+
+	-- shadow_banned means 
+	--  1.  your connection is severely throttled
+	--  2.  you can login and list files as normal
+	--  3.  all other operations do nothing for a random period of time, 
+	--      then return with a generic error
+	CREATE TABLE IF NOT EXISTS shadow_banned (
+		pubkey_hash text primary key,
+		banned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+		FOREIGN KEY (pubkey_hash) REFERENCES users (pubkey_hash) 
+			ON DELETE CASCADE 
+			ON UPDATE CASCADE
+	);
+
+	CREATE TABLE IF NOT EXISTS ip_banned (
+		ip_address TEXT PRIMARY KEY,
+		banned_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS log (
+		id           INTEGER PRIMARY KEY,
+		timestamp    INTEGER NOT NULL,
+		ip_address   TEXT NOT NULL,
+		port         INTEGER NOT NULL,
+		user_id      TEXT,
+		user_session TEXT,
+		event        TEXT NOT NULL,
+		path         TEXT,
+		meta         TEXT
+	);
+	CREATE INDEX IF NOT EXISTS log_timestamp_idx ON log (timestamp);
+	CREATE INDEX IF NOT EXISTS log_ip_address_idx ON log (ip_address);
+	CREATE INDEX IF NOT EXISTS log_user_idx      ON log (user_id, timestamp);
+	CREATE INDEX IF NOT EXISTS log_event_idx     ON log (event);
+	CREATE INDEX IF NOT EXISTS log_session_idx   ON log (user_session);
+`
 )
 
 // ============================================================================
 // User Permission Errors
 // ============================================================================
+
+type EventKind string
+
+const (
+	EventShell                 EventKind = "shell"
+	EventExec                  EventKind = "exec"
+	EventLogin                 EventKind = "login"
+	EventUpload                EventKind = "upload"
+	EventDownload              EventKind = "download"
+	EventDelete                EventKind = "delete"
+	EventRename                EventKind = "rename"
+	EventDenied                EventKind = "denied"
+	EventDeniedSymlink         EventKind = "denied/symlink"
+	EventDeniedContributorLock EventKind = "denied/contributor-lock" // todo: other event kinds
+	EventShadowBan             EventKind = "shadow_ban"
+)
 
 var errorPrefix = struct {
 	EN string
@@ -142,6 +196,7 @@ var errorPrefix = struct {
 }
 
 type UserPermissionError struct {
+	Kind EventKind
 	EN   string
 	ZH   string
 	args []any
@@ -167,9 +222,10 @@ func (e UserPermissionError) Error() string {
 		errorPrefix.ZH, e.format(e.ZH))
 }
 
+// TODO: fill in these event kinds
 var (
-	errMsgSymlinksProhibited = UserPermissionError{EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
-	errMsgContributorsLocked = UserPermissionError{
+	errMsgSymlinksProhibited = UserPermissionError{Kind: EventDeniedSymlink, EN: "Symlinks are prohibited.", ZH: "禁止使用符号链接。"}
+	errMsgContributorsLocked = UserPermissionError{Kind: EventDeniedContributorLock,
 		EN: "%s is only available to contributors who have uploaded at least %s: upload %d more bytes.",
 		ZH: "文件 %s 仅对已上传至少 %s 字节的贡献者可用：再上传 %d 字节。"}
 	errMsgFileProtected    = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
@@ -199,6 +255,7 @@ type userStats struct {
 	DownloadCount int64
 	DownloadBytes int64
 	FirstTimer    bool
+	IsBanned      bool
 }
 
 func (u userStats) IsContributor(threshold int64) (bool, int64) {
@@ -475,6 +532,48 @@ func (s *Store) FilesByOwner(pubHash string) ([]string, error) {
 	return paths, nil
 }
 
+func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr net.Addr, args ...any) {
+	ip := ""
+	port := 0
+	if remoteAddr != nil {
+		host, portStr, err := net.SplitHostPort(remoteAddr.String())
+		if err == nil {
+			ip = host
+			port, _ = strconv.Atoi(portStr)
+		}
+	}
+
+	// Pull path and meta out of the variadic key-value args
+	path := ""
+	meta := map[string]any{}
+	for i := 0; i+1 < len(args); i += 2 {
+		k, _ := args[i].(string)
+		v := args[i+1]
+		switch k {
+		case "path":
+			path, _ = v.(string)
+		default:
+			meta[k] = v
+		}
+	}
+
+	metaJSON := ""
+	if len(meta) > 0 {
+		if b, err := json.Marshal(meta); err == nil {
+			metaJSON = string(b)
+		}
+	}
+
+	_, err := s.exec(`
+		INSERT INTO log (timestamp, ip_address, port, user_id, user_session, event, path, meta)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().Unix(), ip, port, pubHash, sessionID, string(kind), path, metaJSON,
+	)
+	if err != nil {
+		s.logger.Warn("failed to log event", "kind", kind, "err", err)
+	}
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -498,6 +597,8 @@ type Config struct {
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
 	BootstrapSrc            bool
+	AdminEnabled            bool
+	SshNoAuth               bool
 }
 
 func LoadConfig() (Config, error) {
@@ -515,14 +616,17 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 10000, "Maximum total directories allowed in archive")
 	EnvFlag(&cfg.Unrestricted, "unrestricted", "UNRESTRICTED_PATHS", strings.Join(defaultUnrestrictedPaths, ","), "Comma-separated list of paths always available for download")
 	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
-	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable verbose logging")
+	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.")
 	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Enable debug logging")
-
+	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
+	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
 
 	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code and fortunes to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
+
+	i := flag.Bool("install", false, "Install this program as a system service (requires root)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -532,6 +636,14 @@ func LoadConfig() (Config, error) {
 
 	if *v {
 		fmt.Printf("%s v%s\n", cfg.Name, AppVersion)
+		os.Exit(0)
+	}
+
+	if *i {
+		if err := runInstall(sanitizeName(cfg.Name)); err != nil {
+			fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -643,6 +755,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) bootstrapSource() error {
+	// todo: maybe we just walk the tree
 	s.logger.Info("bootstrapping source files to upload directory")
 	// Copy sftpguy.go
 	srcData, err := embeddedSource.ReadFile(sourceFile)
@@ -690,8 +803,11 @@ func (s *Server) Listen() error {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		BannerCallback:    s.bannerCallback,
-		PublicKeyCallback: s.publicKeyCallback,
+		BannerCallback:       s.bannerCallback,
+		PublicKeyCallback:    s.publicKeyCallback,
+		NoClientAuth:         s.cfg.SshNoAuth,
+		NoClientAuthCallback: s.noClientAuthCallback,
+		PasswordCallback:     s.passwordCallback,
 	}
 
 	keyBytes, _ := os.ReadFile(s.cfg.HostKeyFile)
@@ -728,7 +844,52 @@ func (s *Server) Listen() error {
 
 func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+
+	ext := map[string]string{"pubkey-hash": hash}
+	if s.checkAdminKey(key) {
+		ext["admin"] = "1"
+	}
+	return &ssh.Permissions{Extensions: ext}, nil
+}
+
+func (s *Server) noClientAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+	ip := getHostIp(conn)
+
+	data := fmt.Sprintf("anon-auth:%s", ip)
+	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
+
+	s.logger.Debug("anonymous login attempt", "ip", ip, "generated_hash", hash)
+
 	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
+}
+
+func remoteToPubhash(remoteAddr net.Addr) string {
+	ip, _, _ := net.SplitHostPort(remoteAddr.String())
+	data := fmt.Sprintf("anon-auth:%s", ip)
+	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
+	return hash
+}
+
+func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+	data := fmt.Sprintf("pwd-auth:%s:%s", conn.User(), string(password))
+	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
+
+	s.logger.Debug("password login attempt",
+		"ip", getHostIp(conn),
+		"user", conn.User(),
+		"generated_hash", hash,
+	)
+
+	// Note: We are effectively "accepting all passwords" here, but
+	// treating the credentials as the seed for their unique UID.
+	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
+}
+func getHostIp(conn ssh.ConnMetadata) string {
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
@@ -749,6 +910,12 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	nConn.SetDeadline(time.Now().Add(30 * time.Second))
 
+	if s.store.IsBannedByIp(nConn.RemoteAddr()) {
+		s.logger.Info("blocked banned IP", "remote_address", nConn.RemoteAddr())
+		nConn.Close()
+		return
+	}
+
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		nConn.Close()
@@ -758,16 +925,26 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
-	stats, _ := s.store.UpsertUserSession(pubHash)
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 
-	logger := s.logger.With(slog.Group("user",
-		"id", shortID(pubHash),
-		"uid", hashToUid(pubHash),
-		"session", sessionID[:16],
-		"remote_address", sConn.RemoteAddr(),
-	))
+	if s.cfg.AdminEnabled && s.isAdminConn(sConn.Permissions) {
+		// ── Admin fast-path ───────────────────────────────────────────
+		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
+		go ssh.DiscardRequests(reqs)
+		for newCh := range chans {
+			if newCh.ChannelType() != "session" {
+				newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
+				continue
+			}
+			ch, chReqs, _ := newCh.Accept()
+			go s.handleAdminChannel(ch, chReqs, sessionID)
+		}
+		return
+	}
 
+	stats, _ := s.store.UpsertUserSession(pubHash)
+	logger := s.logger.With(userGroup(pubHash, sessionID, sConn.RemoteAddr()))
+	isBanned := s.store.IsBanned(pubHash)
 	logger.Info("login")
 	go ssh.DiscardRequests(reqs)
 
@@ -778,11 +955,19 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger)
+		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger, isBanned)
 	}
 }
 
-func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash, sessionID string, stats userStats, sConn *ssh.ServerConn, logger *slog.Logger) {
+func (s *Server) handleChannel(ch ssh.Channel,
+	reqs <-chan *ssh.Request,
+	pubHash,
+	sessionID string,
+	stats userStats,
+	sConn *ssh.ServerConn,
+	logger *slog.Logger,
+	isBanned bool) {
+
 	defer ch.Close()
 	for req := range reqs {
 		s.logger.Debug("handleChannel", "req", req)
@@ -793,11 +978,15 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 				s.Welcome(ch.Stderr(), pubHash, stats)
 
 				handler := &fsHandler{
-					srv:     s,
-					pubHash: pubHash,
-					stderr:  ch.Stderr(),
-					logger:  *logger,
+					srv:        s,
+					pubHash:    pubHash,
+					stderr:     ch.Stderr(),
+					logger:     *logger,
+					remoteAddr: sConn.RemoteAddr(),
+					sessionID:  sessionID,
+					isBanned:   isBanned,
 				}
+				handler.logLogin(stats)
 				server := sftp.NewRequestServer(ch, sftp.Handlers{
 					FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
 				})
@@ -816,9 +1005,11 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 			req.Reply(true, nil)
 
 		case "shell":
+			s.logShell(pubHash, sessionID, sConn.RemoteAddr())
+
 			// Accept the shell request, tell the user it's SFTP-only, then exit
 			req.Reply(true, nil)
-			fmt.Fprintln(ch, "This server is SFTP-only. Shell access is not permitted.")
+			fmt.Fprintln(ch, "This server is SFTP-only. Shell access is not permitted.\r")
 			return
 
 		case "pty-req":
@@ -835,9 +1026,8 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 			req.Reply(true, nil)
 
 		case "exec":
-			var cmd struct{ Value string }
-			ssh.Unmarshal(req.Payload, &cmd)
-			logger.Warn("exec", "cmd", cmd.Value)
+			s.logExec(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
+
 			req.Reply(false, nil)
 
 		default:
@@ -847,6 +1037,27 @@ func (s *Server) handleChannel(ch ssh.Channel, reqs <-chan *ssh.Request, pubHash
 		}
 
 	}
+}
+
+func userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {
+	return slog.Group("user",
+		"id", shortID(pubHash),
+		"uid", hashToUid(pubHash),
+		"session", sessionID[:16],
+		"remote_address", remoteAddr,
+	)
+}
+
+func (s *Server) logExec(pubHash, sessionID string, remoteAddr net.Addr, payload []byte) {
+	var cmd struct{ Value string }
+	ssh.Unmarshal(payload, &cmd)
+	s.logger.Warn("exec", "cmd", cmd.Value, userGroup(pubHash, sessionID, remoteAddr))
+	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr)
+}
+
+func (s *Server) logShell(pubHash, sessionID string, remoteAddr net.Addr) {
+	s.logger.Info("shell", userGroup(pubHash, sessionID, remoteAddr))
+	s.store.LogEvent(EventShell, pubHash, sessionID, remoteAddr)
 }
 
 func (s *Server) getRandomFortune() string {
@@ -907,14 +1118,6 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		const maxToDisplay = 50
 		ownedDirs, shownCount := printGrid(&buffer, files, maxToDisplay)
 
-		// for _, f := range files {
-		// 	if strings.HasSuffix(f, "/") {
-		// 		ownedDirs += 1
-		// 		buffer.WriteString("   " + underline.Fmt(f) + "\r\n")
-		// 	} else {
-		// 		buffer.WriteString(fmt.Sprintf("   %-20s\r\n", f))
-		// 	}
-		// }
 		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-ownedDirs, ownedDirs)
 		fmt.Fprintln(w, buffer.String())
 		if len(files) > shownCount {
@@ -1003,11 +1206,24 @@ func (s *Server) ensureHostKey() error {
 		return nil
 	}
 	_, priv, _ := ed25519.GenerateKey(cryptorand.Reader)
-	bytes, _ := x509.MarshalPKCS8PrivateKey(priv)
-	pemBlock := &pem.Block{Type: "PRIVATE KEY", Bytes: bytes}
-	keyFile, _ := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	defer keyFile.Close()
-	return pem.Encode(keyFile, pemBlock)
+
+	pemBlock, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		return err
+	}
+	keyFile, err := os.OpenFile(s.cfg.HostKeyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, permHostKey)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(keyFile, pemBlock); err != nil {
+		keyFile.Close()
+		return err
+	}
+	keyFile.Close()
+
+	sshPub, _ := ssh.NewPublicKey(priv.Public())
+	pubBytes := ssh.MarshalAuthorizedKey(sshPub)
+	return os.WriteFile(s.cfg.HostKeyFile+".pub", pubBytes, permFile)
 }
 
 func (s *Server) reconcileOrphans() {
@@ -1045,10 +1261,14 @@ func (s *Server) reconcileOrphans() {
 // ============================================================================
 
 type fsHandler struct {
-	srv     *Server
-	pubHash string
-	stderr  io.Writer
-	logger  slog.Logger
+	srv         *Server
+	pubHash     string
+	stderr      io.Writer
+	logger      slog.Logger
+	remoteAddr  net.Addr
+	sessionID   string
+	readLimiter *rate.Limiter // nil if not banned
+	isBanned    bool
 }
 
 type pathMeta struct {
@@ -1059,6 +1279,18 @@ type pathMeta struct {
 	isDir          bool
 	isUnrestricted bool
 	fi             os.FileInfo
+}
+
+func (h *fsHandler) isShadowBanned() bool {
+	return h.srv.store.IsBanned(h.pubHash)
+}
+
+// shadowDelay sleeps for a random duration (2–8s) then returns a generic error.
+// Used to make shadow-banned users think operations are just slow/broken.
+func (h *fsHandler) shadowDelay() error {
+	delay := time.Duration(2000+rand.Intn(6000)) * time.Millisecond
+	time.Sleep(delay)
+	return sftp.ErrSSHFxFailure
 }
 
 func (h *fsHandler) examine(p string) (*pathMeta, error) {
@@ -1146,13 +1378,60 @@ func (h *fsHandler) prepareDirectory(rel string) error {
 }
 
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
-	logArgs := make([]any, 0, 2+len(args))
-	logArgs = append(logArgs, "reason", err.LogString())
-	logArgs = append(logArgs, args...)
+	h.logger.Info("permission denied", append([]any{"reason", err.LogString()}, args...)...)
 
-	h.logger.Info("permission denied", logArgs...)
+	h.srv.store.LogEvent(err.Kind, h.pubHash, h.sessionID, h.remoteAddr, args...)
 	fmt.Fprintln(h.stderr, err.Error())
 	return sftp.ErrSSHFxPermissionDenied
+}
+
+func (h *fsHandler) logLogin(stats userStats) {
+	var loginType = "pubkey-hash"
+	if strings.HasPrefix(h.pubHash, "anon-auth:") {
+		loginType = "anon-auth"
+	}
+	if strings.HasPrefix(h.pubHash, "pwd-auth:") {
+		loginType = "pwd-auth"
+	}
+
+	h.srv.store.LogEvent(EventLogin, h.pubHash, h.sessionID, h.remoteAddr,
+		"first_timer", stats.FirstTimer,
+		"upload_bytes", stats.UploadBytes,
+		"login_type", loginType,
+	)
+}
+
+func (h *fsHandler) logDownload(meta *pathMeta) {
+	h.logger.Info("download", "path", meta.rel, "size", meta.fi.Size())
+	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
+		"path", meta.rel,
+		"size", meta.fi.Size(),
+	)
+}
+
+func (h *fsHandler) logUpload(rel string, size, delta int64) {
+	h.logger.Info("upload", "path", rel, "size", size, "delta", delta)
+	h.srv.store.LogEvent(EventUpload, h.pubHash, h.sessionID, h.remoteAddr,
+		"path", rel,
+		"size", size,
+		"delta", delta,
+	)
+}
+
+func (h *fsHandler) logDelete(meta *pathMeta) {
+	h.logger.Info("delete", "path", meta.rel, "is_dir", meta.isDir)
+	h.srv.store.LogEvent(EventDelete, h.pubHash, h.sessionID, h.remoteAddr,
+		"path", meta.rel,
+		"is_dir", meta.isDir,
+	)
+}
+
+func (h *fsHandler) logRename(src, dst *pathMeta) {
+	h.logger.Info("rename", "from", src.rel, "to", dst.rel)
+	h.srv.store.LogEvent(EventRename, h.pubHash, h.sessionID, h.remoteAddr,
+		"path", src.rel,
+		"target", dst.rel,
+	)
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
@@ -1175,10 +1454,18 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, sftp.ErrSSHFxNoSuchFile
 	}
 
-	h.logger.Info("file download", "path", meta.rel, "size", fi.Size())
-	h.srv.store.RecordDownload(h.pubHash, fi.Size())
+	h.logDownload(meta)
+	h.srv.store.RecordDownload(h.pubHash, meta.fi.Size())
+	f, err := os.Open(meta.full)
+	if err != nil {
+		return nil, err
+	}
 
-	return os.Open(meta.full)
+	// SHADOW BAN: throttle reads
+	if h.isBanned && h.readLimiter != nil {
+		return &throttledReaderAt{r: f, lim: h.readLimiter}, nil
+	}
+	return f, nil
 }
 
 func (h *fsHandler) canRead(meta *pathMeta) error {
@@ -1205,6 +1492,10 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return nil, h.deny(errMsgPathTraversal, "path", r.Filepath)
+	}
+
+	if h.isBanned {
+		return nil, h.shadowDelay()
 	}
 
 	if err := h.canModify(meta); err != nil {
@@ -1255,6 +1546,11 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
+
+	if h.isBanned && r.Method == "List" {
+		delay := time.Duration(500+rand.Intn(1500)) * time.Millisecond // 0.5–2s
+		time.Sleep(delay)
+	}
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -1324,6 +1620,13 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 		return h.deny(errMsgPathTraversal, r.Filepath)
 	}
 
+	if h.isBanned {
+		switch r.Method {
+		case "Remove", "Rmdir", "Rename", "Mkdir", "Setstat":
+			return h.shadowDelay()
+		}
+	}
+
 	switch r.Method {
 	case "Setstat":
 		return nil
@@ -1338,6 +1641,7 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			h.logger.Error("could not remove path", "method", r.Method, "path", meta.full, "err", err)
 			return err
 		}
+		h.logDelete(meta)
 		return h.srv.store.DeletePath(meta.rel)
 
 	case "Rename":
@@ -1356,9 +1660,84 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			h.logger.Error("could not rename file", "from", meta.rel, "to", targetMeta.rel, "err", err)
 			return h.deny(errMsgRenameFailed)
 		}
+		h.logRename(meta, targetMeta)
 		return h.srv.store.RenamePath(meta.rel, targetMeta.rel)
 	}
 	return sftp.ErrSshFxOpUnsupported
+}
+
+// ============================================================================
+// SHADOW BAN THROTTLING
+// ============================================================================
+
+const shadowBanBytesPerSec = 2 * 1024 // 2 KB/s
+
+type throttledConn struct {
+	net.Conn
+	r *rate.Limiter
+	w *rate.Limiter
+}
+
+func newThrottledConn(c net.Conn, bytesPerSec float64) *throttledConn {
+	burst := int(bytesPerSec) // 1-second burst
+	if burst < 1 {
+		burst = 1
+	}
+	return &throttledConn{
+		Conn: c,
+		r:    rate.NewLimiter(rate.Limit(bytesPerSec), burst),
+		w:    rate.NewLimiter(rate.Limit(bytesPerSec), burst),
+	}
+}
+
+func throttle(ctx context.Context, lim *rate.Limiter, n int) {
+	// consume tokens in 4 KB chunks to avoid asking for huge reservations
+	const chunk = 4096
+	for remaining := n; remaining > 0; {
+		take := remaining
+		if take > chunk {
+			take = chunk
+		}
+		lim.WaitN(ctx, take) //nolint:errcheck — context is background, never cancelled here
+		remaining -= take
+	}
+}
+
+func (c *throttledConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		throttle(context.Background(), c.r, n)
+	}
+	return n, err
+}
+
+func (c *throttledConn) Write(b []byte) (int, error) {
+	throttle(context.Background(), c.w, len(b))
+	return c.Conn.Write(b)
+}
+
+type throttledReaderAt struct {
+	r   io.ReaderAt
+	lim *rate.Limiter
+}
+
+func (t *throttledReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := t.r.ReadAt(p, off)
+	if n > 0 {
+		// Wait for n tokens; if the limiter can't immediately satisfy the
+		// request we block here, which back-pressures the SFTP layer.
+		ctx := context.Background()
+		// Consume in chunks so we don't ask for huge token bursts at once.
+		for remaining := n; remaining > 0; {
+			take := remaining
+			if take > shadowBanBytesPerSec {
+				take = shadowBanBytesPerSec
+			}
+			t.lim.WaitN(ctx, take) //nolint:errcheck
+			remaining -= take
+		}
+	}
+	return n, err
 }
 
 // ============================================================================
@@ -1395,8 +1774,8 @@ func (sw *statWriter) Close() error {
 	fi, _ := sw.File.Stat()
 	size := fi.Size()
 	delta := size - sw.oldSize
-	sw.h.logger.Info("file write closed", "path", sw.rel, "final_size", size, "delta", delta)
 	sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.rel, size, delta)
+	sw.h.logUpload(sw.rel, size, delta)
 	sw.reportUserStatus(sw.h.pubHash)
 	return sw.File.Close()
 }
@@ -1748,6 +2127,9 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"name", cfg.Name,
 		"version", AppVersion,
 		"port", cfg.Port,
+		"admin.ssh", cfg.AdminEnabled,
+		"noauth", cfg.SshNoAuth,
+		"key", cfg.HostKeyFile,
 		"upload_path", cfg.UploadDir,
 		"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
 		"max_dirs", cfg.MaxDirs,
@@ -1763,6 +2145,160 @@ const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
 ┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹  ` + "v" + AppVersion
+
+// sanitizeName returns a filesystem/service-safe version of the archive name:
+// lowercase, only letters/digits/hyphens, no leading/trailing hyphens.
+func sanitizeName(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+const serviceTemplate = `[Unit]
+Description=%s - Anonymous SFTP Server
+After=network.target
+
+[Service]
+Type=simple
+User=anonymous
+Group=ftp
+WorkingDirectory=%s
+ExecStart=%s \
+    -logfile %s \
+    -dir /volume1/public \
+    -db.path %s/sftp.db \
+    -port 2222
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// runInstall installs this binary as a systemd service named after the archive.
+// Must be run as root.
+func runInstall(name string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	installDir := "/var/lib/" + name
+	binaryDst := installDir + "/" + name
+	logFile := "/var/log/" + name + ".log"
+	serviceName := name + ".service"
+	serviceDst := "/etc/systemd/system/" + serviceName
+
+	svcContent := fmt.Sprintf(serviceTemplate, name, installDir, binaryDst, logFile, installDir)
+
+	run := func(name string, args ...string) error {
+		cmd := exec.Command(name, args...)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		return cmd.Run()
+	}
+
+	run("systemctl", "stop", serviceName) // ignore error: may not exist yet
+
+	if err := os.MkdirAll(installDir, permDir); err != nil {
+		return fmt.Errorf("mkdir %s: %w", installDir, err)
+	}
+	if err := copyExecutable(self, binaryDst); err != nil {
+		return fmt.Errorf("copy binary: %w", err)
+	}
+	if err := os.WriteFile(serviceDst, []byte(svcContent), 0644); err != nil {
+		return fmt.Errorf("write service file: %w", err)
+	}
+	if err := touchFile(logFile, permLogFile); err != nil {
+		return fmt.Errorf("create log file: %w", err)
+	}
+	if err := chownTree("anonymous", "ftp", installDir, logFile); err != nil {
+		return fmt.Errorf("chown: %w", err)
+	}
+
+	for _, args := range [][]string{
+		{"daemon-reload"},
+		{"enable", serviceName},
+		{"start", serviceName},
+	} {
+		if err := run("systemctl", args...); err != nil {
+			return fmt.Errorf("systemctl %s: %w", args[0], err)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Installed %s\n  binary:  %s\n  log:     %s\n  status:  systemctl status %s\n",
+		name, binaryDst, logFile, serviceName)
+	return nil
+}
+
+func copyExecutable(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0755)
+}
+
+func touchFile(path string, mode fs.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// chownTree sets ownership of each path (and their contents if directories)
+// to user:group, resolved via /etc/passwd and /etc/group.
+func chownTree(user, group string, paths ...string) error {
+	uid, gid, err := lookupUIDGID(user, group)
+	if err != nil {
+		return err
+	}
+	for _, root := range paths {
+		if err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return nil // skip unreadable entries
+			}
+			return os.Lchown(p, uid, gid)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lookupUIDGID resolves user and group names to numeric IDs via /etc/passwd
+// and /etc/group, avoiding any cgo dependency.
+func lookupUIDGID(user, group string) (uid, gid int, err error) {
+	uid, gid = -1, -1
+	if data, e := os.ReadFile("/etc/passwd"); e == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if f := strings.SplitN(line, ":", 4); len(f) >= 3 && f[0] == user {
+				uid, _ = strconv.Atoi(f[2])
+				break
+			}
+		}
+	}
+	if data, e := os.ReadFile("/etc/group"); e == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if f := strings.SplitN(line, ":", 4); len(f) >= 3 && f[0] == group {
+				gid, _ = strconv.Atoi(f[2])
+				break
+			}
+		}
+	}
+	if uid == -1 {
+		return 0, 0, fmt.Errorf("user %q not found in /etc/passwd", user)
+	}
+	if gid == -1 {
+		return 0, 0, fmt.Errorf("group %q not found in /etc/group", group)
+	}
+	return uid, gid, nil
+}
 
 func main() {
 	cfg, err := LoadConfig()
