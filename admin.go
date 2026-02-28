@@ -351,16 +351,27 @@ func (a *adminConsole) Run() {
 
 // adminModel is the Bubble Tea model.
 type adminModel struct {
-	console     *adminConsole
-	input       textinput.Model
-	history     []string // command history
-	histIdx     int      // current position in history (-1 = new entry)
-	outputBuf   string   // accumulated output rendered above the prompt
-	quitting    bool
-	windowWidth int // updated by tea.WindowSizeMsg; 0 means unknown
+	console      *adminConsole
+	input        textinput.Model
+	history      []string // command history
+	histIdx      int      // current position in history (-1 = new entry)
+	windowWidth  int      // updated by tea.WindowSizeMsg; 0 means unknown
+	windowHeight int      // updated by tea.WindowSizeMsg; 0 means unknown
+
+	// scrollback holds every line ever written to the console, split on "\n".
+	// View() renders only the last N lines that fit in the terminal so that
+	// large outputs (e.g. "help") never produce more content than Bubble Tea
+	// can redraw, which would cause visual corruption.
+	scrollback []string
+
+	quitting bool
 
 	// confirmCmd holds a pending destructive command waiting for user input.
 	confirmCmd *pendingConfirm
+
+	// Autocomplete state
+	completions []string // current candidate list (empty = none)
+	compIdx     int      // which candidate is selected (-1 = none yet)
 }
 
 // pendingConfirm represents a two-step confirmation prompt (purge, shutdown).
@@ -370,9 +381,18 @@ type pendingConfirm struct {
 	onInput    func(answer string) string // returns output to display
 }
 
-type cmdResultMsg struct {
-	output string
-	exit   bool
+// appendOutput splits s on newlines and appends each line to m.scrollback.
+// It is the only place that should write to scrollback.
+func (m *adminModel) appendOutput(s string) {
+	// Normalize: always work with \n, never \r\n
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	// If the last element is empty (trailing newline), drop it to avoid a
+	// phantom blank line — it will be added again naturally as a separator.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	m.scrollback = append(m.scrollback, lines...)
 }
 
 func initialAdminModel(a *adminConsole) adminModel {
@@ -390,13 +410,16 @@ func initialAdminModel(a *adminConsole) adminModel {
 	timeLine := styleDarkGray.Render(fmt.Sprintf("Time:    %s", now.Format("2006-01-02 15:04:05 MST"))) + "\n"
 	hint := styleCyan.Render(`Type "help" for a list of commands, "exit" to disconnect.`) + "\n"
 
-	return adminModel{
-		console:     a,
-		input:       ti,
-		histIdx:     -1,
-		windowWidth: 0,
-		outputBuf:   banner + serverLine + sessionLine + timeLine + hrLine(72) + "\n" + hint,
+	m := adminModel{
+		console:      a,
+		input:        ti,
+		histIdx:      -1,
+		compIdx:      -1,
+		windowWidth:  0,
+		windowHeight: 0,
 	}
+	m.appendOutput(banner + serverLine + sessionLine + timeLine + hrLine(72) + "\n" + hint)
+	return m
 }
 
 func (m adminModel) Init() tea.Cmd {
@@ -410,6 +433,13 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmCmd != nil {
 			return m.handleConfirm(msg)
 		}
+
+		// Any key other than Tab clears the completion list.
+		if msg.Type != tea.KeyTab {
+			m.completions = nil
+			m.compIdx = -1
+		}
+
 		switch msg.Type {
 		case tea.KeyEnter:
 			raw := strings.TrimSpace(m.input.Value())
@@ -418,7 +448,6 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if raw == "" {
 				return m, nil
 			}
-			// Push to history.
 			m.history = append(m.history, raw)
 
 			parts := strings.Fields(raw)
@@ -430,16 +459,39 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.console.srv.store.LogEvent(EventAdmin, "admin", m.console.sessionID, nil,
 				"action", "command", "cmd", cmd)
 
-			// Commands that need interactive confirmation get special handling.
+			// Echo the command into scrollback so the user can see what they ran.
+			promptEcho := styleRedBold.Render("admin") +
+				styleDarkGray.Render("@") +
+				styleYellow.Render(m.console.srv.cfg.Name) +
+				" " + styleDarkGray.Render(m.console.cwdDisplay()) +
+				" " + styleCyanBold.Render("» ") +
+				styleWhite.Render(raw)
+			m.appendOutput(promptEcho + "\n")
+
 			if cmd == "purge" || cmd == "shutdown" {
 				return m.startConfirm(cmd, args)
 			}
 
 			output, exit := m.console.dispatch(cmd, args)
-			m.outputBuf += output
+			m.appendOutput(output)
 			if exit {
 				m.quitting = true
 				return m, tea.Quit
+			}
+			return m, nil
+
+		case tea.KeyTab:
+			m.completions, m.compIdx = m.console.complete(m.input.Value(), m.completions, m.compIdx)
+			if len(m.completions) == 1 {
+				// Single match: fill it in and clear the list.
+				m.input.SetValue(m.completions[0])
+				m.input.CursorEnd()
+				m.completions = nil
+				m.compIdx = -1
+			} else if len(m.completions) > 1 {
+				// Multiple matches: cycle through them and show the list.
+				m.input.SetValue(m.completions[m.compIdx])
+				m.input.CursorEnd()
 			}
 			return m, nil
 
@@ -477,7 +529,8 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
-		promptOverhead := 20 // "admin@name /path » " approximate overhead
+		m.windowHeight = msg.Height
+		promptOverhead := 20
 		if w := msg.Width - promptOverhead; w > 20 {
 			m.input.Width = w
 		}
@@ -500,19 +553,60 @@ func (m adminModel) View() string {
 		" " + styleDarkGray.Render(m.console.cwdDisplay()) +
 		" " + styleCyanBold.Render("» ")
 
-	// Ensure outputBuf ends with exactly one newline before the prompt area.
-	buf := strings.TrimRight(m.outputBuf, "\n")
-	if buf != "" {
-		buf += "\n"
+	// Build the bottom portion: prompt + optional completion hint.
+	// Each of these counts as a line toward the viewport budget.
+	bottomLines := 1 // the prompt+input line
+	compHint := ""
+	if len(m.completions) > 1 {
+		// Show all completions as a single tab-separated hint line.
+		var parts []string
+		for i, c := range m.completions {
+			if i == m.compIdx {
+				parts = append(parts, styleWhiteBold.Render(c))
+			} else {
+				parts = append(parts, styleDarkGray.Render(c))
+			}
+		}
+		compHint = "  " + strings.Join(parts, styleDarkGray.Render("  ·  ")) + "\n"
+		bottomLines++
 	}
 
+	var confirmLine string
 	if m.confirmCmd != nil {
-		return buf + "\n" +
-			styleYellowBold.Render(m.confirmCmd.prompt) + "\n" +
-			prompt + m.input.View()
+		confirmLine = styleYellowBold.Render(m.confirmCmd.prompt) + "\n"
+		bottomLines++
 	}
 
-	return buf + "\n" + prompt + m.input.View()
+	// Calculate how many scrollback lines we can show.
+	// Reserve 1 extra line as a visual gap between scrollback and prompt.
+	h := m.windowHeight
+	if h <= 0 {
+		h = 40 // sane default before first WindowSizeMsg
+	}
+	available := h - bottomLines - 1 // -1 for the gap line
+	if available < 1 {
+		available = 1
+	}
+
+	// Slice the tail of scrollback that fits.
+	lines := m.scrollback
+	if len(lines) > available {
+		lines = lines[len(lines)-available:]
+	}
+	scrollView := strings.Join(lines, "\n")
+
+	var sb strings.Builder
+	sb.WriteString(scrollView)
+	sb.WriteByte('\n') // gap line between scrollback and prompt
+	if confirmLine != "" {
+		sb.WriteString(confirmLine)
+	}
+	if compHint != "" {
+		sb.WriteString(compHint)
+	}
+	sb.WriteString(prompt)
+	sb.WriteString(m.input.View())
+	return sb.String()
 }
 
 // handleConfirm processes a keypress when we are waiting for confirmation.
@@ -528,7 +622,7 @@ func (m adminModel) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	pending := m.confirmCmd
 	m.confirmCmd = nil
 	output := pending.onInput(answer)
-	m.outputBuf += output
+	m.appendOutput(output)
 
 	if pending.shouldQuit {
 		m.quitting = true
@@ -541,7 +635,7 @@ func (m adminModel) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m adminModel) startConfirm(cmd string, args []string) (adminModel, tea.Cmd) {
 	switch cmd {
 	case "shutdown":
-		m.outputBuf += styleRedBold.Render("WARNING: This will shut down the server for ALL users.") + "\n"
+		m.appendOutput(styleRedBold.Render("WARNING: This will shut down the server for ALL users.") + "\n")
 		pending := &pendingConfirm{
 			prompt: `Type "SHUTDOWN" to confirm, or anything else to cancel:`,
 		}
@@ -560,23 +654,23 @@ func (m adminModel) startConfirm(cmd string, args []string) (adminModel, tea.Cmd
 		var sb strings.Builder
 		if len(args) == 0 {
 			writef(&sb, styleRed, "Usage: purge <hash>\n")
-			m.outputBuf += sb.String()
+			m.appendOutput(sb.String())
 			return m, nil
 		}
 		hash, err := m.console.resolveUserHash(args[0])
 		if err != nil {
 			writef(&sb, styleRed, "%v\n", err)
-			m.outputBuf += sb.String()
+			m.appendOutput(sb.String())
 			return m, nil
 		}
 		files, err := m.console.srv.store.FilesByOwner(hash)
 		if err != nil || len(files) == 0 {
-			m.outputBuf += styleYellow.Render("No files found for that user.") + "\n"
+			m.appendOutput(styleYellow.Render("No files found for that user.") + "\n")
 			return m, nil
 		}
-		m.outputBuf += styleRedBold.Render(fmt.Sprintf(
+		m.appendOutput(styleRedBold.Render(fmt.Sprintf(
 			"This will permanently delete %d items owned by %s.",
-			len(files), shortID(hash))) + "\n"
+			len(files), shortID(hash))) + "\n")
 		m.confirmCmd = &pendingConfirm{
 			prompt: "Type the user ID prefix to confirm, or anything else to cancel:",
 			onInput: func(answer string) string {
@@ -788,8 +882,119 @@ func writeHRW(sb *strings.Builder, width int) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// cwdDisplay
+// Autocomplete
 // ─────────────────────────────────────────────────────────────────────────────
+
+// fileArgCommands is the set of commands whose first argument is a path inside
+// the upload root. We offer filesystem completion for their arguments.
+var fileArgCommands = map[string]bool{
+	"cat": true, "rm": true, "mv": true, "chown": true,
+	"protect": true, "unprotect": true, "unrestrict": true, "restrict": true,
+	"inspect": true, "i": true, "ban": true, "ls": true, "cd": true,
+}
+
+// complete returns the new completions slice and selected index given the
+// current input value and the previous completion state.
+//
+//   - If completions is non-nil we are already cycling: advance compIdx.
+//   - Otherwise compute a fresh candidate list from value.
+func (a *adminConsole) complete(value string, prev []string, prevIdx int) ([]string, int) {
+	// If we already have a list, just advance the cursor through it.
+	if len(prev) > 1 {
+		next := (prevIdx + 1) % len(prev)
+		return prev, next
+	}
+
+	parts := strings.Fields(value)
+	trailingSpace := len(value) > 0 && value[len(value)-1] == ' '
+
+	// ── Command-name completion (first token, no trailing space yet) ──────
+	if len(parts) == 0 || (len(parts) == 1 && !trailingSpace) {
+		prefix := ""
+		if len(parts) == 1 {
+			prefix = strings.ToLower(parts[0])
+		}
+		seen := map[string]bool{}
+		var candidates []string
+		for _, c := range a.registry {
+			if seen[c.Name] {
+				continue
+			}
+			seen[c.Name] = true
+			if strings.HasPrefix(c.Name, prefix) {
+				candidates = append(candidates, c.Name)
+			}
+			for _, alias := range c.Aliases {
+				if strings.HasPrefix(alias, prefix) {
+					candidates = append(candidates, alias)
+				}
+			}
+		}
+		sort.Strings(candidates)
+		if len(candidates) == 0 {
+			return nil, -1
+		}
+		return candidates, 0
+	}
+
+	// ── Path completion (second token onward, for file-arg commands) ──────
+	cmd := strings.ToLower(parts[0])
+	if !fileArgCommands[cmd] {
+		return nil, -1
+	}
+
+	// The path being typed is either the last token (no trailing space)
+	// or an empty prefix (trailing space = starting fresh).
+	pathPrefix := ""
+	if !trailingSpace && len(parts) > 1 {
+		pathPrefix = parts[len(parts)-1]
+	}
+
+	// Resolve the directory to list and the file prefix to match.
+	var dirPart, filePart string
+	if strings.Contains(pathPrefix, "/") {
+		dirPart = pathPrefix[:strings.LastIndex(pathPrefix, "/")+1]
+		filePart = pathPrefix[strings.LastIndex(pathPrefix, "/")+1:]
+	} else {
+		dirPart = ""
+		filePart = pathPrefix
+	}
+
+	searchDir := a.resolvePath(dirPart)
+	entries, err := os.ReadDir(searchDir)
+	if err != nil {
+		return nil, -1
+	}
+
+	// Prefix for reconstructing what to put in the input.
+	// Everything before the last token stays, then we append the completion.
+	var inputPrefix string
+	if !trailingSpace && len(parts) > 1 {
+		// Replace just the last token.
+		inputPrefix = strings.Join(parts[:len(parts)-1], " ") + " " + dirPart
+	} else {
+		inputPrefix = strings.Join(parts, " ") + " " + dirPart
+	}
+
+	var candidates []string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, filePart) {
+			continue
+		}
+		completion := inputPrefix + name
+		if e.IsDir() {
+			completion += "/"
+		}
+		candidates = append(candidates, completion)
+	}
+
+	if len(candidates) == 0 {
+		return nil, -1
+	}
+	sort.Strings(candidates)
+	return candidates, 0
+}
 
 func (a *adminConsole) cwdDisplay() string {
 	if a.cwd == "" {
