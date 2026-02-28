@@ -46,7 +46,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -183,7 +182,14 @@ const (
 	EventRename                EventKind = "rename"
 	EventDenied                EventKind = "denied"
 	EventDeniedSymlink         EventKind = "denied/symlink"
-	EventDeniedContributorLock EventKind = "denied/contributor-lock" // todo: other event kinds
+	EventDeniedContributorLock EventKind = "denied/contributor-lock"
+	EventDeniedSystemFile      EventKind = "denied/system-file"
+	EventDeniedDirOwner        EventKind = "denied/dir-owner"
+	EventDeniedFilenameClaimed EventKind = "denied/filename-claimed"
+	EventDeniedNotOwner        EventKind = "denied/not-owner"
+	EventDeniedRateLimit       EventKind = "denied/rate-limit"
+	EventDeniedQuota           EventKind = "denied/quota"
+	EventDeniedPathTraversal   EventKind = "denied/path-traversal"
 	EventShadowBan             EventKind = "shadow_ban"
 )
 
@@ -228,20 +234,20 @@ var (
 	errMsgContributorsLocked = UserPermissionError{Kind: EventDeniedContributorLock,
 		EN: "%s is only available to contributors who have uploaded at least %s: upload %d more bytes.",
 		ZH: "文件 %s 仅对已上传至少 %s 字节的贡献者可用：再上传 %d 字节。"}
-	errMsgFileProtected    = UserPermissionError{EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
-	errMsgCannotWriteToDir = UserPermissionError{EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
-	errMsgFilenameClaimed  = UserPermissionError{EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
-	errMsgNoPermissionDel  = UserPermissionError{
+	errMsgFileProtected    = UserPermissionError{Kind: EventDeniedSystemFile, EN: "%s is a protected system file.", ZH: "%s 是受保护的系统文件。"}
+	errMsgCannotWriteToDir = UserPermissionError{Kind: EventDeniedDirOwner, EN: "Cannot write to another user's directory.", ZH: "无法写入其他用户的目录。"}
+	errMsgFilenameClaimed  = UserPermissionError{Kind: EventDeniedFilenameClaimed, EN: "This filename is already claimed.", ZH: "此文件名已被占用。"}
+	errMsgNoPermissionDel  = UserPermissionError{Kind: EventDeniedNotOwner,
 		EN: "You do not have permission to delete this. (%s UID [owner] %d != [you] %d)",
 		ZH: "您没有删除此项的权限。(%s UID [所有者] %d != [你] %d)"}
-	errMsgNotOwner = UserPermissionError{
+	errMsgNotOwner = UserPermissionError{Kind: EventDeniedNotOwner,
 		EN: "You do not own the source file or directory. (UID [owner] %d != [you] %d)",
 		ZH: "您不是源文件或目录的所有者。(UID [所有者] %d != [你] %d)"}
-	errMsgRenameFailed     = UserPermissionError{EN: "Rename failed.", ZH: "重命名失败。"}
-	errMsgMkdirRateLimit   = UserPermissionError{EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
-	errMsgMaxDirsReached   = UserPermissionError{EN: "Maximum directory limit reached for this archive.", ZH: "已达到此归档的最大目录限制。"}
-	errMsgFileSizeExceeded = UserPermissionError{EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
-	errMsgPathTraversal    = UserPermissionError{EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
+	errMsgRenameFailed     = UserPermissionError{Kind: EventDenied, EN: "Rename failed.", ZH: "重命名失败。"}
+	errMsgMkdirRateLimit   = UserPermissionError{Kind: EventDeniedRateLimit, EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
+	errMsgMaxDirsReached   = UserPermissionError{Kind: EventDeniedQuota, EN: "Maximum directory limit reached for this archive.", ZH: "已达到此归档的最大目录限制。"}
+	errMsgFileSizeExceeded = UserPermissionError{Kind: EventDeniedQuota, EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
+	errMsgPathTraversal    = UserPermissionError{Kind: EventDeniedPathTraversal, EN: "Path traversal detected.", ZH: "检测到路径遍历。"}
 )
 
 // ============================================================================
@@ -755,32 +761,54 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 }
 
 func (s *Server) bootstrapSource() error {
-	// todo: maybe we just walk the tree
-	s.logger.Info("bootstrapping source files to upload directory")
-	// Copy sftpguy.go
-	srcData, err := embeddedSource.ReadFile(sourceFile)
-	if err != nil {
-		return err
-	}
-	destPath := filepath.Join(s.absUploadDir, s.sourceFileName())
-	if err := os.WriteFile(destPath, srcData, permFile); err != nil {
-		return err
-	}
+	s.logger.Info("bootstrapping embedded files to upload directory")
 
-	s.store.RegisterFile(s.sourceFileName(), systemOwner, int64(len(srcData)), false)
-	s.cfg.unrestrictedMap[s.sourceFileName()] = true
+	return fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
 
-	// Copy fortunes.txt
-	fData, err := embeddedSource.ReadFile("fortunes.txt")
-	if err != nil {
-		return err
-	}
-	fPath := filepath.Join(s.absUploadDir, "fortunes.txt")
-	if err := os.WriteFile(fPath, fData, permFile); err != nil {
-		return err
-	}
-	s.store.RegisterFile("fortunes.txt", systemOwner, int64(len(fData)), false)
-	return nil
+		// Read the embedded file content
+		data, err := embeddedSource.ReadFile(relPath)
+		if err != nil {
+			return fmt.Errorf("failed to read embedded file %s: %w", relPath, err)
+		}
+
+		// Determine the destination filename
+		// If it's the main source file, rename it to include version
+		destName := relPath
+		isUnrestricted := false
+		if relPath == sourceFile {
+			destName = s.sourceFileName()
+			isUnrestricted = true
+		}
+
+		destPath := filepath.Join(s.absUploadDir, destName)
+
+		// Create parent directories if they don't exist
+		if err := os.MkdirAll(filepath.Dir(destPath), permDir); err != nil {
+			return err
+		}
+
+		// Write to disk
+		if err := os.WriteFile(destPath, data, permFile); err != nil {
+			return fmt.Errorf("failed to write %s to disk: %w", destName, err)
+		}
+
+		// Register in the database as system-owned
+		s.store.RegisterFile(destName, systemOwner, int64(len(data)), false)
+
+		// Make source code downloadable by everyone
+		if isUnrestricted {
+			s.cfg.unrestrictedMap[destName] = true
+		}
+
+		s.logger.Debug("bootstrapped file", "file", destName)
+		return nil
+	})
 }
 
 func (s *Server) sourceFileName() string {
@@ -2145,160 +2173,6 @@ const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
 ┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹  ` + "v" + AppVersion
-
-// sanitizeName returns a filesystem/service-safe version of the archive name:
-// lowercase, only letters/digits/hyphens, no leading/trailing hyphens.
-func sanitizeName(name string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(name) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteRune('-')
-		}
-	}
-	return strings.Trim(b.String(), "-")
-}
-
-const serviceTemplate = `[Unit]
-Description=%s - Anonymous SFTP Server
-After=network.target
-
-[Service]
-Type=simple
-User=anonymous
-Group=ftp
-WorkingDirectory=%s
-ExecStart=%s \
-    -logfile %s \
-    -dir /volume1/public \
-    -db.path %s/sftp.db \
-    -port 2222
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// runInstall installs this binary as a systemd service named after the archive.
-// Must be run as root.
-func runInstall(name string) error {
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	installDir := "/var/lib/" + name
-	binaryDst := installDir + "/" + name
-	logFile := "/var/log/" + name + ".log"
-	serviceName := name + ".service"
-	serviceDst := "/etc/systemd/system/" + serviceName
-
-	svcContent := fmt.Sprintf(serviceTemplate, name, installDir, binaryDst, logFile, installDir)
-
-	run := func(name string, args ...string) error {
-		cmd := exec.Command(name, args...)
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		return cmd.Run()
-	}
-
-	run("systemctl", "stop", serviceName) // ignore error: may not exist yet
-
-	if err := os.MkdirAll(installDir, permDir); err != nil {
-		return fmt.Errorf("mkdir %s: %w", installDir, err)
-	}
-	if err := copyExecutable(self, binaryDst); err != nil {
-		return fmt.Errorf("copy binary: %w", err)
-	}
-	if err := os.WriteFile(serviceDst, []byte(svcContent), 0644); err != nil {
-		return fmt.Errorf("write service file: %w", err)
-	}
-	if err := touchFile(logFile, permLogFile); err != nil {
-		return fmt.Errorf("create log file: %w", err)
-	}
-	if err := chownTree("anonymous", "ftp", installDir, logFile); err != nil {
-		return fmt.Errorf("chown: %w", err)
-	}
-
-	for _, args := range [][]string{
-		{"daemon-reload"},
-		{"enable", serviceName},
-		{"start", serviceName},
-	} {
-		if err := run("systemctl", args...); err != nil {
-			return fmt.Errorf("systemctl %s: %w", args[0], err)
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "Installed %s\n  binary:  %s\n  log:     %s\n  status:  systemctl status %s\n",
-		name, binaryDst, logFile, serviceName)
-	return nil
-}
-
-func copyExecutable(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0755)
-}
-
-func touchFile(path string, mode fs.FileMode) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, mode)
-	if err != nil {
-		return err
-	}
-	return f.Close()
-}
-
-// chownTree sets ownership of each path (and their contents if directories)
-// to user:group, resolved via /etc/passwd and /etc/group.
-func chownTree(user, group string, paths ...string) error {
-	uid, gid, err := lookupUIDGID(user, group)
-	if err != nil {
-		return err
-	}
-	for _, root := range paths {
-		if err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
-			if err != nil {
-				return nil // skip unreadable entries
-			}
-			return os.Lchown(p, uid, gid)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// lookupUIDGID resolves user and group names to numeric IDs via /etc/passwd
-// and /etc/group, avoiding any cgo dependency.
-func lookupUIDGID(user, group string) (uid, gid int, err error) {
-	uid, gid = -1, -1
-	if data, e := os.ReadFile("/etc/passwd"); e == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if f := strings.SplitN(line, ":", 4); len(f) >= 3 && f[0] == user {
-				uid, _ = strconv.Atoi(f[2])
-				break
-			}
-		}
-	}
-	if data, e := os.ReadFile("/etc/group"); e == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if f := strings.SplitN(line, ":", 4); len(f) >= 3 && f[0] == group {
-				gid, _ = strconv.Atoi(f[2])
-				break
-			}
-		}
-	}
-	if uid == -1 {
-		return 0, 0, fmt.Errorf("user %q not found in /etc/passwd", user)
-	}
-	if gid == -1 {
-		return 0, 0, fmt.Errorf("group %q not found in /etc/group", group)
-	}
-	return uid, gid, nil
-}
 
 func main() {
 	cfg, err := LoadConfig()
