@@ -49,6 +49,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,8 +63,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+//go:generate go run . -update-version
 //go:embed sftpguy.go admin.go fortunes.txt
 var embeddedSource embed.FS
+
+const versionFile = "VERSION"
+
+//go:embed VERSION
+var AppVersion string
 
 // Default files that are always downloadable
 var defaultUnrestrictedPaths = []string{
@@ -78,8 +85,7 @@ var defaultUnrestrictedPaths = []string{
 // ============================================================================
 
 const (
-	AppVersion = "1.8.10"
-	envPrefix  = "SFTP_"
+	envPrefix = "SFTP_"
 
 	// System identifiers
 	systemOwner = "system"
@@ -608,6 +614,8 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error) {
+	updateVersion := flag.Bool("update-version", false, "Internal use by go generate")
+
 	cfg := Config{}
 
 	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name")
@@ -629,7 +637,7 @@ func LoadConfig() (Config, error) {
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
 
-	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code and fortunes to upload directory on boot")
+	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
 
 	i := flag.Bool("install", false, "Install this program as a system service (requires root)")
@@ -639,6 +647,11 @@ func LoadConfig() (Config, error) {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *updateVersion {
+		runVersionGenerator()
+		os.Exit(0)
+	}
 
 	if *v {
 		fmt.Printf("%s v%s\n", cfg.Name, AppVersion)
@@ -752,18 +765,24 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	if cfg.BootstrapSrc {
-		if err := srv.bootstrapSource(); err != nil {
+		srcDir, err := bootstrapSource(cfg.Name, absDir, logger)
+		if err != nil {
 			logger.Error("failed to bootstrap source", "err", err)
 		}
+
+		cfg.unrestrictedMap[srcDir] = true
 	}
 
 	return srv, nil
 }
 
-func (s *Server) bootstrapSource() error {
-	s.logger.Info("bootstrapping embedded files to upload directory")
+func bootstrapSource(name, absDir string, logger *slog.Logger) (srcDir string, err error) {
+	logger.Info("bootstrapping embedded files to upload directory")
 
-	return fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
+	appShort := strings.Split(AppVersion, "-")[0]
+	srcDir = fmt.Sprintf("%s-%s/", name, appShort)
+
+	return srcDir, fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -771,48 +790,26 @@ func (s *Server) bootstrapSource() error {
 			return nil
 		}
 
-		// Read the embedded file content
 		data, err := embeddedSource.ReadFile(relPath)
 		if err != nil {
 			return fmt.Errorf("failed to read embedded file %s: %w", relPath, err)
 		}
 
-		// Determine the destination filename
-		// If it's the main source file, rename it to include version
-		destName := relPath
-		isUnrestricted := false
-		if relPath == sourceFile {
-			destName = s.sourceFileName()
-			isUnrestricted = true
-		}
+		//logical path stored in the DB (e.g. "sftpguy-v1.0.0/main.go")
+		destName := filepath.Join(srcDir, relPath)
+		destPath := filepath.Join(absDir, destName) // the actual location on disk
 
-		destPath := filepath.Join(s.absUploadDir, destName)
-
-		// Create parent directories if they don't exist
 		if err := os.MkdirAll(filepath.Dir(destPath), permDir); err != nil {
-			return err
+			return fmt.Errorf("failed to create directory for %s: %w", destName, err)
 		}
 
-		// Write to disk
 		if err := os.WriteFile(destPath, data, permFile); err != nil {
 			return fmt.Errorf("failed to write %s to disk: %w", destName, err)
 		}
 
-		// Register in the database as system-owned
-		s.store.RegisterFile(destName, systemOwner, int64(len(data)), false)
-
-		// Make source code downloadable by everyone
-		if isUnrestricted {
-			s.cfg.unrestrictedMap[destName] = true
-		}
-
-		s.logger.Debug("bootstrapped file", "file", destName)
+		logger.Debug("bootstrapped file", "file", destName)
 		return nil
 	})
-}
-
-func (s *Server) sourceFileName() string {
-	return fmt.Sprintf("%s-v%s.go", s.cfg.Name, AppVersion)
 }
 
 func (s *Server) Shutdown() error {
@@ -831,11 +828,12 @@ func (s *Server) Listen() error {
 	}
 
 	sshConfig := &ssh.ServerConfig{
-		BannerCallback:       s.bannerCallback,
-		PublicKeyCallback:    s.publicKeyCallback,
-		NoClientAuth:         s.cfg.SshNoAuth,
-		NoClientAuthCallback: s.noClientAuthCallback,
-		PasswordCallback:     s.passwordCallback,
+		BannerCallback:              s.bannerCallback,
+		PublicKeyCallback:           s.publicKeyCallback,
+		NoClientAuth:                s.cfg.SshNoAuth,
+		NoClientAuthCallback:        s.noClientAuthCallback,
+		KeyboardInteractiveCallback: s.keyboardInteractiveCallback,
+		PasswordCallback:            s.passwordCallback,
 	}
 
 	keyBytes, _ := os.ReadFile(s.cfg.HostKeyFile)
@@ -912,6 +910,65 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.
 	// treating the credentials as the seed for their unique UID.
 	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 }
+
+// KeyboardInteractiveCallback, if non-nil, is called when
+// keyboard-interactive authentication is selected (RFC
+// 4256). The client object's Challenge function should be
+// used to query the user. The callback may offer multiple
+// Challenge rounds. To avoid information leaks, the client
+// should be presented a challenge even if the user is
+// unknown.
+// type KeyboardInteractiveChallenge
+// 	 func(name, instruction string, questions []string, echos []bool) (answers []string, err error)
+
+// KeyboardInteractiveCallback: func(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+// 			// You can prompt the user for multiple pieces of information.
+// 			// The `client.Challenge` function sends the prompts to the client.
+// 			questions := []string{"What is your username?", "Enter password:"}
+// 			isPassword := []bool{false, true} // Indicate which prompts are sensitive
+
+// 			answers, err := client(conn.User(), "Server Instruction", questions, isPassword)
+// 			if err != nil {
+// 				return nil, err
+// 			}
+
+//		if answers[0] == "validuser" && answers[1] == "validpassword" {
+//			return &ssh.Permissions{Extensions: map[string]string{"user_id": "123"}}, nil
+//		}
+//		return nil, fmt.Errorf("invalid credentials")
+//	},
+func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+
+	name := fmt.Sprintf("anonymous@%s", s.cfg.Name)
+
+	instructions := `
+	hello world, let's see what this looks like.
+   `
+
+	answers, err := client(name,
+		instructions,
+		[]string{"Password: "},
+		[]bool{true})
+	if err != nil {
+		return nil, err
+	}
+
+	user := conn.User()
+	password := answers[0]
+
+	data := fmt.Sprintf("pwd-auth:%s:%s", user, password)
+	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
+	s.logger.Info("password login attempt",
+		"ip", getHostIp(conn),
+		"user", user,
+		"password", password, // traditionally it's your email address
+		"generated_hash", hash,
+	)
+	//s.store.LogEvent(EventLogin)
+	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
+
+}
+
 func getHostIp(conn ssh.ConnMetadata) string {
 	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
@@ -2169,17 +2226,92 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	return logger, f, nil
 }
 
+func runVersionGenerator() {
+	// const versionFile = "VERSION"
+	h := sha256.New()
+
+	err := fs.WalkDir(embeddedSource, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || path == versionFile {
+			return nil
+		}
+
+		f, err := embeddedSource.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		if _, err := io.Copy(h, f); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Error walking embed: %v\n", err)
+		os.Exit(1)
+	}
+
+	newHash := fmt.Sprintf("%x", h.Sum(nil))
+
+	// read existing VERSION from disk (not from embed, so we get the text)
+	content, _ := os.ReadFile(versionFile)
+	currentFull := strings.TrimSpace(string(content))
+	parts := strings.Split(currentFull, "-")
+
+	currentVer := parts[0]
+	oldHash := ""
+	if len(parts) > 1 {
+		oldHash = parts[1]
+	}
+
+	if newHash == oldHash {
+		fmt.Println("No changes. VERSION is current.")
+		return
+	}
+
+	newVer, err := incrementPatch(currentVer)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	newContent := fmt.Sprintf("%s-%s", newVer, newHash)
+	if err := os.WriteFile(versionFile, []byte(newContent), 0644); err != nil {
+		fmt.Printf("Failed to write: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Updated %s: %s -> %s\n", versionFile, currentFull, newContent)
+}
+
+func incrementPatch(v string) (string, error) {
+	re := regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)$`)
+	m := re.FindStringSubmatch(v)
+	if len(m) != 4 {
+		// Fallback for empty or malformed file
+		return "v0.0.1", nil
+	}
+	patch, _ := strconv.Atoi(m[3])
+	return fmt.Sprintf("v%s.%s.%d", m[1], m[2], patch+1), nil
+}
+
 const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
-┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹  ` + "v" + AppVersion
+┗━┛╹   ╹ ╹  ┗━┛┗━┛ ╹  %s`
 
 func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
 		os.Exit(1)
 	}
-	fmt.Fprintln(os.Stderr, yellow.Bold(startupBanner))
+
+	appShort := strings.Split(AppVersion, "-")[0]
+	fmt.Fprintln(os.Stderr, yellow.Bold(fmt.Sprintf(startupBanner, appShort)))
 
 	start := time.Now()
 

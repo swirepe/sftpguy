@@ -84,46 +84,46 @@ const (
 // ─────────────────────────────────────────────────────────────────────────────
 
 var (
-	styleRed       = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
-	styleGreen     = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FFF87"))
-	styleYellow    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
-	styleBlue      = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FAFFF"))
-	styleCyan      = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FFFF"))
-	styleWhite     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
-	styleDarkGray  = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
-	styleLightGray = lipgloss.NewStyle().Foreground(lipgloss.Color("#A8A8A8"))
+	styleRed       = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleGreen     = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	styleYellow    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	styleBlue      = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
+	styleCyan      = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	styleWhite     = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	styleDarkGray  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleLightGray = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 
-	styleRedBold    = styleRed.Copy().Bold(true)
-	styleGreenBold  = styleGreen.Copy().Bold(true)
-	styleYellowBold = styleYellow.Copy().Bold(true)
-	styleWhiteBold  = styleWhite.Copy().Bold(true)
-	styleCyanBold   = styleCyan.Copy().Bold(true)
-	styleBlueBold   = styleBlue.Copy().Bold(true)
+	styleRedBold    = styleRed.Bold(true)
+	styleGreenBold  = styleGreen.Bold(true)
+	styleYellowBold = styleYellow.Bold(true)
+	styleWhiteBold  = styleWhite.Bold(true)
+	styleCyanBold   = styleCyan.Bold(true)
+	styleBlueBold   = styleBlue.Bold(true)
 
-	styleBrandPrimary = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")) // Charm Violet
+	// ── Layout styles ──────────────────────────────────────────────────────
 
-	// styleHeaderBar: full-width top bar. Background is deep violet, text white.
+	// styleHeaderBar: full-width top bar. Background is dark red, text white.
 	styleHeaderBar = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFDF5")).
-			Background(lipgloss.Color("#7D56F4")).
+			Foreground(lipgloss.Color("15")).
+			Background(lipgloss.Color("1")).
 			Padding(0, 1)
 
 	// styleFooterBar: full-width bottom status strip.
 	styleFooterBar = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#A8A8A8")).
-			Background(lipgloss.Color("#262626")).
+			Foreground(lipgloss.Color("8")).
+			Background(lipgloss.Color("0")).
 			Padding(0, 1)
 
 	// styleViewportBorder: thin separator line between viewport and prompt.
 	styleViewportBorder = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#444444"))
+				Foreground(lipgloss.Color("8"))
 
 	styleBanner = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FF5F87")).
+			Foreground(lipgloss.Color("1")).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#FF5F87")).
+			BorderForeground(lipgloss.Color("1")).
 			Padding(0, 2)
 )
 
@@ -158,10 +158,7 @@ type adminConsole struct {
 	byName   map[string]*AdminCommand
 
 	// hasPTY is set by handleAdminChannel when the client sends a pty-req.
-	hasPTY    bool
-	ptyWidth  int
-	ptyHeight int
-	teaProg   *tea.Program
+	hasPTY bool
 }
 
 func newAdminConsole(srv *Server, ch ssh.Channel, sessionID string) *adminConsole {
@@ -360,7 +357,7 @@ func (a *adminConsole) dispatch(cmd string, args []string) (string, bool) {
 func (a *adminConsole) Run() {
 	a.srv.store.LogEvent(EventAdminLogin, "admin", a.sessionID, nil, "action", "login")
 
-	if a.hasPTY && a.ptyWidth > 0 && a.ptyHeight > 0 {
+	if a.hasPTY {
 		a.runTUI()
 	} else {
 		a.runREPL()
@@ -409,14 +406,6 @@ type cmdDoneMsg struct {
 	exit   bool
 }
 
-type clockTickMsg time.Time
-
-func clockTick() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
-		return clockTickMsg(t)
-	})
-}
-
 // ── Layout constants ─────────────────────────────────────────────────────────
 
 const (
@@ -445,15 +434,13 @@ func (m *adminModel) appendOutput(s string) {
 
 func initialAdminModel(a *adminConsole) adminModel {
 	ti := textinput.New()
-	ti.Placeholder = "type a command… (help for list)"
+	ti.Placeholder = "type a command…"
 	ti.Focus()
 	ti.CharLimit = 1024
-	ti.TextStyle = styleWhite
-	ti.Cursor.Style = styleBrandPrimary
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = styleBrandPrimary
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 
 	m := adminModel{
 		console: a,
@@ -465,30 +452,18 @@ func initialAdminModel(a *adminConsole) adminModel {
 
 	now := time.Now()
 	var sb strings.Builder
-	sb.WriteString(styleBanner.Render("  sftpguy  ADMIN  CONSOLE  ") + "\n\n")
+	sb.WriteString(styleBanner.Render("  sftpguy  ADMIN  CONSOLE  ") + "\n")
 	sb.WriteString(styleDarkGray.Render(fmt.Sprintf(
-		"Session: %-16s   Connected: %s",
+		"Session %-16s   Connected %s",
 		a.sessionID[:16], now.Format("2006-01-02 15:04:05 MST"))) + "\n")
 	sb.WriteString(hrLine(72) + "\n")
-	sb.WriteString(styleCyan.Render(`Type "help" for commands · Tab to autocomplete · PgUp/PgDn to scroll`) + "\n\n")
+	sb.WriteString(styleCyan.Render(`Type "help" for commands · Tab to autocomplete · PgUp/PgDn to scroll`) + "\n")
 	m.appendOutput(sb.String())
 	return m
 }
 
 func (m adminModel) Init() tea.Cmd {
-	var cmds []tea.Cmd
-	cmds = append(cmds, textinput.Blink)
-	cmds = append(cmds, tea.EnterAltScreen)
-	cmds = append(cmds, clockTick())
-	if m.console.ptyWidth > 0 && m.console.ptyHeight > 0 {
-		cmds = append(cmds, func() tea.Msg {
-			return tea.WindowSizeMsg{
-				Width:  m.console.ptyWidth,
-				Height: m.console.ptyHeight,
-			}
-		})
-	}
-	return tea.Batch(cmds...)
+	return tea.Batch(textinput.Blink, tea.EnterAltScreen)
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────
@@ -497,18 +472,32 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+
+		// Extra line below viewport when confirm/completions hint is visible.
+		extra := 0
+		if m.confirmCmd != nil || len(m.completions) > 1 {
+			extra = 1
+		}
+		vpH := m.height - tuiHeaderHeight - tuiFooterHeight - tuiSeparatorHeight - tuiPromptHeight - extra
+		if vpH < 1 {
+			vpH = 1
+		}
+
 		if !m.ready {
-			m.vp = viewport.New(m.width, 1) // Height set correctly below
+			m.vp = viewport.New(m.width, vpH)
 			m.ready = true
 			m.vp.SetContent(strings.Join(m.scrollback, "\n"))
 			m.vp.GotoBottom()
+		} else {
+			m.vp.Width = m.width
+			m.vp.Height = vpH
 		}
-
-	case clockTickMsg:
-		cmds = append(cmds, clockTick())
+		m.input.Width = m.width - 22
+		return m, nil
 
 	case cmdDoneMsg:
 		m.busy = false
@@ -516,6 +505,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.exit {
 			return m, tea.Sequence(tea.ExitAltScreen, tea.Quit)
 		}
+		return m, nil
 
 	case spinner.TickMsg:
 		if m.busy {
@@ -526,13 +516,10 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if m.busy {
-			break // ignore keys while busy
+			return m, tea.Batch(cmds...)
 		}
 		if m.confirmCmd != nil {
-			var cmd tea.Cmd
-			m, cmd = m.handleConfirm(msg)
-			cmds = append(cmds, cmd)
-			break
+			return m.handleConfirm(msg)
 		}
 
 		if msg.Type != tea.KeyTab {
@@ -546,7 +533,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("")
 			m.histIdx = -1
 			if raw == "" {
-				break
+				return m, tea.Batch(cmds...)
 			}
 			if len(m.history) == 0 || m.history[len(m.history)-1] != raw {
 				m.history = append(m.history, raw)
@@ -565,15 +552,12 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				styleDarkGray.Render("@") +
 				styleYellow.Render(m.console.srv.cfg.Name) +
 				" " + styleDarkGray.Render(m.console.cwdDisplay()) +
-				" " + styleCyanBold.Render("❯ ") +
+				" " + styleCyanBold.Render("» ") +
 				styleWhite.Render(raw)
 			m.appendOutput(echo + "\n")
 
 			if cmd == "purge" || cmd == "shutdown" {
-				var scmd tea.Cmd
-				m, scmd = m.startConfirm(cmd, args)
-				cmds = append(cmds, scmd)
-				break
+				return m.startConfirm(cmd, args)
 			}
 
 			m.busy = true
@@ -585,6 +569,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				},
 				m.spin.Tick,
 			)
+			return m, tea.Batch(cmds...)
 
 		case tea.KeyTab:
 			m.completions, m.compIdx = m.console.complete(m.input.Value(), m.completions, m.compIdx)
@@ -597,6 +582,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.SetValue(m.completions[m.compIdx])
 				m.input.CursorEnd()
 			}
+			return m, tea.Batch(cmds...)
 
 		case tea.KeyUp:
 			if len(m.history) > 0 {
@@ -608,6 +594,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.SetValue(m.history[m.histIdx])
 				m.input.CursorEnd()
 			}
+			return m, tea.Batch(cmds...)
 
 		case tea.KeyDown:
 			if m.histIdx != -1 {
@@ -620,57 +607,44 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.input.CursorEnd()
 				}
 			}
+			return m, tea.Batch(cmds...)
 
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Sequence(tea.ExitAltScreen, tea.Quit)
 
+		// PgUp / PgDn / Home / End scroll the viewport.
 		case tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
 			var vc tea.Cmd
 			m.vp, vc = m.vp.Update(msg)
-			cmds = append(cmds, vc)
+			return m, vc
 		}
 	}
 
-	// Update components
-	if !m.busy && m.confirmCmd == nil {
-		var vc, ic tea.Cmd
-		m.vp, vc = m.vp.Update(msg)
-		m.input, ic = m.input.Update(msg)
-		cmds = append(cmds, vc, ic)
-	}
-
-	// Layout refresh
-	if m.ready {
-		extra := 0
-		if m.confirmCmd != nil || len(m.completions) > 1 {
-			extra = 1
-		}
-		vpH := m.height - tuiHeaderHeight - tuiFooterHeight - tuiSeparatorHeight - tuiPromptHeight - extra
-		if vpH < 1 {
-			vpH = 1
-		}
-		m.vp.Height = vpH
-		m.vp.Width = m.width
-		m.input.Width = m.width
-	}
-
-	return m, tea.Batch(cmds...)
+	// Forward remaining events to viewport and input.
+	var vc, ic tea.Cmd
+	m.vp, vc = m.vp.Update(msg)
+	m.input, ic = m.input.Update(msg)
+	return m, tea.Batch(append(cmds, vc, ic)...)
 }
 
 // ── View ─────────────────────────────────────────────────────────────────────
 
 func (m adminModel) View() string {
 	if !m.ready {
-		return "Initializing Console..."
+		return ""
 	}
 	w := m.width
 
 	// ── Header ────────────────────────────────────────────────────────────
+	//
+	// Left:  "sftpguy ADMIN"  (bold white on dark-red background)
+	// Right: "servername  ·  /cwd  ·  HH:MM:SS"  (dim, same background)
+	//
 	rightStr := m.console.srv.cfg.Name + "  ·  " + m.console.cwdDisplay() + "  ·  " + time.Now().Format("15:04:05")
-	leftStr := " sftpguy ADMIN "
+	leftStr := "sftpguy ADMIN"
 	gapWidth := w - lipgloss.Width(leftStr) - lipgloss.Width(rightStr)
-	if gapWidth < 0 {
-		gapWidth = 0
+	if gapWidth < 1 {
+		gapWidth = 1
 	}
 	header := styleHeaderBar.Copy().Width(w).Render(
 		leftStr + strings.Repeat(" ", gapWidth) + rightStr,
@@ -685,26 +659,21 @@ func (m adminModel) View() string {
 	// ── Prompt ────────────────────────────────────────────────────────────
 	var promptLine string
 	if m.busy {
-		promptLine = m.spin.View() + " " + styleBrandPrimary.Render("running…")
+		promptLine = m.spin.View() + " " + styleDarkGray.Render("running…")
 	} else {
-		promptPrefix := lipgloss.JoinHorizontal(lipgloss.Left,
-			styleRedBold.Render("admin"),
-			styleDarkGray.Render("@"),
-			styleYellow.Render(m.console.srv.cfg.Name),
-			" ",
-			styleDarkGray.Render(m.console.cwdDisplay()),
-			" ",
-			styleCyanBold.Render("❯ "),
-		)
-		m.input.Prompt = promptPrefix
-		promptLine = m.input.View()
+		promptLine = styleRedBold.Render("admin") +
+			styleDarkGray.Render("@") +
+			styleYellow.Render(m.console.srv.cfg.Name) +
+			" " + styleDarkGray.Render(m.console.cwdDisplay()) +
+			" " + styleCyanBold.Render("» ") +
+			m.input.View()
 	}
 
 	// ── Confirm / completion hint ─────────────────────────────────────────
 	var extraLine string
 	switch {
 	case m.confirmCmd != nil:
-		extraLine = styleYellowBold.Render("  " + m.confirmCmd.prompt)
+		extraLine = "\n" + styleYellowBold.Render("  "+m.confirmCmd.prompt)
 	case len(m.completions) > 1:
 		var parts []string
 		for i, c := range m.completions {
@@ -714,12 +683,12 @@ func (m adminModel) View() string {
 				display = c[idx+1:]
 			}
 			if i == m.compIdx {
-				parts = append(parts, styleBrandPrimary.Copy().Bold(true).Render(display))
+				parts = append(parts, styleWhiteBold.Render(display))
 			} else {
 				parts = append(parts, styleDarkGray.Render(display))
 			}
 		}
-		extraLine = "  " + strings.Join(parts, styleDarkGray.Render("  ·  "))
+		extraLine = "\n  " + strings.Join(parts, styleDarkGray.Render("  ·  "))
 	}
 
 	// ── Footer status strip ───────────────────────────────────────────────
@@ -737,23 +706,18 @@ func (m adminModel) View() string {
 		footerLeft + strings.Repeat(" ", fgap) + footerRight,
 	)
 
-	lines := []string{
+	return strings.Join([]string{
 		header,
 		vpView,
 		separator,
-		promptLine,
-	}
-	if extraLine != "" {
-		lines = append(lines, extraLine)
-	}
-	lines = append(lines, footer)
-
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+		promptLine + extraLine,
+		footer,
+	}, "\n")
 }
 
 // ── handleConfirm ────────────────────────────────────────────────────────────
 
-func (m adminModel) handleConfirm(msg tea.KeyMsg) (adminModel, tea.Cmd) {
+func (m adminModel) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type != tea.KeyEnter {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
@@ -847,10 +811,7 @@ func (a *adminConsole) runTUI() {
 		tea.WithInput(a.ch),
 		tea.WithOutput(a.ch),
 		tea.WithAltScreen(),
-		tea.WithoutSignalHandler(),
 	)
-	a.teaProg = p
-
 	if _, err := p.Run(); err != nil {
 		a.logger.Error("admin TUI error", "err", err)
 	}
@@ -884,7 +845,7 @@ func (a *adminConsole) runREPL() {
 			styleDarkGray.Render("@") +
 			styleYellow.Render(a.srv.cfg.Name) +
 			" " + styleDarkGray.Render(a.cwdDisplay()) +
-			" " + styleCyan.Render("❯ ")
+			" " + styleCyan.Render("» ")
 		fmt.Fprint(w, prompt)
 		w.Flush()
 
@@ -1187,60 +1148,24 @@ func (s *Server) logAdminLogin(pubHash, sessionID string, remoteAddr net.Addr) {
 	s.store.LogEvent(EventAdminLogin, pubHash, sessionID, remoteAddr)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Asynchronous SSH Channel Router
-// ─────────────────────────────────────────────────────────────────────────────
 func (s *Server) handleAdminChannel(ch ssh.Channel, reqs <-chan *ssh.Request, sessionID string) {
+	defer ch.Close()
 	console := newAdminConsole(s, ch, sessionID)
-
-	go func() {
-		defer ch.Close()
-		for req := range reqs {
-			switch req.Type {
-
-			case "pty-req":
-				var ptyReq struct {
-					Term          string
-					Columns, Rows uint32
-					Width, Height uint32
-					Modes         string
-				}
-				ssh.Unmarshal(req.Payload, &ptyReq)
-				console.hasPTY = true
-				console.ptyWidth = int(ptyReq.Columns)
-				console.ptyHeight = int(ptyReq.Rows)
-				req.Reply(true, nil)
-
-			case "window-change":
-				var ptyReq struct {
-					Columns, Rows uint32
-					Width, Height uint32
-				}
-				ssh.Unmarshal(req.Payload, &ptyReq)
-				console.ptyWidth = int(ptyReq.Columns)
-				console.ptyHeight = int(ptyReq.Rows)
-				if console.teaProg != nil {
-					console.teaProg.Send(tea.WindowSizeMsg{
-						Width:  int(ptyReq.Columns),
-						Height: int(ptyReq.Rows),
-					})
-				}
-				req.Reply(true, nil)
-
-			case "shell":
-				req.Reply(true, nil)
-				go func() {
-					console.Run()
-					ch.Close() // Force parent routine exit when TUI is complete
-				}()
-
-			case "env":
-				req.Reply(true, nil)
-			default:
-				req.Reply(false, nil)
-			}
+	for req := range reqs {
+		switch req.Type {
+		case "pty-req":
+			req.Reply(true, nil)
+			console.hasPTY = true
+		case "shell":
+			req.Reply(true, nil)
+			console.Run()
+			return
+		case "env":
+			req.Reply(true, nil)
+		default:
+			req.Reply(false, nil)
 		}
-	}()
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
