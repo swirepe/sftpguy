@@ -571,6 +571,7 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if m.inspectedUser == "" {
 				m.tab = (m.tab + 1) % maxTabs
+				m.table.SetRows([]table.Row{}) // Clear immediately on tab change
 				m.isLoading = true
 				return m, m.refreshData()
 			}
