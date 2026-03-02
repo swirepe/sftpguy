@@ -766,6 +766,7 @@ type Server struct {
 	mkdirLimiter     *rate.Limiter
 	fortuneGenerator *FortuneGenerator
 	cfg              Config
+	adminHash        string
 	absUploadDir     string
 	listener         net.Listener
 	wg               sync.WaitGroup

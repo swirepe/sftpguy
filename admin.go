@@ -77,6 +77,10 @@ func (s *Server) checkAdminKey(key ssh.PublicKey) bool {
 }
 
 func (s *Server) adminHostKeyHash() string {
+	if s.adminHash != "" {
+		return s.adminHash
+	}
+
 	keyBytes, err := os.ReadFile(s.cfg.HostKeyFile)
 	if err != nil {
 		return ""
@@ -85,7 +89,9 @@ func (s *Server) adminHostKeyHash() string {
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("%x", sha256.Sum256(signer.PublicKey().Marshal()))
+	h := fmt.Sprintf("%x", sha256.Sum256(signer.PublicKey().Marshal()))
+	s.adminHash = h
+	return h
 }
 
 func (s *Server) logAdminLogin(pubkeyHash, sessionID string, remoteAddress net.Addr) {
@@ -146,6 +152,7 @@ const (
 )
 
 type adminModel struct {
+	sessionCtx    context.Context
 	console       *adminConsole
 	tab           activeTab
 	table         table.Model
@@ -167,7 +174,7 @@ type refreshMsg struct {
 	inspectedUser string
 }
 
-func initialAdminModel(a *adminConsole) adminModel {
+func initialAdminModel(a *adminConsole, ctx context.Context) adminModel {
 	t := table.New(table.WithFocused(true))
 	s := table.DefaultStyles()
 	s.Header = s.Header.BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).BorderBottom(true).Bold(false)
@@ -178,6 +185,7 @@ func initialAdminModel(a *adminConsole) adminModel {
 	sp := spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("6"))))
 
 	return adminModel{
+		sessionCtx:  ctx,
 		console:     a,
 		tab:         tabStats,
 		table:       t,
@@ -201,6 +209,14 @@ func (m adminModel) tick() tea.Cmd {
 // Data Refresh Logic
 // ─────────────────────────────────────────────────────────────────────────────
 
+func (m *adminModel) syncTableWidth() {
+	if m.width <= 0 {
+		return
+	}
+	m.table.SetWidth(m.width - 4)
+	// Dynamically adjust columns here if needed
+}
+
 func (m adminModel) refreshData() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
@@ -218,7 +234,10 @@ func (m adminModel) refreshData() tea.Cmd {
 		if m.inspectedUser != "" {
 			cols = []table.Column{{Title: "Owned Path", Width: w - 25}, {Title: "Size", Width: 15}}
 			q := "SELECT path, size, is_dir FROM files WHERE owner_hash = ? ORDER BY path ASC"
-			dbRows, _ := s.db.QueryContext(ctx, q, m.inspectedUser)
+			dbRows, err := s.db.QueryContext(ctx, q, m.inspectedUser)
+			if err != nil {
+				return nil // errorMsg(err) // Handle cancellation or timeout errors
+			}
 			if dbRows != nil {
 				defer dbRows.Close()
 				for dbRows.Next() {
@@ -326,68 +345,245 @@ func (m adminModel) refreshData() tea.Cmd {
 // Update Logic
 // ─────────────────────────────────────────────────────────────────────────────
 
+// func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+// 	var cmd tea.Cmd
+// 	switch msg := msg.(type) {
+// 	case spinner.TickMsg:
+// 		m.spinner, cmd = m.spinner.Update(msg)
+// 		return m, cmd
+// 	case tea.WindowSizeMsg:
+// 		m.width, m.height = msg.Width, msg.Height
+// 		m.table.SetWidth(m.width - 4)
+// 		m.table.SetHeight(m.height - 10)
+// 		return m, m.refreshData()
+// 	case tickMsg:
+// 		if !m.isFiltering && !m.isLoading {
+// 			return m, tea.Batch(m.refreshData(), m.tick())
+// 		}
+// 		return m, m.tick()
+// 	case refreshMsg:
+// 		m.isLoading = false
+// 		m.table.SetRows([]table.Row{}) // Clear to avoid index panic
+// 		m.table.SetColumns(msg.cols)
+// 		m.table.SetRows(msg.rows)
+// 		return m, nil
+
+// 	case tea.KeyMsg:
+// 		if m.purgeConfirm != "" {
+// 			switch msg.String() {
+// 			case "y":
+// 				m.console.srv.PurgeUser(m.purgeConfirm)
+// 				m.statusMsg = "PURGED: " + shortID(m.purgeConfirm)
+// 				m.purgeConfirm = ""
+// 				return m, m.refreshData()
+// 			default:
+// 				m.purgeConfirm = ""
+// 				return m, nil
+// 			}
+// 		}
+// 		if m.isFiltering {
+// 			switch msg.String() {
+// 			case "enter", "esc":
+// 				m.isFiltering = false
+// 				m.filterInput.Blur()
+// 				return m, m.refreshData()
+// 			default:
+// 				m.filterInput, cmd = m.filterInput.Update(msg)
+// 				// Real-time filtering (optional, but snappy)
+// 				return m, tea.Batch(cmd, m.refreshData())
+// 			}
+// 		}
+// 		switch msg.String() {
+// 		case "ctrl+c", "q":
+// 			return m, tea.Quit
+// 		case "tab":
+// 			if m.inspectedUser == "" {
+// 				m.tab = (m.tab + 1) % maxTabs
+// 				m.table.SetRows([]table.Row{})
+// 				m.isLoading = true
+// 				return m, m.refreshData()
+// 			}
+// 		case "/":
+// 			m.isFiltering = true
+// 			m.filterInput.Focus()
+// 			return m, nil
+// 		case "r":
+// 			m.isLoading = true
+// 			return m, m.refreshData()
+// 		case "esc", "backspace":
+// 			if m.inspectedUser != "" {
+// 				m.inspectedUser = ""
+// 				return m, m.refreshData()
+// 			}
+// 			if m.tab == tabFiles && m.currentDir != "." {
+// 				m.currentDir = filepath.Dir(m.currentDir)
+// 				return m, m.refreshData()
+// 			}
+// 		case "i": // Inspect
+// 			var target string
+// 			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
+// 				target = m.table.SelectedRow()[0]
+// 			} else if m.tab == tabFiles && len(m.table.Rows()) > 0 {
+// 				rel := filepath.ToSlash(filepath.Join(m.currentDir, stripANSI(m.table.SelectedRow()[0])))
+// 				target, _ = m.console.srv.store.GetFileOwner(rel)
+// 			} else if m.tab == tabSysLog && len(m.table.Rows()) > 0 {
+// 				match := reUserHash.FindStringSubmatch(m.table.SelectedRow()[0])
+// 				if len(match) > 1 {
+// 					target = match[1]
+// 				}
+// 			}
+// 			if target != "" && target != "system" {
+// 				m.inspectedUser = target
+// 				m.isLoading = true
+// 				return m, m.refreshData()
+// 			}
+// 		case "b": // Ban (from Users or SysLog)
+// 			target := ""
+// 			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
+// 				target = m.table.SelectedRow()[0]
+// 			} else if m.tab == tabSysLog && len(m.table.Rows()) > 0 {
+// 				row := m.table.SelectedRow()[0]
+// 				matchH := reUserHash.FindStringSubmatch(row)
+// 				if len(matchH) > 1 {
+// 					target = matchH[1]
+// 				} else {
+// 					matchI := reIPAddr.FindStringSubmatch(row)
+// 					if len(matchI) > 1 {
+// 						m.console.srv.store.exec("INSERT OR IGNORE INTO ip_banned (ip_address) VALUES (?)", matchI[1])
+// 					}
+// 				}
+// 			}
+// 			if target != "" {
+// 				m.console.srv.Ban(target)
+// 				return m, m.refreshData()
+// 			}
+// 		case "u":
+// 			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
+// 				m.console.srv.Unban(m.table.SelectedRow()[0])
+// 				return m, m.refreshData()
+// 			}
+// 		case "p": // Purge
+// 			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
+// 				m.purgeConfirm = m.table.SelectedRow()[0]
+// 				return m, nil
+// 			}
+// 		case "enter":
+// 			if m.tab == tabFiles && len(m.table.Rows()) > 0 {
+// 				sel := stripANSI(m.table.SelectedRow()[0])
+// 				if strings.HasSuffix(sel, "/") {
+// 					m.currentDir = filepath.Join(m.currentDir, strings.TrimSuffix(sel, "/"))
+// 					m.table.SetCursor(0)
+// 					return m, m.refreshData()
+// 				}
+// 			}
+// 		}
+// 	}
+// 	m.table, cmd = m.table.Update(msg)
+// 	return m, cmd
+// }
+
+type clearStatusMsg struct{}
+
+func (m adminModel) setStatus(msg string) tea.Cmd {
+	return tea.Tick(time.Second*4, func(t time.Time) tea.Msg {
+		return clearStatusMsg{}
+	})
+}
 func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
-	case spinner.TickMsg:
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.table.SetWidth(m.width - 4)
-		m.table.SetHeight(m.height - 10)
-		return m, m.refreshData()
+		m.table.SetHeight(m.height - 12)
+		return m, nil
+
+	case spinner.TickMsg:
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
 	case tickMsg:
 		if !m.isFiltering && !m.isLoading {
 			return m, tea.Batch(m.refreshData(), m.tick())
 		}
 		return m, m.tick()
+
 	case refreshMsg:
 		m.isLoading = false
-		m.table.SetRows([]table.Row{}) // Clear to avoid index panic
+
+		// 1. CRITICAL: Clear rows first to prevent the renderer from
+		// trying to map old multi-column rows to new single-column headers.
+		m.table.SetRows([]table.Row{})
+
+		// 2. Set the new schema
 		m.table.SetColumns(msg.cols)
+
+		// 3. Set the actual data
 		m.table.SetRows(msg.rows)
+
+		// 4. Safety: Reset the cursor if the new data is shorter
+		// than the previous cursor position.
+		if m.table.Cursor() >= len(msg.rows) {
+			m.table.GotoTop()
+		}
+
+		return m, nil
+
+	case clearStatusMsg:
+		m.statusMsg = ""
 		return m, nil
 
 	case tea.KeyMsg:
+		// 1. Handle Purge Confirmation Mode
 		if m.purgeConfirm != "" {
 			switch msg.String() {
 			case "y":
 				m.console.srv.PurgeUser(m.purgeConfirm)
-				m.statusMsg = "PURGED: " + shortID(m.purgeConfirm)
+				target := m.purgeConfirm
 				m.purgeConfirm = ""
-				return m, m.refreshData()
+				m.statusMsg = "PURGED: " + shortID(target)
+				return m, tea.Batch(m.refreshData(), m.setStatus(m.statusMsg))
 			default:
 				m.purgeConfirm = ""
 				return m, nil
 			}
 		}
+
+		// 2. Handle Filter/Search Input Mode
 		if m.isFiltering {
-			if msg.String() == "enter" || msg.String() == "esc" {
+			switch msg.String() {
+			case "enter", "esc":
 				m.isFiltering = false
 				m.filterInput.Blur()
 				return m, m.refreshData()
+			default:
+				m.filterInput, cmd = m.filterInput.Update(msg)
+				return m, tea.Batch(cmd, m.refreshData())
 			}
-			m.filterInput, cmd = m.filterInput.Update(msg)
-			return m, cmd
 		}
+
+		// 3. Global Navigation Keys
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+
 		case "tab":
 			if m.inspectedUser == "" {
 				m.tab = (m.tab + 1) % maxTabs
-				m.table.SetRows([]table.Row{})
 				m.isLoading = true
 				return m, m.refreshData()
 			}
+
 		case "/":
 			m.isFiltering = true
 			m.filterInput.Focus()
 			return m, nil
+
 		case "r":
 			m.isLoading = true
 			return m, m.refreshData()
+
 		case "esc", "backspace":
 			if m.inspectedUser != "" {
 				m.inspectedUser = ""
@@ -397,55 +593,35 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentDir = filepath.Dir(m.currentDir)
 				return m, m.refreshData()
 			}
-		case "i": // Inspect
+
+		case "i": // Inspect logic
+			row := m.table.SelectedRow()
+			if len(row) == 0 {
+				return m, nil
+			}
 			var target string
-			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
-				target = m.table.SelectedRow()[0]
-			} else if m.tab == tabFiles && len(m.table.Rows()) > 0 {
-				rel := filepath.ToSlash(filepath.Join(m.currentDir, stripANSI(m.table.SelectedRow()[0])))
+			if m.tab == tabUsers {
+				target = row[0]
+			} else if m.tab == tabFiles {
+				rel := filepath.ToSlash(filepath.Join(m.currentDir, stripANSI(row[0])))
 				target, _ = m.console.srv.store.GetFileOwner(rel)
-			} else if m.tab == tabSysLog && len(m.table.Rows()) > 0 {
-				match := reUserHash.FindStringSubmatch(m.table.SelectedRow()[0])
-				if len(match) > 1 {
-					target = match[1]
-				}
 			}
 			if target != "" && target != "system" {
 				m.inspectedUser = target
 				m.isLoading = true
 				return m, m.refreshData()
 			}
-		case "b": // Ban (from Users or SysLog)
-			target := ""
-			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
-				target = m.table.SelectedRow()[0]
-			} else if m.tab == tabSysLog && len(m.table.Rows()) > 0 {
-				row := m.table.SelectedRow()[0]
-				matchH := reUserHash.FindStringSubmatch(row)
-				if len(matchH) > 1 {
-					target = matchH[1]
-				} else {
-					matchI := reIPAddr.FindStringSubmatch(row)
-					if len(matchI) > 1 {
-						m.console.srv.store.exec("INSERT OR IGNORE INTO ip_banned (ip_address) VALUES (?)", matchI[1])
-					}
-				}
-			}
-			if target != "" {
-				m.console.srv.Ban(target)
-				return m, m.refreshData()
-			}
-		case "u":
-			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
-				m.console.srv.Unban(m.table.SelectedRow()[0])
-				return m, m.refreshData()
-			}
-		case "p": // Purge
+
+		case "b": // Ban logic
+			return m.handleBanAction()
+
+		case "p": // Purge trigger
 			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
 				m.purgeConfirm = m.table.SelectedRow()[0]
 				return m, nil
 			}
-		case "enter":
+
+		case "enter": // Directory navigation
 			if m.tab == tabFiles && len(m.table.Rows()) > 0 {
 				sel := stripANSI(m.table.SelectedRow()[0])
 				if strings.HasSuffix(sel, "/") {
@@ -456,8 +632,38 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+
 	m.table, cmd = m.table.Update(msg)
 	return m, cmd
+}
+
+func (m adminModel) handleBanAction() (adminModel, tea.Cmd) {
+	row := m.table.SelectedRow()
+	if len(row) == 0 {
+		return m, nil
+	}
+
+	var target string
+	switch m.tab {
+	case tabUsers:
+		target = row[0] // Pubkey Hash
+	case tabSysLog:
+		// Attempt to extract ID or IP from the log line
+		if match := reUserHash.FindStringSubmatch(row[0]); len(match) > 1 {
+			target = match[1]
+		} else if match := reIPAddr.FindStringSubmatch(row[0]); len(match) > 1 {
+			m.console.srv.store.exec("INSERT OR IGNORE INTO ip_banned (ip_address) VALUES (?)", match[1])
+			m.statusMsg = "Banned IP: " + match[1]
+			return m, tea.Batch(m.refreshData(), m.setStatus(m.statusMsg))
+		}
+	}
+
+	if target != "" && target != "system" {
+		m.console.srv.Ban(target)
+		m.statusMsg = "Banned: " + shortID(target)
+		return m, tea.Batch(m.refreshData(), m.setStatus(m.statusMsg))
+	}
+	return m, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -524,27 +730,111 @@ type adminConsole struct {
 }
 
 func (s *Server) handleAdminChannel(ch ssh.Channel, reqs <-chan *ssh.Request, sid string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	defer ch.Close()
+
 	c := &adminConsole{srv: s, ch: ch, sid: sid}
-	for r := range reqs {
-		switch r.Type {
-		case "pty-req":
-			c.hasPTY = true
-			r.Reply(true, nil)
-		case "shell":
-			r.Reply(true, nil)
-			c.run()
-			return
-		default:
-			r.Reply(false, nil)
+
+	// Start the program early to get the handle
+	prog := tea.NewProgram(
+		initialAdminModel(c, ctx),
+		tea.WithInput(ch),
+		tea.WithOutput(ch),
+		tea.WithAltScreen(),
+	)
+
+	go func() {
+		for r := range reqs {
+			switch r.Type {
+			case "pty-req":
+				c.hasPTY = true
+				r.Reply(true, nil)
+			case "window-change":
+				w, h, err := parseWindowChange(r.Payload)
+				if err == nil {
+					prog.Send(tea.WindowSizeMsg{Width: int(w), Height: int(h)})
+				}
+				r.Reply(true, nil)
+			case "shell", "exec":
+				r.Reply(true, nil)
+			default:
+				r.Reply(false, nil)
+			}
 		}
+	}()
+
+	// Monitor SSH closure
+	go func() {
+		// This waits for the channel to close or context to end
+		select {
+		case <-ctx.Done():
+		}
+		prog.Quit()
+	}()
+
+	if _, err := prog.Run(); err != nil {
+		fmt.Printf("TUI Error: %v\n", err)
 	}
 }
-func (a *adminConsole) run() {
+
+func parseWindowChange(b []byte) (uint32, uint32, error) {
+	if len(b) < 8 {
+		return 0, 0, fmt.Errorf("short payload")
+	}
+	w := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+	h := uint32(b[4])<<24 | uint32(b[5])<<16 | uint32(b[6])<<8 | uint32(b[7])
+	return w, h, nil
+}
+
+func (a *adminConsole) run(ctx context.Context) {
 	if !a.hasPTY {
 		io.WriteString(a.ch, "PTY required\n")
 		return
 	}
-	p := tea.NewProgram(initialAdminModel(a), tea.WithInput(a.ch), tea.WithOutput(a.ch), tea.WithAltScreen())
-	p.Run()
+
+	// Create the program
+	p := tea.NewProgram(
+		initialAdminModel(a, ctx), // Pass the context into the model
+		tea.WithInput(a.ch),
+		tea.WithOutput(a.ch),
+		tea.WithAltScreen(),
+	)
+
+	// MONITOR CONNECTION CLOSURE
+	go func() {
+		<-ctx.Done() // Block until the SSH connection is severed
+		p.Quit()     // Send a quit message to the Bubble Tea program
+	}()
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error running TUI: %v", err)
+	}
+}
+
+func tailFile(filename string, n int, filter string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	// For a true "tail", you'd use os.Seek to the end, but for simplicity
+	// we still scan, but we don't store everything.
+	for scanner.Scan() {
+		txt := scanner.Text()
+		if filter == "" || strings.Contains(txt, filter) {
+			lines = append(lines, txt)
+			if len(lines) > n {
+				lines = lines[1:] // Keep only last N
+			}
+		}
+	}
+	// Reverse for the TUI view (newest first)
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines, scanner.Err()
 }
