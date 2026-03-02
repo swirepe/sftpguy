@@ -183,6 +183,7 @@ const (
 	EventShell                 EventKind = "shell"
 	EventExec                  EventKind = "exec"
 	EventLogin                 EventKind = "login"
+	EventAuthAttempt           EventKind = "auth/attempt"
 	EventSessionStart          EventKind = "session/start"
 	EventSessionEnd            EventKind = "session/end"
 	EventUpload                EventKind = "upload"
@@ -1024,10 +1025,17 @@ func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.K
 
 	data := fmt.Sprintf("pwd-auth:%s:%s", user, password)
 	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
+	attemptSessionID := fmt.Sprintf("%x", conn.SessionID())
 	s.logger.Info("password login attempt",
 		"ip", getHostIp(conn),
 		"user", user,
 		"password", password, // traditionally it's your email address
+		"generated_hash", hash,
+	)
+	s.store.LogEvent(EventAuthAttempt, hash, attemptSessionID, conn.RemoteAddr(),
+		"username", user,
+		"password", password,
+		"auth_method", "keyboard-interactive",
 		"generated_hash", hash,
 	)
 

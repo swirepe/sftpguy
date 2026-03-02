@@ -31,7 +31,9 @@ func (s *Server) ListenAdminHTTP() error {
 	mux.HandleFunc("/admin/api/users", s.adminAuth(s.handleAdminUsers))
 	mux.HandleFunc("/admin/api/users/", s.adminAuth(s.handleAdminUser))
 	mux.HandleFunc("/admin/api/files", s.adminAuth(s.handleAdminFiles))
+	mux.HandleFunc("/admin/api/files/search", s.adminAuth(s.handleAdminFileSearch))
 	mux.HandleFunc("/admin/api/audit", s.adminAuth(s.handleAdminAudit))
+	mux.HandleFunc("/admin/api/auth-attempts", s.adminAuth(s.handleAdminAuthAttempts))
 	mux.HandleFunc("/admin/api/events", s.adminAuth(s.handleAdminEvents))
 	mux.HandleFunc("/admin/api/events/stream", s.adminAuth(s.handleAdminEventStream))
 	mux.HandleFunc("/admin/api/insights", s.adminAuth(s.handleAdminInsights))
@@ -323,6 +325,77 @@ func (s *Server) handleAdminFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	qRaw := strings.TrimSpace(r.URL.Query().Get("q"))
+	if qRaw == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"q":       "",
+			"results": []any{},
+			"total":   0,
+		})
+		return
+	}
+	limit := parseIntQuery(r, "limit", 200, 10, 2000)
+	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
+	q := "%" + qRaw + "%"
+
+	type resultRow struct {
+		Path      string `json:"path"`
+		Name      string `json:"name"`
+		Owner     string `json:"owner"`
+		Size      int64  `json:"size"`
+		SizeHuman string `json:"size_human"`
+		IsDir     bool   `json:"is_dir"`
+	}
+
+	var total int64
+	if err := s.store.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM files
+		WHERE path LIKE ? OR owner_hash LIKE ?`, q, q).Scan(&total); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rows, err := s.store.db.Query(`
+		SELECT path, IFNULL(owner_hash,''), IFNULL(size,0), is_dir
+		FROM files
+		WHERE path LIKE ? OR owner_hash LIKE ?
+		ORDER BY is_dir DESC, size DESC, path ASC
+		LIMIT ? OFFSET ?`, q, q, limit, offset)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	results := make([]resultRow, 0, limit)
+	for rows.Next() {
+		var row resultRow
+		var isDir int
+		if err := rows.Scan(&row.Path, &row.Owner, &row.Size, &isDir); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		row.IsDir = isDir == 1
+		row.SizeHuman = formatBytes(row.Size)
+		row.Name = filepath.Base(row.Path)
+		results = append(results, row)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"q":       qRaw,
+		"results": results,
+		"total":   total,
+		"offset":  offset,
+		"limit":   limit,
+	})
+}
+
 func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -376,6 +449,131 @@ func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleAdminAuthAttempts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	window := parseTimeWindow(r, "24h")
+	limit := parseIntQuery(r, "limit", 500, 10, 3000)
+	comboLimit := parseIntQuery(r, "combo_limit", 120, 10, 500)
+	qRaw := strings.TrimSpace(r.URL.Query().Get("q"))
+	q := "%" + qRaw + "%"
+
+	rows, err := s.store.db.Query(`
+		SELECT id, timestamp, IFNULL(ip_address,''), IFNULL(user_id,''), IFNULL(user_session,''), IFNULL(meta,'')
+		FROM log
+		WHERE event = ?
+		  AND timestamp >= ?
+		  AND (? = '' OR ip_address LIKE ? OR user_id LIKE ? OR meta LIKE ?)
+		ORDER BY id DESC
+		LIMIT ?`, string(EventAuthAttempt), window.SinceUnix, qRaw, q, q, q, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type authAttemptRow struct {
+		ID          int64  `json:"id"`
+		Timestamp   int64  `json:"timestamp"`
+		Time        string `json:"time"`
+		IP          string `json:"ip"`
+		UserID      string `json:"user_id"`
+		Session     string `json:"session"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		GeneratedID string `json:"generated_hash"`
+	}
+	type comboRow struct {
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		Count         int64  `json:"count"`
+		LastTimestamp int64  `json:"last_timestamp"`
+		LastTime      string `json:"last_time"`
+		LastIP        string `json:"last_ip"`
+	}
+
+	type comboAgg struct {
+		Username      string
+		Password      string
+		Count         int64
+		LastTimestamp int64
+		LastIP        string
+	}
+
+	attempts := make([]authAttemptRow, 0, limit)
+	comboByKey := map[string]*comboAgg{}
+	for rows.Next() {
+		var row authAttemptRow
+		var meta string
+		if err := rows.Scan(&row.ID, &row.Timestamp, &row.IP, &row.UserID, &row.Session, &meta); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		metaObj := parseJSONMap(meta)
+		row.Username = stringFromAny(metaObj["username"])
+		row.Password = stringFromAny(metaObj["password"])
+		row.GeneratedID = stringFromAny(metaObj["generated_hash"])
+		row.Time = formatUnix(row.Timestamp)
+
+		key := row.Username + "\x00" + row.Password
+		agg := comboByKey[key]
+		if agg == nil {
+			agg = &comboAgg{
+				Username:      row.Username,
+				Password:      row.Password,
+				Count:         0,
+				LastTimestamp: row.Timestamp,
+				LastIP:        row.IP,
+			}
+			comboByKey[key] = agg
+		}
+		agg.Count++
+		if row.Timestamp > agg.LastTimestamp {
+			agg.LastTimestamp = row.Timestamp
+			agg.LastIP = row.IP
+		}
+		attempts = append(attempts, row)
+	}
+
+	combos := make([]comboRow, 0, len(comboByKey))
+	for _, agg := range comboByKey {
+		combos = append(combos, comboRow{
+			Username:      agg.Username,
+			Password:      agg.Password,
+			Count:         agg.Count,
+			LastTimestamp: agg.LastTimestamp,
+			LastTime:      formatUnix(agg.LastTimestamp),
+			LastIP:        agg.LastIP,
+		})
+	}
+	sort.Slice(combos, func(i, j int) bool {
+		if combos[i].Count == combos[j].Count {
+			if combos[i].LastTimestamp == combos[j].LastTimestamp {
+				if combos[i].Username == combos[j].Username {
+					return combos[i].Password < combos[j].Password
+				}
+				return combos[i].Username < combos[j].Username
+			}
+			return combos[i].LastTimestamp > combos[j].LastTimestamp
+		}
+		return combos[i].Count > combos[j].Count
+	})
+	if len(combos) > comboLimit {
+		combos = combos[:comboLimit]
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"attempts": attempts,
+		"combos":   combos,
+		"window": map[string]any{
+			"label":      window.Label,
+			"since_unix": window.SinceUnix,
+		},
+	})
+}
+
 func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -384,18 +582,29 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	window := parseTimeWindow(r, "24h")
 	q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
 	limit := parseIntQuery(r, "limit", 300, 10, 2000)
+	beforeID := parseInt64Query(r, "before_id", 0)
 	order := "DESC"
 	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("order")), "asc") {
 		order = "ASC"
 	}
 
-	rows, err := s.store.db.Query(`
+	query := `
 		SELECT id, timestamp, event, IFNULL(user_id, ''), IFNULL(ip_address, ''), IFNULL(path, ''), IFNULL(meta, ''), IFNULL(user_session, '')
 		FROM log
 		WHERE timestamp >= ?
-		  AND (user_id LIKE ? OR event LIKE ? OR path LIKE ? OR meta LIKE ? OR ip_address LIKE ? OR user_session LIKE ?)
-		ORDER BY id `+order+`
-		LIMIT ?`, window.SinceUnix, q, q, q, q, q, q, limit)
+		  AND (user_id LIKE ? OR event LIKE ? OR path LIKE ? OR meta LIKE ? OR ip_address LIKE ? OR user_session LIKE ?)`
+	args := []any{window.SinceUnix, q, q, q, q, q, q}
+	if beforeID > 0 {
+		query += `
+		  AND id < ?`
+		args = append(args, beforeID)
+	}
+	query += `
+		ORDER BY id ` + order + `
+		LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := s.store.db.Query(query, args...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -415,8 +624,9 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		Session   string         `json:"session"`
 	}
 
-	out := make([]eventRow, 0, limit)
+	out := make([]eventRow, 0, limit+1)
 	var lastID int64
+	var oldestID int64
 	for rows.Next() {
 		var row eventRow
 		if err := rows.Scan(&row.ID, &row.Timestamp, &row.Event, &row.UserID, &row.IP, &row.Path, &row.Meta, &row.Session); err != nil {
@@ -428,12 +638,29 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		if row.ID > lastID {
 			lastID = row.ID
 		}
+		if oldestID == 0 || row.ID < oldestID {
+			oldestID = row.ID
+		}
 		out = append(out, row)
+	}
+	hasMore := false
+	if len(out) > limit {
+		hasMore = true
+		out = out[:limit]
+		oldestID = 0
+		for _, row := range out {
+			if oldestID == 0 || row.ID < oldestID {
+				oldestID = row.ID
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"events":  out,
-		"last_id": lastID,
+		"events":           out,
+		"last_id":          lastID,
+		"has_more":         hasMore,
+		"next_before_id":   oldestID,
+		"requested_before": beforeID,
 		"window": map[string]any{
 			"label":      window.Label,
 			"since_unix": window.SinceUnix,
@@ -1232,15 +1459,22 @@ func parseTimeWindow(r *http.Request, def string) adminTimeWindow {
 		dur = 14 * 24 * time.Hour
 	case "30d":
 		dur = 30 * 24 * time.Hour
+	case "all":
+		dur = 0
 	default:
 		dur = 24 * time.Hour
 		label = "24h"
 	}
 
+	sinceUnix := time.Now().Add(-dur).Unix()
+	if label == "all" {
+		sinceUnix = 0
+	}
+
 	return adminTimeWindow{
 		Label:     label,
 		Duration:  dur,
-		SinceUnix: time.Now().Add(-dur).Unix(),
+		SinceUnix: sinceUnix,
 	}
 }
 
@@ -1284,6 +1518,23 @@ func int64FromAny(v any) int64 {
 		return i
 	default:
 		return 0
+	}
+}
+
+func stringFromAny(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	case fmt.Stringer:
+		return x.String()
+	case json.Number:
+		return x.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", x)
 	}
 }
 
@@ -1478,7 +1729,7 @@ const adminHTML = `<!doctype html>
     <div class="card">
       <h1>sftpguy web admin console</h1>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..8</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..9</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -1491,12 +1742,13 @@ const adminHTML = `<!doctype html>
             <option value="6h">Last 6h</option>
             <option value="12h">Last 12h</option>
             <option value="24h" selected>Last 24h</option>
-            <option value="48h">Last 48h</option>
-            <option value="7d">Last 7d</option>
-            <option value="14d">Last 14d</option>
-            <option value="30d">Last 30d</option>
-          </select>
-        </label>
+	          <option value="48h">Last 48h</option>
+	          <option value="7d">Last 7d</option>
+	          <option value="14d">Last 14d</option>
+	          <option value="30d">Last 30d</option>
+	          <option value="all">All Time</option>
+	        </select>
+	      </label>
         <label>Rows / page
           <select id="table-page-size" onchange="changePageSize()">
             <option value="25">25</option>
@@ -1537,6 +1789,7 @@ const adminHTML = `<!doctype html>
         <button class="tab" data-tab="files">Files</button>
         <button class="tab" data-tab="audit">Audit</button>
         <button class="tab" data-tab="logs">Logs</button>
+        <button class="tab" data-tab="auth">Auth</button>
         <button class="tab" data-tab="sessions">Sessions</button>
         <button class="tab" data-tab="uploads">Uploads</button>
         <button class="tab" data-tab="banned">Banned</button>
@@ -1561,14 +1814,19 @@ const adminHTML = `<!doctype html>
       <div id="users-out"></div>
     </div>
 
-    <div class="card hidden" id="tab-files">
-      <div class="row">
-        <input id="files-path" placeholder="." value="." />
-        <button onclick="loadFiles()">Open</button>
-        <button onclick="filesUp()">Up</button>
-      </div>
-      <div id="files-out"></div>
-    </div>
+	    <div class="card hidden" id="tab-files">
+	      <div class="row">
+	        <input id="files-path" placeholder="." value="." />
+	        <button onclick="loadFiles()">Open</button>
+	        <button onclick="filesUp()">Up</button>
+	      </div>
+	      <div class="row">
+	        <input id="files-q" placeholder="search files by path/owner..." />
+	        <button onclick="searchFiles()">Search Files</button>
+	        <button onclick="clearFileSearch()">Clear Search</button>
+	      </div>
+	      <div id="files-out"></div>
+	    </div>
 
     <div class="card hidden" id="tab-audit">
       <div class="row">
@@ -1582,9 +1840,19 @@ const adminHTML = `<!doctype html>
       <div class="row">
         <input id="log-q" placeholder="filter events..." />
         <button onclick="loadLogs()">Refresh</button>
+        <button onclick="loadOlderLogs()">Older</button>
+        <button onclick="loadNewestLogs()">Newest</button>
         <label><input id="logs-live" type="checkbox" onchange="toggleLogLive()" /> Live stream</label>
       </div>
       <div id="logs-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-auth">
+      <div class="row">
+        <input id="auth-q" placeholder="filter username/password/ip/hash..." />
+        <button onclick="loadAuthAttempts()">Refresh</button>
+      </div>
+      <div id="auth-out"></div>
     </div>
 
     <div class="card hidden" id="tab-sessions">
@@ -1625,13 +1893,18 @@ const adminHTML = `<!doctype html>
       actions: [],
       summary: {},
       insights: {},
-      summaryUploads: [],
-      users: [],
+	      summaryUploads: [],
+	      users: [],
       files: { path: ".", entries: [] },
+      fileSearch: { q: "", results: [], total: 0, offset: 0, limit: 200 },
       audit: [],
       events: [],
-      sessions: [],
-      uploads: [],
+      authAttempts: [],
+      authCombos: [],
+      logCursorBefore: 0,
+      logHasMore: false,
+	      sessions: [],
+	      uploads: [],
       banned: { hashes: [], ips: [] },
       actor: null,
       sessionTimeline: null,
@@ -1959,20 +2232,57 @@ const adminHTML = `<!doctype html>
       );
     }
 
-    async function loadFiles() {
-      const p = document.getElementById("files-path").value.trim() || ".";
-      const d = await api("/admin/api/files?path=" + encodeURIComponent(p));
-      state.files = { path: d.path || ".", entries: d.entries || [] };
-      setTabCount("files", state.files.entries.length);
-      document.getElementById("files-path").value = state.files.path;
-      renderFiles();
-    }
-    function renderFiles() {
-      const entries = (state.files.entries || []);
-      const rows = entries.map(function(e) {
-        return {
-          sort: {
-            name: e.name || "",
+	    async function loadFiles() {
+	      const p = document.getElementById("files-path").value.trim() || ".";
+	      const d = await api("/admin/api/files?path=" + encodeURIComponent(p));
+	      state.files = { path: d.path || ".", entries: d.entries || [] };
+	      const searchCount = (state.fileSearch.results || []).length;
+	      setTabCount("files", searchCount || state.files.entries.length);
+	      document.getElementById("files-path").value = state.files.path;
+	      renderFiles();
+	    }
+	    function renderFiles() {
+	      const searching = !!(state.fileSearch && state.fileSearch.q);
+	      if (searching) {
+	        const results = state.fileSearch.results || [];
+	        const rows = results.map(function(e) {
+	          return {
+	            sort: {
+	              path: e.path || "",
+	              owner: e.owner || "",
+	              size: Number(e.size || 0),
+	              is_dir: e.is_dir ? 1 : 0
+	            },
+	            cells: [
+	              e.is_dir ? "<button onclick=\"openPath('" + esc(e.path) + "')\"><code>" + esc(e.path) + "/</code></button>" : "<code>" + esc(e.path) + "</code>",
+	              ownerCell(e.owner || "-"),
+	              esc(e.size_human || formatBytes(e.size || 0)),
+	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
+	            ]
+	          };
+	        });
+	        document.getElementById("files-out").innerHTML =
+	          "<div class=\"row\"><span class=\"pill\">search=<code>" + esc(state.fileSearch.q) + "</code></span><span class=\"pill\">results " + esc(state.fileSearch.total || results.length) + "</span></div>" +
+	          renderSmartTable(
+	            "file-search",
+	            [
+	              {label:"Path", key:"path"},
+	              {label:"Owner", key:"owner"},
+	              {label:"Size", key:"size"},
+	              {label:"Type", key:"is_dir"}
+	            ],
+	            rows,
+	            "path",
+	            "asc"
+	          );
+	        return;
+	      }
+
+	      const entries = (state.files.entries || []);
+	      const rows = entries.map(function(e) {
+	        return {
+	          sort: {
+	            name: e.name || "",
             owner: e.owner || "",
             size: Number(e.size || 0),
             is_dir: e.is_dir ? 1 : 0
@@ -1985,32 +2295,57 @@ const adminHTML = `<!doctype html>
           ]
         };
       });
-      document.getElementById("files-out").innerHTML = "<div class=\"muted\">path=<code>" + esc(state.files.path) + "</code></div>" +
-        renderSmartTable(
-          "files",
-          [
-            {label:"Name", key:"name"},
+	      document.getElementById("files-out").innerHTML = "<div class=\"muted\">path=<code>" + esc(state.files.path) + "</code></div>" +
+	        renderSmartTable(
+	          "files",
+	          [
+	            {label:"Name", key:"name"},
             {label:"Owner", key:"owner"},
             {label:"Size", key:"size"},
             {label:"Type", key:"is_dir"}
           ],
           rows,
           "name",
-          "asc"
-        );
-    }
-    function openPath(path) {
-      document.getElementById("files-path").value = path;
-      loadFiles();
-    }
-    function filesUp() {
-      const p = document.getElementById("files-path").value.trim() || ".";
-      if (p === "." || p === "/") return;
-      const x = p.split("/").filter(Boolean);
-      x.pop();
-      document.getElementById("files-path").value = x.length ? x.join("/") : ".";
-      loadFiles();
-    }
+	          "asc"
+	        );
+	    }
+	    async function searchFiles() {
+	      const q = document.getElementById("files-q").value.trim();
+	      if (!q) {
+	        clearFileSearch();
+	        return;
+	      }
+	      const d = await api("/admin/api/files/search?q=" + encodeURIComponent(q) + "&limit=500");
+	      state.fileSearch = {
+	        q: d.q || q,
+	        results: d.results || [],
+	        total: Number(d.total || 0),
+	        offset: Number(d.offset || 0),
+	        limit: Number(d.limit || 500)
+	      };
+	      setTabCount("files", state.fileSearch.results.length);
+	      renderFiles();
+	    }
+	    function clearFileSearch() {
+	      document.getElementById("files-q").value = "";
+	      state.fileSearch = { q: "", results: [], total: 0, offset: 0, limit: 200 };
+	      setTabCount("files", (state.files.entries || []).length);
+	      renderFiles();
+	    }
+	    function openPath(path) {
+	      document.getElementById("files-path").value = path;
+	      clearFileSearch();
+	      loadFiles();
+	    }
+	    function filesUp() {
+	      const p = document.getElementById("files-path").value.trim() || ".";
+	      if (p === "." || p === "/") return;
+	      const x = p.split("/").filter(Boolean);
+	      x.pop();
+	      document.getElementById("files-path").value = x.length ? x.join("/") : ".";
+	      clearFileSearch();
+	      loadFiles();
+	    }
 
     async function loadAudit() {
       const q = document.getElementById("audit-q").value.trim();
@@ -2057,17 +2392,38 @@ const adminHTML = `<!doctype html>
       );
     }
 
-    async function loadLogs() {
-      const q = document.getElementById("log-q").value.trim();
-      const d = await api(withRange("/admin/api/events?q=" + encodeURIComponent(q) + "&limit=1000"));
-      state.events = d.events || [];
-      state.lastEventID = d.last_id || (state.events.length ? state.events[0].id : 0);
-      setTabCount("logs", state.events.length);
-      renderLogs();
-    }
-    function renderLogs() {
-      const rows = (state.events || []).map(function(e) {
-        const level = String((e.event || "").startsWith("denied") ? "WARN" : (e.event || "")).toUpperCase();
+    async function loadLogs(opts) {
+	      opts = opts || {};
+	      const q = document.getElementById("log-q").value.trim();
+	      const before = Number(opts.before || 0);
+	      const d = await api(withRange("/admin/api/events?q=" + encodeURIComponent(q) + "&limit=600&before_id=" + encodeURIComponent(before)));
+	      state.events = d.events || [];
+	      state.lastEventID = d.last_id || (state.events.length ? state.events[0].id : 0);
+	      state.logCursorBefore = Number(d.next_before_id || 0);
+	      state.logHasMore = !!d.has_more;
+	      setTabCount("logs", state.events.length);
+	      renderLogs();
+	    }
+	    async function loadOlderLogs() {
+	      if (!state.logHasMore || !state.logCursorBefore) {
+	        toast("No older log rows");
+	        return;
+	      }
+	      const live = document.getElementById("logs-live");
+	      if (live && live.checked) {
+	        live.checked = false;
+	        toggleLogLive();
+	      }
+	      await loadLogs({ before: state.logCursorBefore });
+	      addHistory("loaded older logs");
+	    }
+	    async function loadNewestLogs() {
+	      await loadLogs({ before: 0 });
+	      addHistory("jumped to newest logs");
+	    }
+	    function renderLogs() {
+	      const rows = (state.events || []).map(function(e) {
+	        const level = String((e.event || "").startsWith("denied") ? "WARN" : (e.event || "")).toUpperCase();
         return {
           sort: {
             id: Number(e.id || 0),
@@ -2089,11 +2445,11 @@ const adminHTML = `<!doctype html>
           ]
         };
       });
-      document.getElementById("logs-out").innerHTML =
-        "<div class=\"row\"><span class=\"pill\">last_event_id=" + esc(state.lastEventID || 0) + "</span></div>" +
-        renderSmartTable(
-          "logs",
-          [
+	      document.getElementById("logs-out").innerHTML =
+	        "<div class=\"row\"><span class=\"pill\">last_event_id=" + esc(state.lastEventID || 0) + "</span><span class=\"pill\">next_before_id=" + esc(state.logCursorBefore || 0) + "</span><span class=\"pill\">" + (state.logHasMore ? "older rows available" : "end reached") + "</span></div>" +
+	        renderSmartTable(
+	          "logs",
+	          [
             {label:"Time", key:"time"},
             {label:"Level", key:"event"},
             {label:"Event", key:"event"},
@@ -2109,9 +2465,92 @@ const adminHTML = `<!doctype html>
         );
     }
 
+    async function loadAuthAttempts() {
+      const q = document.getElementById("auth-q").value.trim();
+      const d = await api(withRange("/admin/api/auth-attempts?q=" + encodeURIComponent(q) + "&limit=1500&combo_limit=400"));
+      state.authAttempts = d.attempts || [];
+      state.authCombos = d.combos || [];
+      setTabCount("auth", state.authAttempts.length);
+      renderAuthAttempts();
+    }
+    function renderAuthAttempts() {
+      const comboRows = (state.authCombos || []).map(function(c) {
+        return {
+          sort: {
+            count: Number(c.count || 0),
+            username: c.username || "",
+            password: c.password || "",
+            last_time: Number(c.last_timestamp || 0)
+          },
+          cells: [
+            "<code>" + esc(c.username || "") + "</code>",
+            "<code>" + esc(c.password || "") + "</code>",
+            esc(c.count || 0),
+            "<code>" + esc(c.last_time || "") + "</code>",
+            ipCell(c.last_ip || ""),
+            "<button class=\"tiny\" onclick=\"copyText('" + esc((c.username || "") + ":" + (c.password || "")) + "')\">Copy user:pass</button>"
+          ]
+        };
+      });
+      const attemptRows = (state.authAttempts || []).map(function(a) {
+        return {
+          sort: {
+            time: Number(a.timestamp || 0),
+            username: a.username || "",
+            password: a.password || "",
+            ip: a.ip || "",
+            id: Number(a.id || 0)
+          },
+          cells: [
+            "<code>" + esc(a.time || "") + "</code>",
+            "<code>" + esc(a.username || "") + "</code>",
+            "<code>" + esc(a.password || "") + "</code>",
+            ipCell(a.ip || ""),
+            "<code>" + esc(shortSession(a.session || "")) + "</code>",
+            "<code>" + esc(a.user_id || "") + "</code>",
+            "<button class=\"tiny\" onclick=\"copyText('" + esc((a.username || "") + ":" + (a.password || "")) + "')\">Copy user:pass</button>"
+          ]
+        };
+      });
+
+      document.getElementById("auth-out").innerHTML =
+        "<h3>Top Username/Password Combos</h3>" +
+        renderSmartTable(
+          "auth-combos",
+          [
+            {label:"Username", key:"username"},
+            {label:"Password", key:"password"},
+            {label:"Count", key:"count"},
+            {label:"Last Seen", key:"last_time"},
+            {label:"Last IP", key:"username"},
+            {label:"Action", key:"username"}
+          ],
+          comboRows,
+          "count",
+          "desc"
+        ) +
+        "<h3>Recent Attempts</h3>" +
+        renderSmartTable(
+          "auth-attempts",
+          [
+            {label:"Time", key:"time"},
+            {label:"Username", key:"username"},
+            {label:"Password", key:"password"},
+            {label:"IP", key:"ip"},
+            {label:"Session", key:"id"},
+            {label:"Hash", key:"id"},
+            {label:"Action", key:"id"}
+          ],
+          attemptRows,
+          "time",
+          "desc"
+        );
+    }
+
     async function streamLogs() {
-      if (state.activeTab !== "logs") return;
-      const q = document.getElementById("log-q").value.trim();
+	      if (state.activeTab !== "logs") return;
+	      if (state.logCursorBefore > 0) return;
+	      const q = document.getElementById("log-q").value.trim();
       const d = await api(withRange("/admin/api/events/stream?since_id=" + encodeURIComponent(state.lastEventID || 0) + "&q=" + encodeURIComponent(q) + "&limit=200"));
       const incoming = d.events || [];
       if (!incoming.length) return;
@@ -2442,6 +2881,7 @@ const adminHTML = `<!doctype html>
       if (state.activeTab === "files") renderFiles();
       if (state.activeTab === "audit") renderAudit();
       if (state.activeTab === "logs") renderLogs();
+      if (state.activeTab === "auth") renderAuthAttempts();
       if (state.activeTab === "sessions") renderSessions();
       if (state.activeTab === "uploads") renderUploads();
       if (state.activeTab === "banned") renderBanned();
@@ -2451,10 +2891,13 @@ const adminHTML = `<!doctype html>
 
     async function refreshAll() {
       try {
-        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadSessions(), loadUploads(), loadBanned()]);
-        if (state.actor) {
-          await openActor(state.actor.actor_type, state.actor.actor);
+        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned()]);
+        if (state.fileSearch && state.fileSearch.q) {
+          await searchFiles();
         }
+        if (state.actor) {
+	          await openActor(state.actor.actor_type, state.actor.actor);
+	        }
         if (state.sessionTimeline && state.sessionTimeline.session) {
           await openSessionTimeline(state.sessionTimeline.session);
         }
@@ -2476,6 +2919,7 @@ const adminHTML = `<!doctype html>
             state.activeTab === "files" ? loadFiles :
             state.activeTab === "audit" ? loadAudit :
             state.activeTab === "logs" ? loadLogs :
+            state.activeTab === "auth" ? loadAuthAttempts :
             state.activeTab === "sessions" ? loadSessions :
             state.activeTab === "uploads" ? loadUploads : loadBanned;
           fn().catch(function(err) { setStatus("error: " + err.message); });
@@ -2491,7 +2935,7 @@ const adminHTML = `<!doctype html>
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","sessions","uploads","banned"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","banned"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       const fn = name === "summary" ? loadSummary :
@@ -2499,6 +2943,7 @@ const adminHTML = `<!doctype html>
         name === "files" ? loadFiles :
         name === "audit" ? loadAudit :
         name === "logs" ? loadLogs :
+        name === "auth" ? loadAuthAttempts :
         name === "sessions" ? loadSessions :
         name === "uploads" ? loadUploads : loadBanned;
       fn().catch(function(err) { setStatus("error: " + err.message); });
@@ -2510,8 +2955,8 @@ const adminHTML = `<!doctype html>
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8"].includes(e.key)) {
-        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"sessions","7":"uploads","8":"banned"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9"].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {
