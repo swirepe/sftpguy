@@ -64,7 +64,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go fortunes.txt
+//go:embed sftpguy.go admin.go install.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -779,8 +779,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 func bootstrapSource(name, absDir string, logger *slog.Logger) (srcDir string, err error) {
 	logger.Info("bootstrapping embedded files to upload directory")
 
-	appShort := strings.Split(AppVersion, "-")[0]
-	srcDir = fmt.Sprintf("%s-%s/", name, appShort)
+	srcDir = fmt.Sprintf("%s-%s/", name, appShort())
 
 	return srcDir, fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -833,7 +832,6 @@ func (s *Server) Listen() error {
 		NoClientAuth:                s.cfg.SshNoAuth,
 		NoClientAuthCallback:        s.noClientAuthCallback,
 		KeyboardInteractiveCallback: s.keyboardInteractiveCallback,
-		PasswordCallback:            s.passwordCallback,
 	}
 
 	keyBytes, _ := os.ReadFile(s.cfg.HostKeyFile)
@@ -906,8 +904,6 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.
 		"generated_hash", hash,
 	)
 
-	// Note: We are effectively "accepting all passwords" here, but
-	// treating the credentials as the seed for their unique UID.
 	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 }
 
@@ -937,19 +933,29 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.
 //		}
 //		return nil, fmt.Errorf("invalid credentials")
 //	},
+
+func (s *Server) getRules() string {
+	b, err := os.ReadFile(filepath.Join(s.absUploadDir, "RULES.txt"))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 
-	name := fmt.Sprintf("anonymous@%s", s.cfg.Name)
+	// TODO: better instructions or whatever
+	instructions := s.getRules() + `
+	Your password is your email address.
 
-	instructions := `
-	hello world, let's see what this looks like.
-   `
+	`
 
-	answers, err := client(name,
+	answers, err := client(s.cfg.Name,
 		instructions,
-		[]string{"Password: "},
+		[]string{fmt.Sprintf("\r(anonymous@%s) Password: ", s.cfg.Name)},
 		[]bool{true})
 	if err != nil {
+		s.logger.Warn("password weird lol", "err", err)
 		return nil, err
 	}
 
@@ -965,8 +971,10 @@ func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.K
 		"generated_hash", hash,
 	)
 	//s.store.LogEvent(EventLogin)
-	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 
+	// Note: We are effectively "accepting all passwords" here, but
+	// treating the credentials as the seed for their unique UID.
+	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
 }
 
 func getHostIp(conn ssh.ConnMetadata) string {
@@ -982,7 +990,7 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 	if data, err := os.ReadFile(s.cfg.BannerFile); err == nil {
 		banner = string(data)
 	} else {
-		banner = fmt.Sprintf("=== %s v%s ===", s.cfg.Name, AppVersion)
+		banner = fmt.Sprintf("=== %s %s ===", s.cfg.Name, appShort())
 	}
 
 	if s.cfg.BannerStats {
@@ -1218,6 +1226,10 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		fmt.Fprintf(w, "Share %s more to unlock all downloads.\r\n", color.Bold(formatBytes(needed)))
 		fmt.Fprintln(w, "You may always download from unrestricted files or directories:")
 		for pathName := range s.cfg.unrestrictedMap {
+			if _, err := os.Stat(filepath.Join(s.absUploadDir, pathName)); err != nil {
+				continue
+			}
+
 			if strings.HasSuffix(pathName, "/") {
 				fmt.Fprintln(w, "  "+cyan.Bold(pathName))
 			} else {
@@ -2033,10 +2045,10 @@ func parseSize(s string) (int64, error) {
 }
 
 func shortID(id string) string {
-	if len(id) <= 12 {
+	if len(id) <= 20 {
 		return id
 	}
-	return id[:12]
+	return id[:20]
 }
 
 type MultiLogHandler struct {
@@ -2299,6 +2311,10 @@ func incrementPatch(v string) (string, error) {
 	return fmt.Sprintf("v%s.%s.%d", m[1], m[2], patch+1), nil
 }
 
+func appShort() string {
+	return strings.Split(AppVersion, "-")[0]
+}
+
 const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
@@ -2310,8 +2326,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	appShort := strings.Split(AppVersion, "-")[0]
-	fmt.Fprintln(os.Stderr, yellow.Bold(fmt.Sprintf(startupBanner, appShort)))
+	fmt.Fprintln(os.Stderr, yellow.Bold(fmt.Sprintf(startupBanner, appShort())))
 
 	start := time.Now()
 
