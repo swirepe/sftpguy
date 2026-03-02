@@ -592,6 +592,8 @@ func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr n
 type Config struct {
 	Name                    string
 	Port                    int
+	AdminHTTP               string
+	AdminHTTPToken          string
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -619,6 +621,8 @@ func LoadConfig() (Config, error) {
 
 	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name")
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port")
+	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
+	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -721,6 +725,11 @@ func (c Config) Validate() error {
 	if c.Port < minPort || c.Port > maxPort {
 		return fmt.Errorf("port must be between %d and %d", minPort, maxPort)
 	}
+	if c.AdminHTTP != "" {
+		if _, _, err := net.SplitHostPort(c.AdminHTTP); err != nil {
+			return fmt.Errorf("admin.http must be host:port, got %q: %w", c.AdminHTTP, err)
+		}
+	}
 	if c.Name == "" || c.HostKeyFile == "" || c.DBPath == "" || c.UploadDir == "" {
 		return errors.New("required configuration fields missing")
 	}
@@ -773,6 +782,8 @@ type Server struct {
 	shutdown         chan struct{}
 	ctx              context.Context
 	cancel           context.CancelFunc
+	adminShutdownMu  sync.Mutex
+	adminShutdown    func(context.Context) error
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -852,6 +863,16 @@ func (s *Server) Shutdown() error {
 	s.cancel()
 	if s.listener != nil {
 		s.listener.Close()
+	}
+	s.adminShutdownMu.Lock()
+	adminShutdown := s.adminShutdown
+	s.adminShutdownMu.Unlock()
+	if adminShutdown != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := adminShutdown(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Warn("admin http shutdown failed", "err", err)
+		}
 	}
 	s.wg.Wait()
 	return s.store.Close()
@@ -2256,6 +2277,8 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"version", AppVersion,
 		"port", cfg.Port,
 		"admin.ssh", cfg.AdminEnabled,
+		"admin.http", cfg.AdminHTTP,
+		"admin.http.token", cfg.AdminHTTPToken != "",
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"upload_path", cfg.UploadDir,
@@ -2381,7 +2404,18 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go srv.reconcileOrphans()
-	go srv.Listen()
+	go func() {
+		if err := srv.Listen(); err != nil {
+			logger.Error("ssh listener failed", "err", err)
+		}
+	}()
+	if cfg.AdminHTTP != "" {
+		go func() {
+			if err := srv.ListenAdminHTTP(); err != nil {
+				logger.Error("admin http listener failed", "err", err)
+			}
+		}()
+	}
 
 	sig := <-sigChan
 	logger.Info("Shutdown signal received", "signal", sig.String())
