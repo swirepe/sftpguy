@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,12 +31,6 @@ const (
 	EventAdminBan   EventKind = "admin/ban"
 	EventAdminUnban EventKind = "admin/unban"
 	EventAdminPurge EventKind = "admin/purge"
-)
-
-// Regex to extract user IDs/IPs from structured log files
-var (
-	reUserHash = regexp.MustCompile(`id=([a-f0-9]+)`)
-	reIPAddr   = regexp.MustCompile(`remote_address=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)`)
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +141,14 @@ const (
 	tabFiles
 	tabAudit
 	tabSysLog
-	maxTabs = 5
+	tabBanned // New Tab
+	maxTabs   = 6
+)
+
+var (
+	// Updated regex to be more flexible for "user.id=" or "id="
+	reUserHash = regexp.MustCompile(`(?:user\.id|id)=([a-f0-9]+)`)
+	reIPAddr   = regexp.MustCompile(`(?:remote_address|remote_addr|ip)=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)`)
 )
 
 type adminModel struct {
@@ -257,6 +257,33 @@ func (m adminModel) refreshData() tea.Cmd {
 		}
 
 		switch m.tab {
+		case tabBanned:
+			cols = []table.Column{
+				{Title: "Type", Width: 10},
+				{Title: "Identity (Hash/IP)", Width: w - 20},
+			}
+			// 1. Fetch Banned Hashes
+			hRows, _ := s.db.QueryContext(ctx, "SELECT pubkey_hash FROM shadow_banned")
+			if hRows != nil {
+				defer hRows.Close()
+				for hRows.Next() {
+					var h string
+					if err := hRows.Scan(&h); err == nil {
+						rows = append(rows, table.Row{styleRed.Render("PUBKEY"), h})
+					}
+				}
+			}
+			// 2. Fetch Banned IPs
+			iRows, _ := s.db.QueryContext(ctx, "SELECT ip_address FROM ip_banned")
+			if iRows != nil {
+				defer iRows.Close()
+				for iRows.Next() {
+					var ip string
+					if err := iRows.Scan(&ip); err == nil {
+						rows = append(rows, table.Row{styleGold.Render("IP"), ip})
+					}
+				}
+			}
 		case tabStats:
 			cols = []table.Column{{Title: "Metric", Width: 20}, {Title: "Value", Width: w - 25}}
 			u, c, f, b := s.GetBannerStats(m.console.srv.cfg.ContributorThreshold)
@@ -300,7 +327,12 @@ func (m adminModel) refreshData() tea.Cmd {
 				rows = append(rows, table.Row{name, shortID(owner), formatBytes(fi.Size())})
 			}
 		case tabAudit:
-			cols = []table.Column{{Title: "Time", Width: 10}, {Title: "Event", Width: 12}, {Title: "User", Width: 12}, {Title: "Details", Width: w - 40}}
+			cols = []table.Column{
+				{Title: "Time", Width: 10},
+				{Title: "Event", Width: 12},
+				{Title: "User", Width: 20}, // Increased width, removed shortID below
+				{Title: "Details", Width: w - 50},
+			}
 			q := `SELECT timestamp, event, IFNULL(user_id, ''), IFNULL(path, '') || ' ' || IFNULL(meta, '') FROM log 
 			      WHERE (user_id LIKE ? OR event LIKE ? OR path LIKE ?) ORDER BY timestamp DESC LIMIT 50`
 			dbRows, _ := s.db.QueryContext(ctx, q, f, f, f)
@@ -310,7 +342,7 @@ func (m adminModel) refreshData() tea.Cmd {
 					var ts int64
 					var ev, u, det string
 					if err := dbRows.Scan(&ts, &ev, &u, &det); err == nil {
-						rows = append(rows, table.Row{time.Unix(ts, 0).Format("15:04"), ev, shortID(u), det})
+						rows = append(rows, table.Row{time.Unix(ts, 0).Format("15:04"), ev, u, det})
 					}
 				}
 			}
@@ -511,23 +543,12 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshMsg:
 		m.isLoading = false
-
-		// 1. CRITICAL: Clear rows first to prevent the renderer from
-		// trying to map old multi-column rows to new single-column headers.
 		m.table.SetRows([]table.Row{})
-
-		// 2. Set the new schema
 		m.table.SetColumns(msg.cols)
-
-		// 3. Set the actual data
 		m.table.SetRows(msg.rows)
-
-		// 4. Safety: Reset the cursor if the new data is shorter
-		// than the previous cursor position.
 		if m.table.Cursor() >= len(msg.rows) {
 			m.table.GotoTop()
 		}
-
 		return m, nil
 
 	case clearStatusMsg:
@@ -535,7 +556,6 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// 1. Handle Purge Confirmation Mode
 		if m.purgeConfirm != "" {
 			switch msg.String() {
 			case "y":
@@ -550,7 +570,6 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 2. Handle Filter/Search Input Mode
 		if m.isFiltering {
 			switch msg.String() {
 			case "enter", "esc":
@@ -563,18 +582,21 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 3. Global Navigation Keys
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
 		case "tab":
-			if m.inspectedUser == "" {
-				m.tab = (m.tab + 1) % maxTabs
-				m.table.SetRows([]table.Row{}) // Clear immediately on tab change
-				m.isLoading = true
-				return m, m.refreshData()
-			}
+			m.inspectedUser = ""
+			m.tab = (m.tab + 1) % maxTabs
+			m.table.SetRows([]table.Row{})
+			return m, m.refreshData()
+
+		case "shift+tab", "backtab":
+			m.inspectedUser = ""
+			m.tab = (m.tab - 1 + maxTabs) % maxTabs
+			m.table.SetRows([]table.Row{})
+			return m, m.refreshData()
 
 		case "/":
 			m.isFiltering = true
@@ -595,36 +617,85 @@ func (m adminModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.refreshData()
 			}
 
-		case "i": // Inspect logic
+		case "u": // UNBAN Logic
+			row := m.table.SelectedRow()
+			if len(row) == 0 {
+				return m, nil
+			} // SAFETY CHECK
+
+			if m.tab == tabBanned && len(row) >= 2 {
+				target := row[1]
+				if strings.Contains(stripANSI(row[0]), "IP") {
+					m.console.srv.store.exec("DELETE FROM ip_banned WHERE ip_address = ?", target)
+					m.statusMsg = "Unbanned IP: " + target
+				} else {
+					m.console.srv.Unban(target)
+					m.statusMsg = "Unbanned Hash: " + shortID(target)
+				}
+				return m, tea.Batch(m.refreshData(), m.setStatus(m.statusMsg))
+			}
+			if m.tab == tabUsers {
+				m.console.srv.Unban(row[0])
+				m.statusMsg = "Unbanned: " + shortID(row[0])
+				return m, tea.Batch(m.refreshData(), m.setStatus(m.statusMsg))
+			}
+
+		case "i":
 			row := m.table.SelectedRow()
 			if len(row) == 0 {
 				return m, nil
 			}
 			var target string
-			if m.tab == tabUsers {
-				target = row[0]
-			} else if m.tab == tabFiles {
+
+			switch m.tab {
+			case tabUsers:
+				target = stripANSI(row[0])
+			case tabFiles:
 				rel := filepath.ToSlash(filepath.Join(m.currentDir, stripANSI(row[0])))
 				target, _ = m.console.srv.store.GetFileOwner(rel)
+			case tabAudit:
+				// In Audit, Column 2 is the User hash.
+				if len(row) >= 3 {
+					target = stripANSI(row[2])
+				}
+			case tabSysLog:
+				line := row[0]
+				// 1. Try "id=..." or "user.id=..."
+				if match := reUserHash.FindStringSubmatch(line); len(match) > 1 {
+					target = match[1]
+				} else {
+					// 2. Fallback: Look for any 64-character hex string (SHA256 hash)
+					hexMatch := regexp.MustCompile(`([a-f0-9]{64})`).FindString(line)
+					if hexMatch != "" {
+						target = hexMatch
+					}
+				}
 			}
+
+			// Perform the pivot
 			if target != "" && target != "system" {
 				m.inspectedUser = target
 				m.isLoading = true
+				m.table.SetCursor(0)
+				// Clear filter so we actually see the results
+				m.filterInput.SetValue("")
 				return m, m.refreshData()
 			}
 
-		case "b": // Ban logic
+		case "b":
 			return m.handleBanAction()
 
-		case "p": // Purge trigger
-			if m.tab == tabUsers && len(m.table.Rows()) > 0 {
-				m.purgeConfirm = m.table.SelectedRow()[0]
+		case "p":
+			row := m.table.SelectedRow()
+			if m.tab == tabUsers && len(row) > 0 {
+				m.purgeConfirm = row[0]
 				return m, nil
 			}
 
-		case "enter": // Directory navigation
-			if m.tab == tabFiles && len(m.table.Rows()) > 0 {
-				sel := stripANSI(m.table.SelectedRow()[0])
+		case "enter":
+			row := m.table.SelectedRow()
+			if m.tab == tabFiles && len(row) > 0 {
+				sel := stripANSI(row[0])
 				if strings.HasSuffix(sel, "/") {
 					m.currentDir = filepath.Join(m.currentDir, strings.TrimSuffix(sel, "/"))
 					m.table.SetCursor(0)
@@ -642,14 +713,13 @@ func (m adminModel) handleBanAction() (adminModel, tea.Cmd) {
 	row := m.table.SelectedRow()
 	if len(row) == 0 {
 		return m, nil
-	}
+	} // SAFETY CHECK
 
 	var target string
 	switch m.tab {
 	case tabUsers:
-		target = row[0] // Pubkey Hash
+		target = row[0]
 	case tabSysLog:
-		// Attempt to extract ID or IP from the log line
 		if match := reUserHash.FindStringSubmatch(row[0]); len(match) > 1 {
 			target = match[1]
 		} else if match := reIPAddr.FindStringSubmatch(row[0]); len(match) > 1 {
@@ -678,7 +748,7 @@ func (m adminModel) View() string {
 	}
 	header := styleHeader.Render(fmt.Sprintf(" %s ADMIN ", strings.ToUpper(m.console.srv.cfg.Name)) + spin)
 
-	tabNames := []string{"Stats", "Users", "Files", "User Audit", "SysLogs"}
+	tabNames := []string{"Stats", "Users", "Files", "Audit", "Logs", "Banned"}
 	var tabs []string
 	for i, n := range tabNames {
 		if activeTab(i) == m.tab && m.inspectedUser == "" {
@@ -698,14 +768,12 @@ func (m adminModel) View() string {
 	}
 
 	help := " tab: cycle • /: search • r: refresh • q: quit"
-	if m.inspectedUser != "" {
-		help = " esc: back • r: refresh"
+	if m.tab == tabBanned {
+		help = " u: unban selected • r: refresh"
 	} else if m.tab == tabUsers {
 		help = " i: inspect • p: purge • b: ban • u: unban"
-	} else if m.tab == tabFiles {
-		help = " enter: cd • backspace: up • i: inspect owner"
 	} else if m.tab == tabSysLog {
-		help = " i: inspect row user • b: ban row user/ip"
+		help = " i: inspect user hash in line • b: ban hash/ip in line"
 	}
 
 	body := m.table.View()
@@ -786,31 +854,6 @@ func parseWindowChange(b []byte) (uint32, uint32, error) {
 	w := uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 	h := uint32(b[4])<<24 | uint32(b[5])<<16 | uint32(b[6])<<8 | uint32(b[7])
 	return w, h, nil
-}
-
-func (a *adminConsole) run(ctx context.Context) {
-	if !a.hasPTY {
-		io.WriteString(a.ch, "PTY required\n")
-		return
-	}
-
-	// Create the program
-	p := tea.NewProgram(
-		initialAdminModel(a, ctx), // Pass the context into the model
-		tea.WithInput(a.ch),
-		tea.WithOutput(a.ch),
-		tea.WithAltScreen(),
-	)
-
-	// MONITOR CONNECTION CLOSURE
-	go func() {
-		<-ctx.Done() // Block until the SSH connection is severed
-		p.Quit()     // Send a quit message to the Bubble Tea program
-	}()
-
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running TUI: %v", err)
-	}
 }
 
 func tailFile(filename string, n int, filter string) ([]string, error) {
