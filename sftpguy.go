@@ -196,7 +196,6 @@ const (
 	EventDeniedRateLimit       EventKind = "denied/rate-limit"
 	EventDeniedQuota           EventKind = "denied/quota"
 	EventDeniedPathTraversal   EventKind = "denied/path-traversal"
-	EventShadowBan             EventKind = "shadow_ban"
 )
 
 var errorPrefix = struct {
@@ -930,18 +929,18 @@ func remoteToPubhash(remoteAddr net.Addr) string {
 	return hash
 }
 
-func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-	data := fmt.Sprintf("pwd-auth:%s:%s", conn.User(), string(password))
-	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
+// func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+// 	data := fmt.Sprintf("pwd-auth:%s:%s", conn.User(), string(password))
+// 	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
 
-	s.logger.Debug("password login attempt",
-		"ip", getHostIp(conn),
-		"user", conn.User(),
-		"generated_hash", hash,
-	)
+// 	s.logger.Debug("password login attempt",
+// 		"ip", getHostIp(conn),
+// 		"user", conn.User(),
+// 		"generated_hash", hash,
+// 	)
 
-	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
-}
+// 	return &ssh.Permissions{Extensions: map[string]string{"pubkey-hash": hash}}, nil
+// }
 
 // KeyboardInteractiveCallback, if non-nil, is called when
 // keyboard-interactive authentication is selected (RFC
@@ -1038,12 +1037,6 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	nConn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	if s.store.IsBannedByIp(nConn.RemoteAddr()) {
-		s.logger.Info("blocked banned IP", "remote_address", nConn.RemoteAddr())
-		nConn.Close()
-		return
-	}
-
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		nConn.Close()
@@ -1071,9 +1064,10 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	}
 
 	stats, _ := s.store.UpsertUserSession(pubHash)
-	logger := s.logger.With(userGroup(pubHash, sessionID, sConn.RemoteAddr()))
-	isBanned := s.store.IsBanned(pubHash)
-	logger.Info("login")
+	logger := s.logger.With(s.userGroup(pubHash, sessionID, sConn.RemoteAddr()))
+	isBanned := s.store.IsBanned(pubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
+
+	logger.Info("login", "banned", isBanned)
 	go ssh.DiscardRequests(reqs)
 
 	for newCh := range chans {
@@ -1167,24 +1161,26 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	}
 }
 
-func userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {
+func (s *Server) userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {
 	return slog.Group("user",
 		"id", shortID(pubHash),
 		"uid", hashToUid(pubHash),
 		"session", sessionID[:16],
 		"remote_address", remoteAddr,
+		"hash_banned", s.store.IsBanned(pubHash),
+		"ip_banned", s.store.IsBannedByIp(remoteAddr),
 	)
 }
 
 func (s *Server) logExec(pubHash, sessionID string, remoteAddr net.Addr, payload []byte) {
 	var cmd struct{ Value string }
 	ssh.Unmarshal(payload, &cmd)
-	s.logger.Warn("exec", "cmd", cmd.Value, userGroup(pubHash, sessionID, remoteAddr))
+	s.logger.Warn("exec", "cmd", cmd.Value, s.userGroup(pubHash, sessionID, remoteAddr))
 	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr)
 }
 
 func (s *Server) logShell(pubHash, sessionID string, remoteAddr net.Addr) {
-	s.logger.Info("shell", userGroup(pubHash, sessionID, remoteAddr))
+	s.logger.Info("shell", s.userGroup(pubHash, sessionID, remoteAddr))
 	s.store.LogEvent(EventShell, pubHash, sessionID, remoteAddr)
 }
 
@@ -1233,12 +1229,11 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 
 	fmt.Fprintf(w, welcomeMsg)
 	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
+	fmt.Fprintf(w, "* You may always modify or delete files or directories you have created.\r\n")
 
 	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
 		fmt.Fprintf(w, "* The maximum permitted file size is %s\r\n", bold.Fmt(formatBytes(maxSize)))
 	}
-
-	fmt.Fprintln(w, "* You may always modify or delete files or directories you have created.")
 
 	files, err := s.store.FilesByOwner(hash)
 	if err == nil && len(files) > 0 {
