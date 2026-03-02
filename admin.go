@@ -18,6 +18,19 @@ TUI framework
     declarations.  Replaces the old hand-rolled asciiStyle system.
   • Bubbles textinput (github.com/charmbracelet/bubbles/textinput) — gives
     the prompt full readline-style editing and command history for free.
+  • Bubbles viewport — scrollable output region shared by the main console
+    and the three panel modes (log viewer, DB viewer, file browser).
+  • Bubbles table — used for the DB viewer panel.
+
+Panel modes
+───────────
+  Three full-screen panels can be launched from the REPL:
+    view-logs  [n]               — scrollable, colour-coded log stream
+    view-db    <table>           — paginated table view (users/files/log/bans)
+    view-files [path]            — interactive file browser with preview
+
+  Inside a panel: ↑/↓ to scroll, PgUp/PgDn for page jumps, q/Esc to return.
+  In view-files: Enter opens a directory; backspace/h goes up; p previews a file.
 
 No-PTY fallback
 ───────────────
@@ -102,20 +115,17 @@ var (
 
 	// ── Layout styles ──────────────────────────────────────────────────────
 
-	// styleHeaderBar: full-width top bar. Background is dark red, text white.
 	styleHeaderBar = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("15")).
 			Background(lipgloss.Color("1")).
 			Padding(0, 1)
 
-	// styleFooterBar: full-width bottom status strip.
 	styleFooterBar = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			Background(lipgloss.Color("0")).
 			Padding(0, 1)
 
-	// styleViewportBorder: thin separator line between viewport and prompt.
 	styleViewportBorder = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("8"))
 
@@ -125,6 +135,27 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("1")).
 			Padding(0, 2)
+
+	// Panel-specific
+	stylePanelHeader = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("15")).
+				Background(lipgloss.Color("4")).
+				Padding(0, 1)
+
+	stylePanelFooter = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("8")).
+				Background(lipgloss.Color("0")).
+				Padding(0, 1)
+
+	styleSelected = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("6")).
+			Bold(true)
+
+	styleDir     = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	styleFile    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	styleSysFile = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +247,38 @@ func (a *adminConsole) buildRegistry() {
 		{Name: "inspect", Aliases: []string{"i"}, Usage: "inspect [path]", Help: "Show file/directory metadata",
 			Category: "Files",
 			Handler:  func(args []string, out *strings.Builder) bool { a.cmdInspect(args, out); return false }},
+
+		// ── Interactive Viewers ───────────────────────────────────────────
+		{Name: "view-logs", Aliases: []string{"vl"}, Usage: "view-logs [n]", Help: "Interactive log viewer (↑↓ PgUp/PgDn, q=back)",
+			Category: "Viewers",
+			Handler: func(args []string, out *strings.Builder) bool {
+				if a.hasPTY {
+					a.runLogViewer(args)
+				} else {
+					a.cmdLogs(args, "", "", "", out)
+				}
+				return false
+			}},
+		{Name: "view-db", Aliases: []string{"vd"}, Usage: "view-db <users|files|log|bans>", Help: "Interactive DB table viewer (↑↓ PgUp/PgDn, q=back)",
+			Category: "Viewers",
+			Handler: func(args []string, out *strings.Builder) bool {
+				if a.hasPTY {
+					a.runDBViewer(args)
+				} else {
+					writef(out, styleYellow, "view-db requires a PTY. Connect with: ssh -t host\n")
+				}
+				return false
+			}},
+		{Name: "view-files", Aliases: []string{"vf"}, Usage: "view-files [path]", Help: "Interactive file browser (Enter=open, p=preview, q=back)",
+			Category: "Viewers",
+			Handler: func(args []string, out *strings.Builder) bool {
+				if a.hasPTY {
+					a.runFileBrowser(args)
+				} else {
+					a.cmdLs(args, out)
+				}
+				return false
+			}},
 
 		// ── Users ────────────────────────────────────────────────────────
 		{Name: "users", Usage: "users", Help: "List all known users",
@@ -458,6 +521,7 @@ func initialAdminModel(a *adminConsole) adminModel {
 		a.sessionID[:16], now.Format("2006-01-02 15:04:05 MST"))) + "\n")
 	sb.WriteString(hrLine(72) + "\n")
 	sb.WriteString(styleCyan.Render(`Type "help" for commands · Tab to autocomplete · PgUp/PgDn to scroll`) + "\n")
+	sb.WriteString(styleDarkGray.Render(`Viewers: view-logs (vl) · view-db (vd) · view-files (vf)`) + "\n")
 	m.appendOutput(sb.String())
 	return m
 }
@@ -635,11 +699,6 @@ func (m adminModel) View() string {
 	}
 	w := m.width
 
-	// ── Header ────────────────────────────────────────────────────────────
-	//
-	// Left:  "sftpguy ADMIN"  (bold white on dark-red background)
-	// Right: "servername  ·  /cwd  ·  HH:MM:SS"  (dim, same background)
-	//
 	rightStr := m.console.srv.cfg.Name + "  ·  " + m.console.cwdDisplay() + "  ·  " + time.Now().Format("15:04:05")
 	leftStr := "sftpguy ADMIN"
 	gapWidth := w - lipgloss.Width(leftStr) - lipgloss.Width(rightStr)
@@ -650,13 +709,10 @@ func (m adminModel) View() string {
 		leftStr + strings.Repeat(" ", gapWidth) + rightStr,
 	)
 
-	// ── Viewport ──────────────────────────────────────────────────────────
 	vpView := m.vp.View()
 
-	// ── Separator ─────────────────────────────────────────────────────────
 	separator := styleViewportBorder.Render(strings.Repeat("─", w))
 
-	// ── Prompt ────────────────────────────────────────────────────────────
 	var promptLine string
 	if m.busy {
 		promptLine = m.spin.View() + " " + styleDarkGray.Render("running…")
@@ -669,7 +725,6 @@ func (m adminModel) View() string {
 			m.input.View()
 	}
 
-	// ── Confirm / completion hint ─────────────────────────────────────────
 	var extraLine string
 	switch {
 	case m.confirmCmd != nil:
@@ -677,7 +732,6 @@ func (m adminModel) View() string {
 	case len(m.completions) > 1:
 		var parts []string
 		for i, c := range m.completions {
-			// Show only the basename to keep the hint compact.
 			display := c
 			if idx := strings.LastIndexAny(c, "/ "); idx >= 0 && idx < len(c)-1 {
 				display = c[idx+1:]
@@ -691,7 +745,6 @@ func (m adminModel) View() string {
 		extraLine = "\n  " + strings.Join(parts, styleDarkGray.Render("  ·  "))
 	}
 
-	// ── Footer status strip ───────────────────────────────────────────────
 	pctStr := "100%"
 	if !m.vp.AtBottom() {
 		pctStr = fmt.Sprintf("%d%%", int(m.vp.ScrollPercent()*100))
@@ -815,6 +868,782 @@ func (a *adminConsole) runTUI() {
 	if _, err := p.Run(); err != nil {
 		a.logger.Error("admin TUI error", "err", err)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Panel: Log Viewer
+// ─────────────────────────────────────────────────────────────────────────────
+
+type logViewerModel struct {
+	console *adminConsole
+	vp      viewport.Model
+	lines   []string
+	width   int
+	height  int
+	ready   bool
+	filter  string // current event-kind filter (empty = all)
+	title   string
+}
+
+type logViewerDoneMsg struct{}
+
+func (a *adminConsole) buildLogLines(n int, userFilter, eventFilter, ipFilter string) []string {
+	var out strings.Builder
+	a.cmdLogs([]string{strconv.Itoa(n)}, userFilter, eventFilter, ipFilter, &out)
+	raw := strings.ReplaceAll(out.String(), "\r\n", "\n")
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	return lines
+}
+
+func (m logViewerModel) Init() tea.Cmd { return nil }
+
+func (m logViewerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		vpH := m.height - 2 // header + footer
+		if vpH < 1 {
+			vpH = 1
+		}
+		if !m.ready {
+			m.vp = viewport.New(m.width, vpH)
+			m.vp.SetContent(strings.Join(m.lines, "\n"))
+			m.vp.GotoBottom()
+			m.ready = true
+		} else {
+			m.vp.Width = m.width
+			m.vp.Height = vpH
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "esc":
+			return m, tea.Quit
+		case "g":
+			m.vp.GotoTop()
+			return m, nil
+		case "G":
+			m.vp.GotoBottom()
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+func (m logViewerModel) View() string {
+	if !m.ready {
+		return ""
+	}
+	w := m.width
+	title := "LOG VIEWER — " + m.title
+	hint := " q=back  ↑↓ PgUp/PgDn  g=top G=bottom "
+	gap := w - lipgloss.Width(title) - lipgloss.Width(hint)
+	if gap < 0 {
+		gap = 0
+	}
+	header := stylePanelHeader.Copy().Width(w).Render(title + strings.Repeat(" ", gap) + hint)
+
+	pct := "100%"
+	if !m.vp.AtBottom() {
+		pct = fmt.Sprintf("%d%%", int(m.vp.ScrollPercent()*100))
+	}
+	footerStr := fmt.Sprintf("  %d lines  ·  %s  ", len(m.lines), pct)
+	footer := stylePanelFooter.Copy().Width(w).Render(footerStr)
+
+	return header + "\n" + m.vp.View() + "\n" + footer
+}
+
+func (a *adminConsole) runLogViewer(args []string) {
+	n := 200
+	if len(args) > 0 {
+		if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+			n = v
+		}
+	}
+	lines := a.buildLogLines(n, "", "", "")
+	title := fmt.Sprintf("last %d entries", n)
+
+	m := logViewerModel{console: a, lines: lines, title: title}
+	p := tea.NewProgram(m, tea.WithInput(a.ch), tea.WithOutput(a.ch), tea.WithAltScreen())
+	p.Run() //nolint:errcheck
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Panel: DB Viewer
+// ─────────────────────────────────────────────────────────────────────────────
+
+type dbRow = []string
+
+type dbViewerModel struct {
+	console   *adminConsole
+	vp        viewport.Model
+	tableName string
+	cols      []string
+	rows      []dbRow
+	cursor    int
+	width     int
+	height    int
+	ready     bool
+	colWidths []int
+}
+
+func (a *adminConsole) loadDBTable(name string) (cols []string, rows []dbRow, err error) {
+	var q string
+	switch name {
+	case "users":
+		q = `SELECT pubkey_hash, last_login, upload_count, upload_bytes, download_count, download_bytes FROM users ORDER BY upload_bytes DESC`
+		cols = []string{"hash", "last_login", "up_count", "up_bytes", "dn_count", "dn_bytes"}
+	case "files":
+		q = `SELECT path, owner_hash, size, is_dir FROM files ORDER BY size DESC LIMIT 500`
+		cols = []string{"path", "owner", "size", "is_dir"}
+	case "log":
+		q = `SELECT timestamp, ip_address, port, user_id, event, path FROM log ORDER BY timestamp DESC LIMIT 500`
+		cols = []string{"timestamp", "ip", "port", "user", "event", "path"}
+	case "bans", "shadow_banned":
+		q = `SELECT pubkey_hash, banned_at FROM shadow_banned ORDER BY banned_at DESC`
+		cols = []string{"pubkey_hash", "banned_at"}
+	case "ip_banned":
+		q = `SELECT ip_address, banned_at FROM ip_banned ORDER BY banned_at DESC`
+		cols = []string{"ip_address", "banned_at"}
+	default:
+		return nil, nil, fmt.Errorf("unknown table %q (use: users/files/log/bans/ip_banned)", name)
+	}
+
+	dbRows, err := a.srv.store.db.Query(q)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer dbRows.Close()
+
+	for dbRows.Next() {
+		// Dynamic scanning into []any
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := dbRows.Scan(ptrs...); err != nil {
+			continue
+		}
+		row := make(dbRow, len(cols))
+		for i, v := range vals {
+			switch val := v.(type) {
+			case []byte:
+				row[i] = string(val)
+			case int64:
+				// Pretty-print byte columns
+				colName := cols[i]
+				if strings.Contains(colName, "bytes") || colName == "size" {
+					row[i] = formatBytes(val)
+				} else if colName == "timestamp" {
+					row[i] = time.Unix(val, 0).Format("2006-01-02 15:04:05")
+				} else {
+					row[i] = strconv.FormatInt(val, 10)
+				}
+			case string:
+				row[i] = val
+			case nil:
+				row[i] = ""
+			default:
+				row[i] = fmt.Sprintf("%v", val)
+			}
+		}
+		rows = append(rows, row)
+	}
+	return cols, rows, dbRows.Err()
+}
+
+func renderDBTable(cols []string, rows []dbRow, cursor, width int) ([]string, []int) {
+	// Compute column widths
+	colW := make([]int, len(cols))
+	for i, c := range cols {
+		colW[i] = len(c)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < len(colW) && len(cell) > colW[i] {
+				colW[i] = len(cell)
+			}
+		}
+	}
+	// Cap each column at a fraction of the terminal width
+	maxCol := (width - len(cols)*3) / len(cols)
+	if maxCol < 8 {
+		maxCol = 8
+	}
+	for i := range colW {
+		if colW[i] > maxCol {
+			colW[i] = maxCol
+		}
+	}
+
+	var lines []string
+
+	// Header row
+	var hdr strings.Builder
+	hdr.WriteString("  ")
+	for i, c := range cols {
+		cell := fmt.Sprintf("%-*s", colW[i], c)
+		if len(cell) > colW[i] {
+			cell = cell[:colW[i]]
+		}
+		hdr.WriteString(styleCyanBold.Render(cell) + "  ")
+	}
+	lines = append(lines, hdr.String())
+	lines = append(lines, styleDarkGray.Render(strings.Repeat("─", width-2)))
+
+	for ri, row := range rows {
+		var line strings.Builder
+		line.WriteString("  ")
+		for ci, cell := range row {
+			if ci >= len(colW) {
+				break
+			}
+			padded := cell
+			if len(padded) > colW[ci] {
+				padded = padded[:colW[ci]-1] + "…"
+			}
+			padded = fmt.Sprintf("%-*s", colW[ci], padded)
+			if ri == cursor {
+				line.WriteString(styleSelected.Render(padded) + "  ")
+			} else {
+				line.WriteString(styleWhite.Render(padded) + "  ")
+			}
+		}
+		lines = append(lines, line.String())
+	}
+	return lines, colW
+}
+
+func (m dbViewerModel) Init() tea.Cmd { return nil }
+
+func (m dbViewerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		vpH := m.height - 2
+		if vpH < 1 {
+			vpH = 1
+		}
+		lines, colW := renderDBTable(m.cols, m.rows, m.cursor, m.width)
+		m.colWidths = colW
+		if !m.ready {
+			m.vp = viewport.New(m.width, vpH)
+			m.vp.SetContent(strings.Join(lines, "\n"))
+			m.ready = true
+		} else {
+			m.vp.Width = m.width
+			m.vp.Height = vpH
+			m.vp.SetContent(strings.Join(lines, "\n"))
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "esc":
+			return m, tea.Quit
+
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.refreshContent()
+				// Scroll viewport to keep cursor visible
+				lineIdx := m.cursor + 2 // 2 header lines
+				if lineIdx < m.vp.YOffset {
+					m.vp.SetYOffset(lineIdx)
+				}
+			}
+			return m, nil
+
+		case "down", "j":
+			if m.cursor < len(m.rows)-1 {
+				m.cursor++
+				m.refreshContent()
+				lineIdx := m.cursor + 2
+				if lineIdx >= m.vp.YOffset+m.vp.Height {
+					m.vp.SetYOffset(lineIdx - m.vp.Height + 1)
+				}
+			}
+			return m, nil
+
+		case "g":
+			m.cursor = 0
+			m.refreshContent()
+			m.vp.GotoTop()
+			return m, nil
+		case "G":
+			m.cursor = len(m.rows) - 1
+			m.refreshContent()
+			m.vp.GotoBottom()
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+func (m *dbViewerModel) refreshContent() {
+	lines, _ := renderDBTable(m.cols, m.rows, m.cursor, m.width)
+	m.vp.SetContent(strings.Join(lines, "\n"))
+}
+
+func (m dbViewerModel) View() string {
+	if !m.ready {
+		return ""
+	}
+	w := m.width
+	title := fmt.Sprintf("DB VIEWER — %s  (%d rows)", m.tableName, len(m.rows))
+	hint := " q=back  ↑↓=move  g=top G=bottom "
+	gap := w - lipgloss.Width(title) - lipgloss.Width(hint)
+	if gap < 0 {
+		gap = 0
+	}
+	header := stylePanelHeader.Copy().Width(w).Render(title + strings.Repeat(" ", gap) + hint)
+
+	rowInfo := ""
+	if len(m.rows) > 0 {
+		rowInfo = fmt.Sprintf("row %d/%d", m.cursor+1, len(m.rows))
+	}
+	footer := stylePanelFooter.Copy().Width(w).Render("  " + rowInfo)
+
+	return header + "\n" + m.vp.View() + "\n" + footer
+}
+
+func (a *adminConsole) runDBViewer(args []string) {
+	tableName := "users"
+	if len(args) > 0 {
+		tableName = strings.ToLower(args[0])
+	}
+
+	cols, rows, err := a.loadDBTable(tableName)
+	if err != nil {
+		// Write error to channel directly since we're not in a TUI yet
+		fmt.Fprintf(a.ch, styleRed.Render(fmt.Sprintf("view-db: %v\r\n", err)))
+		return
+	}
+
+	m := dbViewerModel{
+		console:   a,
+		tableName: tableName,
+		cols:      cols,
+		rows:      rows,
+	}
+	p := tea.NewProgram(m, tea.WithInput(a.ch), tea.WithOutput(a.ch), tea.WithAltScreen())
+	p.Run() //nolint:errcheck
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Panel: File Browser
+// ─────────────────────────────────────────────────────────────────────────────
+
+type fileEntry struct {
+	name    string
+	isDir   bool
+	size    int64
+	modTime time.Time
+	owner   string
+}
+
+type fileBrowserModel struct {
+	console *adminConsole
+	dir     string // absolute path being browsed
+	entries []fileEntry
+	cursor  int
+	width   int
+	height  int
+	ready   bool
+	vp      viewport.Model
+	preview string // non-empty = showing file preview pane
+	status  string // one-line status message
+}
+
+func (a *adminConsole) readDir(absDir string) ([]fileEntry, error) {
+	des, err := os.ReadDir(absDir)
+	if err != nil {
+		return nil, err
+	}
+	root := a.srv.absUploadDir
+	var entries []fileEntry
+	// Always add ".." unless we're at root
+	if absDir != root {
+		entries = append(entries, fileEntry{name: "..", isDir: true})
+	}
+	for _, de := range des {
+		fi, err := de.Info()
+		if err != nil {
+			continue
+		}
+		rel, _ := filepath.Rel(root, filepath.Join(absDir, de.Name()))
+		rel = filepath.ToSlash(rel)
+		owner, _ := a.srv.store.GetFileOwner(rel)
+		entries = append(entries, fileEntry{
+			name:    de.Name(),
+			isDir:   de.IsDir(),
+			size:    fi.Size(),
+			modTime: fi.ModTime(),
+			owner:   owner,
+		})
+	}
+	return entries, nil
+}
+
+func (m fileBrowserModel) buildListLines() []string {
+	root := m.console.srv.absUploadDir
+	rel, _ := filepath.Rel(root, m.dir)
+	rel = filepath.ToSlash(rel)
+	if rel == "." {
+		rel = "/"
+	} else {
+		rel = "/" + rel
+	}
+
+	lines := []string{
+		styleCyan.Render(rel) + "  " + styleDarkGray.Render(fmt.Sprintf("(%d entries)", len(m.entries))),
+		styleDarkGray.Render(strings.Repeat("─", m.width-2)),
+	}
+
+	for i, e := range m.entries {
+		modStr := e.modTime.Format("Jan 02 15:04")
+		sizeStr := formatBytes(e.size)
+		if e.isDir {
+			sizeStr = "       "
+		}
+		ownerStr := shortID(e.owner)
+		if ownerStr == "" {
+			ownerStr = "?"
+		}
+
+		nameStr := e.name
+		var styled string
+		if e.isDir {
+			styled = styleDir.Render(nameStr + "/")
+		} else {
+			if e.owner == systemOwner {
+				styled = styleSysFile.Render(nameStr)
+			} else {
+				styled = styleFile.Render(nameStr)
+			}
+		}
+
+		line := fmt.Sprintf("  %s  %7s  %-10s  %s",
+			styleDarkGray.Render(modStr),
+			styleLightGray.Render(sizeStr),
+			styleDarkGray.Render(ownerStr),
+			styled)
+
+		if i == m.cursor {
+			// Highlight the selected row (strip ANSI first for accurate width, then re-render)
+			plain := fmt.Sprintf("  %s  %7s  %-10s  %s",
+				modStr, sizeStr, ownerStr, nameStr)
+			if e.isDir {
+				plain = fmt.Sprintf("  %s  %7s  %-10s  %s/",
+					modStr, sizeStr, ownerStr, nameStr)
+			}
+			_ = line // discard styled for selected
+			line = styleSelected.Render(fmt.Sprintf("%-*s", m.width, plain))
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func (m fileBrowserModel) Init() tea.Cmd { return nil }
+
+func (m fileBrowserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		vpH := m.height - 3 // header + footer + status
+		if vpH < 1 {
+			vpH = 1
+		}
+		if !m.ready {
+			m.vp = viewport.New(m.width, vpH)
+			m.vp.SetContent(strings.Join(m.buildListLines(), "\n"))
+			m.ready = true
+		} else {
+			m.vp.Width = m.width
+			m.vp.Height = vpH
+			m.refreshContent()
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		if m.preview != "" {
+			// In preview mode, any key returns to list
+			m.preview = ""
+			m.refreshContent()
+			return m, nil
+		}
+
+		switch msg.String() {
+		case "q", "esc":
+			return m, tea.Quit
+
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.ensureVisible()
+				m.refreshContent()
+			}
+			return m, nil
+
+		case "down", "j":
+			if m.cursor < len(m.entries)-1 {
+				m.cursor++
+				m.ensureVisible()
+				m.refreshContent()
+			}
+			return m, nil
+
+		case "g":
+			m.cursor = 0
+			m.vp.GotoTop()
+			m.refreshContent()
+			return m, nil
+		case "G":
+			m.cursor = len(m.entries) - 1
+			m.vp.GotoBottom()
+			m.refreshContent()
+			return m, nil
+
+		case "enter", "l", "right":
+			if len(m.entries) == 0 {
+				return m, nil
+			}
+			e := m.entries[m.cursor]
+			if e.isDir {
+				newDir := filepath.Join(m.dir, e.name)
+				entries, err := m.console.readDir(newDir)
+				if err != nil {
+					m.status = styleRed.Render(fmt.Sprintf("error: %v", err))
+					return m, nil
+				}
+				m.dir = newDir
+				m.entries = entries
+				m.cursor = 0
+				m.vp.GotoTop()
+				m.refreshContent()
+			} else {
+				// Open file for preview
+				m.openPreview(e)
+			}
+			return m, nil
+
+		case "backspace", "h", "left":
+			root := m.console.srv.absUploadDir
+			if m.dir == root {
+				return m, nil
+			}
+			parent := filepath.Dir(m.dir)
+			if !strings.HasPrefix(parent, root) {
+				parent = root
+			}
+			// Find the cursor position for the directory we came from
+			fromName := filepath.Base(m.dir)
+			entries, err := m.console.readDir(parent)
+			if err != nil {
+				m.status = styleRed.Render(fmt.Sprintf("error: %v", err))
+				return m, nil
+			}
+			m.dir = parent
+			m.entries = entries
+			m.cursor = 0
+			for i, e := range entries {
+				if e.name == fromName {
+					m.cursor = i
+					break
+				}
+			}
+			m.ensureVisible()
+			m.refreshContent()
+			return m, nil
+
+		case "p":
+			if len(m.entries) > 0 {
+				e := m.entries[m.cursor]
+				if !e.isDir {
+					m.openPreview(e)
+				}
+			}
+			return m, nil
+
+		case "d":
+			// Quick delete with confirmation via status line
+			if len(m.entries) > 0 {
+				e := m.entries[m.cursor]
+				if e.name == ".." {
+					return m, nil
+				}
+				full := filepath.Join(m.dir, e.name)
+				root := m.console.srv.absUploadDir
+				rel, _ := filepath.Rel(root, full)
+				rel = filepath.ToSlash(rel)
+				if err := os.RemoveAll(full); err != nil {
+					m.status = styleRed.Render(fmt.Sprintf("delete failed: %v", err))
+				} else {
+					m.console.srv.store.DeletePath(rel)
+					m.console.srv.store.LogEvent(EventAdmin, "admin", m.console.sessionID, nil,
+						"action", "rm", "path", rel)
+					m.status = styleGreen.Render(fmt.Sprintf("deleted: %s", rel))
+					// Reload directory
+					entries, err := m.console.readDir(m.dir)
+					if err == nil {
+						m.entries = entries
+						if m.cursor >= len(m.entries) {
+							m.cursor = len(m.entries) - 1
+						}
+						if m.cursor < 0 {
+							m.cursor = 0
+						}
+					}
+					m.refreshContent()
+				}
+			}
+			return m, nil
+
+		case "b":
+			// Quick ban: ban owner of selected file
+			if len(m.entries) > 0 {
+				e := m.entries[m.cursor]
+				if !e.isDir && e.owner != "" && e.owner != systemOwner {
+					if err := m.console.srv.store.Ban(e.owner); err != nil {
+						m.status = styleRed.Render(fmt.Sprintf("ban failed: %v", err))
+					} else {
+						m.console.srv.store.LogEvent(EventShadowBan, e.owner, m.console.sessionID, nil,
+							"action", "ban", "path", e.name)
+						m.status = styleRedBold.Render(fmt.Sprintf("banned owner of: %s", e.name))
+					}
+				} else {
+					m.status = styleYellow.Render("no bannable owner for this entry")
+				}
+			}
+			return m, nil
+		}
+	}
+
+	var cmd tea.Cmd
+	m.vp, cmd = m.vp.Update(msg)
+	return m, cmd
+}
+
+func (m *fileBrowserModel) ensureVisible() {
+	lineIdx := m.cursor + 2 // 2 header lines in list
+	if lineIdx < m.vp.YOffset {
+		m.vp.SetYOffset(lineIdx)
+	} else if lineIdx >= m.vp.YOffset+m.vp.Height {
+		m.vp.SetYOffset(lineIdx - m.vp.Height + 1)
+	}
+}
+
+func (m *fileBrowserModel) refreshContent() {
+	if m.preview != "" {
+		m.vp.SetContent(m.preview)
+	} else {
+		m.vp.SetContent(strings.Join(m.buildListLines(), "\n"))
+	}
+}
+
+func (m *fileBrowserModel) openPreview(e fileEntry) {
+	full := filepath.Join(m.dir, e.name)
+	const maxPreview = 8192
+	data, err := os.ReadFile(full)
+	if err != nil {
+		m.status = styleRed.Render(fmt.Sprintf("preview error: %v", err))
+		return
+	}
+	if len(data) > maxPreview {
+		data = append(data[:maxPreview], []byte("\n… (truncated)")...)
+	}
+	// Simple binary sniff
+	isBinary := false
+	for _, b := range data[:min(512, len(data))] {
+		if b == 0 {
+			isBinary = true
+			break
+		}
+	}
+	if isBinary {
+		m.preview = styleYellow.Render(fmt.Sprintf("Binary file: %s (%s)", e.name, formatBytes(e.size)))
+	} else {
+		header := styleCyanBold.Render(fmt.Sprintf("── %s (%s) ──", e.name, formatBytes(e.size)))
+		m.preview = header + "\n" + string(data)
+	}
+	m.status = styleDarkGray.Render("press any key to return to listing")
+	m.vp.SetContent(m.preview)
+	m.vp.GotoTop()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (m fileBrowserModel) View() string {
+	if !m.ready {
+		return ""
+	}
+	w := m.width
+
+	// Panel title
+	root := m.console.srv.absUploadDir
+	rel, _ := filepath.Rel(root, m.dir)
+	rel = filepath.ToSlash(rel)
+	if rel == "." {
+		rel = "/"
+	} else {
+		rel = "/" + rel
+	}
+
+	title := "FILE BROWSER — " + rel
+	hint := " q=back  ↑↓=move  Enter=open  p=preview  d=delete  b=ban  "
+	gap := w - lipgloss.Width(title) - lipgloss.Width(hint)
+	if gap < 0 {
+		gap = 0
+	}
+	header := stylePanelHeader.Copy().Width(w).Render(title + strings.Repeat(" ", gap) + hint)
+
+	statusLine := m.status
+	if statusLine == "" {
+		pct := "100%"
+		if !m.vp.AtBottom() {
+			pct = fmt.Sprintf("%d%%", int(m.vp.ScrollPercent()*100))
+		}
+		statusLine = styleDarkGray.Render(fmt.Sprintf("  %d entries  ·  %s  ", len(m.entries), pct))
+	}
+	footer := stylePanelFooter.Copy().Width(w).Render(statusLine)
+
+	return header + "\n" + m.vp.View() + "\n" + footer
+}
+
+func (a *adminConsole) runFileBrowser(args []string) {
+	startDir := a.srv.absUploadDir
+	if len(args) > 0 {
+		candidate := a.resolvePath(args[0])
+		if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
+			startDir = candidate
+		}
+	}
+
+	entries, err := a.readDir(startDir)
+	if err != nil {
+		fmt.Fprintf(a.ch, styleRed.Render(fmt.Sprintf("view-files: %v\r\n", err)))
+		return
+	}
+
+	m := fileBrowserModel{
+		console: a,
+		dir:     startDir,
+		entries: entries,
+	}
+	p := tea.NewProgram(m, tea.WithInput(a.ch), tea.WithOutput(a.ch), tea.WithAltScreen())
+	p.Run() //nolint:errcheck
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -971,7 +1800,6 @@ func writef(sb *strings.Builder, style lipgloss.Style, format string, args ...an
 }
 
 // hrLine returns a horizontal rule styled for the given column width.
-// The width is clamped to a sensible range.
 func hrLine(width int) string {
 	if width < 40 {
 		width = 72
@@ -1000,15 +1828,12 @@ var fileArgCommands = map[string]bool{
 	"cat": true, "rm": true, "mv": true, "chown": true,
 	"protect": true, "unprotect": true, "unrestrict": true, "restrict": true,
 	"inspect": true, "i": true, "ban": true, "ls": true, "cd": true,
+	"view-files": true, "vf": true,
 }
 
 // complete returns the new completions slice and selected index given the
 // current input value and the previous completion state.
-//
-//   - If completions is non-nil we are already cycling: advance compIdx.
-//   - Otherwise compute a fresh candidate list from value.
 func (a *adminConsole) complete(value string, prev []string, prevIdx int) ([]string, int) {
-	// If we already have a list, just advance the cursor through it.
 	if len(prev) > 1 {
 		next := (prevIdx + 1) % len(prev)
 		return prev, next
@@ -1017,7 +1842,7 @@ func (a *adminConsole) complete(value string, prev []string, prevIdx int) ([]str
 	parts := strings.Fields(value)
 	trailingSpace := len(value) > 0 && value[len(value)-1] == ' '
 
-	// ── Command-name completion (first token, no trailing space yet) ──────
+	// ── Command-name completion ──────────────────────────────────────────
 	if len(parts) == 0 || (len(parts) == 1 && !trailingSpace) {
 		prefix := ""
 		if len(parts) == 1 {
@@ -1046,20 +1871,17 @@ func (a *adminConsole) complete(value string, prev []string, prevIdx int) ([]str
 		return candidates, 0
 	}
 
-	// ── Path completion (second token onward, for file-arg commands) ──────
+	// ── Path completion ──────────────────────────────────────────────────
 	cmd := strings.ToLower(parts[0])
 	if !fileArgCommands[cmd] {
 		return nil, -1
 	}
 
-	// The path being typed is either the last token (no trailing space)
-	// or an empty prefix (trailing space = starting fresh).
 	pathPrefix := ""
 	if !trailingSpace && len(parts) > 1 {
 		pathPrefix = parts[len(parts)-1]
 	}
 
-	// Resolve the directory to list and the file prefix to match.
 	var dirPart, filePart string
 	if strings.Contains(pathPrefix, "/") {
 		dirPart = pathPrefix[:strings.LastIndex(pathPrefix, "/")+1]
@@ -1075,11 +1897,8 @@ func (a *adminConsole) complete(value string, prev []string, prevIdx int) ([]str
 		return nil, -1
 	}
 
-	// Prefix for reconstructing what to put in the input.
-	// Everything before the last token stays, then we append the completion.
 	var inputPrefix string
 	if !trailingSpace && len(parts) > 1 {
-		// Replace just the last token.
 		inputPrefix = strings.Join(parts[:len(parts)-1], " ") + " " + dirPart
 	} else {
 		inputPrefix = strings.Join(parts, " ") + " " + dirPart
@@ -1525,6 +2344,7 @@ func (a *adminConsole) cmdInspect(args []string, out *strings.Builder) {
 	inspectRow("Modified:", fi.ModTime().Format("2006-01-02 15:04:05"))
 	inspectRow("Owner:", shortID(owner))
 	inspectRow("Permissions:", fi.Mode().String())
+	inspectRow("Unrestricted:", fmt.Sprintf("%v", a.srv.cfg.unrestrictedMap[rel] || a.srv.cfg.unrestrictedMap[rel+"/"]))
 	writeHR(out)
 }
 
@@ -1564,7 +2384,7 @@ func (a *adminConsole) cmdUsers(out *strings.Builder) {
 		if hash == "system" {
 			continue
 		}
-		banStr := "      " // 6 spaces to preserve column alignment when not banned
+		banStr := "      "
 		if banned {
 			banStr = styleRedBold.Render("BANNED")
 		}
@@ -1624,15 +2444,15 @@ func (a *adminConsole) cmdUser(args []string, out *strings.Builder) {
 		bannedStr))
 	userRow("Files owned:", fmt.Sprintf("%d", len(files)))
 	if len(files) > 0 {
-		max := 20
-		if len(files) < max {
-			max = len(files)
+		maxShow := 20
+		if len(files) < maxShow {
+			maxShow = len(files)
 		}
-		for _, f := range files[:max] {
+		for _, f := range files[:maxShow] {
 			out.WriteString("    " + styleDarkGray.Render(f) + "\n")
 		}
-		if len(files) > max {
-			out.WriteString(fmt.Sprintf("    … and %d more\n", len(files)-max))
+		if len(files) > maxShow {
+			out.WriteString(fmt.Sprintf("    … and %d more\n", len(files)-maxShow))
 		}
 	}
 	writeHR(out)
@@ -1715,7 +2535,6 @@ func (a *adminConsole) cmdBan(args []string, ban bool, out *strings.Builder) {
 // cmdPurge is handled via startConfirm in the TUI path and replConfirm in the
 // REPL path; this stub is here so dispatch() can find it when called directly.
 func (a *adminConsole) cmdPurge(args []string, out *strings.Builder) bool {
-	// Should not be reached via normal dispatch — confirmation flow handles it.
 	writef(out, styleRed, "purge: internal error — should be handled by confirmation flow\n")
 	return false
 }
@@ -1859,7 +2678,6 @@ func (a *adminConsole) cmdLogs(args []string, userFilter, eventFilter, ipFilter 
 		styleCyan.Render("Detail")))
 	writeHR(out)
 	for _, e := range entries {
-		// Colour-code event kind; pad *before* styling to preserve column alignment.
 		eventPadded := fmt.Sprintf("%-28s", e.event)
 		var eventCol string
 		switch {
@@ -1961,11 +2779,11 @@ func (a *adminConsole) cmdTopUsers(args []string, mode string, out *strings.Buil
 		if err := rows.Scan(&hash, &upBytes, &dnBytes, &upCount, &dnCount); err != nil {
 			continue
 		}
-		bytes, count := upBytes, upCount
+		byt, count := upBytes, upCount
 		if mode == "download" {
-			bytes, count = dnBytes, dnCount
+			byt, count = dnBytes, dnCount
 		}
-		out.WriteString(fmt.Sprintf("  %4d. %-14s  %-14s  %d\n", rank, shortID(hash), formatBytes(bytes), count))
+		out.WriteString(fmt.Sprintf("  %4d. %-14s  %-14s  %d\n", rank, shortID(hash), formatBytes(byt), count))
 		rank++
 	}
 	writeHR(out)
@@ -1995,7 +2813,6 @@ func (a *adminConsole) cmdConfig(out *strings.Builder) {
 		{"Lock dirs to owners", fmt.Sprintf("%v", cfg.LockDirectoriesToOwners)},
 		{"Unrestricted paths", fmt.Sprintf("%v", cfg.Unrestricted)},
 	} {
-		// Pad the label before styling so ANSI codes don't corrupt column width.
 		out.WriteString(fmt.Sprintf("  %s  %s\n",
 			styleCyan.Render(fmt.Sprintf("%-28s", r[0])),
 			styleWhite.Render(r[1])))
@@ -2015,8 +2832,6 @@ func (a *adminConsole) cmdReloadBanner(out *strings.Builder) {
 
 // cmdShutdown is called from dispatch for the REPL path; TUI uses startConfirm.
 func (a *adminConsole) cmdShutdown(out *strings.Builder) bool {
-	// In TUI mode this is handled by startConfirm. If somehow called directly,
-	// refuse without confirmation.
 	out.WriteString(styleRedBold.Render("Use the interactive TUI or plain SSH to run shutdown.") + "\n")
 	return false
 }
@@ -2060,7 +2875,6 @@ func (a *adminConsole) cmdHelp(args []string, out *strings.Builder) {
 	for _, cat := range categoryOrder {
 		out.WriteString("\n" + styleYellowBold.Render(cat) + "\n")
 		for _, c := range byCategory[cat] {
-			// Pad usage before styling so column widths are accurate.
 			usagePadded := fmt.Sprintf("%-36s", c.Usage)
 			out.WriteString(fmt.Sprintf("  %s %s\n",
 				styleCyan.Render(usagePadded), styleDarkGray.Render(c.Help)))

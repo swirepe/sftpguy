@@ -640,12 +640,18 @@ func LoadConfig() (Config, error) {
 	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
 
-	i := flag.Bool("install", false, "Install this program as a system service (requires root)")
+	install := flag.Bool("install", false, "Install as a systemd service (requires root)")
+	installService := flag.String("install.service", "sftpguy", "Service name to use when installing")
+	installUser := flag.String("install.user", "anonymous", "System user the service runs as")
+	installGroup := flag.String("install.group", "ftp", "System group the service runs as")
+	installEnsure := flag.Bool("install.ensure", true, "Create user/group if they don't exist")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
+
+	rawArgs := os.Args[1:]
 	flag.Parse()
 
 	if *updateVersion {
@@ -658,14 +664,20 @@ func LoadConfig() (Config, error) {
 		os.Exit(0)
 	}
 
-	if *i {
-		if err := runInstall(sanitizeName(cfg.Name)); err != nil {
+	if *install {
+		opts := installOptions{
+			Name:   sanitizeName(*installService),
+			User:   *installUser,
+			Group:  *installGroup,
+			Ensure: *installEnsure,
+			Args:   stripInstallFlags(rawArgs),
+		}
+		if err := runInstall(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 			os.Exit(1)
 		}
 		os.Exit(0)
 	}
-
 	// Process unrestricted paths
 	cfg.unrestrictedMap = make(map[string]bool)
 	for _, p := range strings.Split(cfg.Unrestricted, ",") {
@@ -680,6 +692,30 @@ func LoadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func stripInstallFlags(argv []string) []string {
+	out := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		name := strings.TrimLeft(a, "-")
+		// Strip -install=... / -install.foo=...
+		if bare, _, ok := strings.Cut(name, "="); ok {
+			if bare == "install" || strings.HasPrefix(bare, "install.") {
+				continue
+			}
+		}
+		// Strip bare -install / -install.foo and consume the following value
+		// token if it isn't itself a flag.
+		if name == "install" || strings.HasPrefix(name, "install.") {
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++ // consume the value
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 func (c Config) Validate() error {
@@ -970,7 +1006,6 @@ func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.K
 		"password", password, // traditionally it's your email address
 		"generated_hash", hash,
 	)
-	//s.store.LogEvent(EventLogin)
 
 	// Note: We are effectively "accepting all passwords" here, but
 	// treating the credentials as the seed for their unique UID.
