@@ -54,6 +54,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -182,6 +183,8 @@ const (
 	EventShell                 EventKind = "shell"
 	EventExec                  EventKind = "exec"
 	EventLogin                 EventKind = "login"
+	EventSessionStart          EventKind = "session/start"
+	EventSessionEnd            EventKind = "session/end"
 	EventUpload                EventKind = "upload"
 	EventDownload              EventKind = "download"
 	EventDelete                EventKind = "delete"
@@ -1069,6 +1072,8 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
+	sessionStarted := time.Now()
+	sessionCounts := &sessionCounters{}
 
 	if s.cfg.AdminEnabled && s.isAdminConn(sConn.Permissions) {
 		// ── Admin fast-path ───────────────────────────────────────────
@@ -1088,6 +1093,25 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	stats, _ := s.store.UpsertUserSession(pubHash)
 	logger := s.logger.With(s.userGroup(pubHash, sessionID, sConn.RemoteAddr()))
 	isBanned := s.store.IsBanned(pubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
+	loginType := loginTypeFromHash(pubHash)
+
+	s.store.LogEvent(EventSessionStart, pubHash, sessionID, sConn.RemoteAddr(),
+		"login_type", loginType,
+		"banned", isBanned,
+	)
+	defer func() {
+		duration := time.Since(sessionStarted)
+		s.store.LogEvent(EventSessionEnd, pubHash, sessionID, sConn.RemoteAddr(),
+			"duration_ms", duration.Milliseconds(),
+			"login_type", loginType,
+			"ops", sessionCounts.totalOps.Load(),
+			"uploads", sessionCounts.uploads.Load(),
+			"uploads_bytes", sessionCounts.uploadsBytes.Load(),
+			"downloads", sessionCounts.downloads.Load(),
+			"downloads_bytes", sessionCounts.downloadsBytes.Load(),
+			"denied", sessionCounts.denied.Load(),
+		)
+	}()
 
 	logger.Info("login", "banned", isBanned)
 	go ssh.DiscardRequests(reqs)
@@ -1099,7 +1123,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger, isBanned)
+		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger, isBanned, sessionCounts)
 	}
 }
 
@@ -1110,7 +1134,8 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	stats userStats,
 	sConn *ssh.ServerConn,
 	logger *slog.Logger,
-	isBanned bool) {
+	isBanned bool,
+	counters *sessionCounters) {
 
 	defer ch.Close()
 	for req := range reqs {
@@ -1129,6 +1154,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 					remoteAddr: sConn.RemoteAddr(),
 					sessionID:  sessionID,
 					isBanned:   isBanned,
+					counters:   counters,
 				}
 				handler.logLogin(stats)
 				server := sftp.NewRequestServer(ch, sftp.Handlers{
@@ -1418,6 +1444,16 @@ type fsHandler struct {
 	sessionID   string
 	readLimiter *rate.Limiter // nil if not banned
 	isBanned    bool
+	counters    *sessionCounters
+}
+
+type sessionCounters struct {
+	totalOps       atomic.Int64
+	uploads        atomic.Int64
+	uploadsBytes   atomic.Int64
+	downloads      atomic.Int64
+	downloadsBytes atomic.Int64
+	denied         atomic.Int64
 }
 
 type pathMeta struct {
@@ -1527,6 +1563,8 @@ func (h *fsHandler) prepareDirectory(rel string) error {
 }
 
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
+	h.bumpOps()
+	h.bumpDenied()
 	h.logger.Info("permission denied", append([]any{"reason", err.LogString()}, args...)...)
 
 	h.srv.store.LogEvent(err.Kind, h.pubHash, h.sessionID, h.remoteAddr, args...)
@@ -1534,14 +1572,55 @@ func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	return sftp.ErrSSHFxPermissionDenied
 }
 
+func loginTypeFromHash(pubHash string) string {
+	switch {
+	case strings.HasPrefix(pubHash, "anon-auth:"):
+		return "anon-auth"
+	case strings.HasPrefix(pubHash, "pwd-auth:"):
+		return "pwd-auth"
+	default:
+		return "pubkey-hash"
+	}
+}
+
+func (h *fsHandler) bumpOps() {
+	if h.counters == nil {
+		return
+	}
+	h.counters.totalOps.Add(1)
+}
+
+func (h *fsHandler) bumpDenied() {
+	if h.counters == nil {
+		return
+	}
+	h.counters.denied.Add(1)
+}
+
+func (h *fsHandler) bumpUpload(delta int64) {
+	if h.counters == nil {
+		return
+	}
+	h.counters.totalOps.Add(1)
+	h.counters.uploads.Add(1)
+	if delta > 0 {
+		h.counters.uploadsBytes.Add(delta)
+	}
+}
+
+func (h *fsHandler) bumpDownload(size int64) {
+	if h.counters == nil {
+		return
+	}
+	h.counters.totalOps.Add(1)
+	h.counters.downloads.Add(1)
+	if size > 0 {
+		h.counters.downloadsBytes.Add(size)
+	}
+}
+
 func (h *fsHandler) logLogin(stats userStats) {
-	var loginType = "pubkey-hash"
-	if strings.HasPrefix(h.pubHash, "anon-auth:") {
-		loginType = "anon-auth"
-	}
-	if strings.HasPrefix(h.pubHash, "pwd-auth:") {
-		loginType = "pwd-auth"
-	}
+	loginType := loginTypeFromHash(h.pubHash)
 
 	h.srv.store.LogEvent(EventLogin, h.pubHash, h.sessionID, h.remoteAddr,
 		"first_timer", stats.FirstTimer,
@@ -1551,6 +1630,7 @@ func (h *fsHandler) logLogin(stats userStats) {
 }
 
 func (h *fsHandler) logDownload(meta *pathMeta) {
+	h.bumpDownload(meta.fi.Size())
 	h.logger.Info("download", "path", meta.rel, "size", meta.fi.Size())
 	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", meta.rel,
@@ -1559,6 +1639,7 @@ func (h *fsHandler) logDownload(meta *pathMeta) {
 }
 
 func (h *fsHandler) logUpload(rel string, size, delta int64) {
+	h.bumpUpload(delta)
 	h.logger.Info("upload", "path", rel, "size", size, "delta", delta)
 	h.srv.store.LogEvent(EventUpload, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", rel,
@@ -1568,6 +1649,7 @@ func (h *fsHandler) logUpload(rel string, size, delta int64) {
 }
 
 func (h *fsHandler) logDelete(meta *pathMeta) {
+	h.bumpOps()
 	h.logger.Info("delete", "path", meta.rel, "is_dir", meta.isDir)
 	h.srv.store.LogEvent(EventDelete, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", meta.rel,
@@ -1576,6 +1658,7 @@ func (h *fsHandler) logDelete(meta *pathMeta) {
 }
 
 func (h *fsHandler) logRename(src, dst *pathMeta) {
+	h.bumpOps()
 	h.logger.Info("rename", "from", src.rel, "to", dst.rel)
 	h.srv.store.LogEvent(EventRename, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", src.rel,
