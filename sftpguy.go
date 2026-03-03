@@ -65,7 +65,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go admin_http.go install.go fortunes.txt
+//go:embed sftpguy.go admin.go admin_http*.go install.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
