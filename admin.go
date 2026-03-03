@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -44,6 +47,16 @@ func (s *Store) IsBanned(pubkeyHash string) bool {
 }
 
 func (s *Store) IsIPBanned(ip string) bool {
+	if s.whitelist.Matches(ip) {
+		s.logger.Debug("IP is whitelisted", "ip", ip)
+		return false
+	}
+
+	if s.blacklist.Matches(ip) {
+		s.logger.Debug("IP is blacklisted", "ip", ip)
+		return true
+	}
+
 	var exists bool
 	s.db.QueryRow("SELECT 1 FROM ip_banned WHERE ip_address = ?", ip).Scan(&exists)
 	return exists
@@ -108,6 +121,7 @@ func (s *Server) PurgeUser(pubHash string) error {
 	if err != nil {
 		return err
 	}
+
 	for _, rel := range paths {
 		full := filepath.Join(s.absUploadDir, filepath.FromSlash(rel))
 		os.RemoveAll(full)
@@ -115,7 +129,7 @@ func (s *Server) PurgeUser(pubHash string) error {
 	s.store.exec("DELETE FROM files WHERE owner_hash = ?", pubHash)
 	s.store.exec("DELETE FROM shadow_banned WHERE pubkey_hash = ?", pubHash)
 	_, err = s.store.exec("DELETE FROM users WHERE pubkey_hash = ?", pubHash)
-	s.store.LogEvent(EventAdminPurge, systemOwner, "admin", nil, "target", pubHash)
+	s.store.LogEvent(EventAdminPurge, systemOwner, "admin", nil, "target", pubHash, "purged", paths)
 	return err
 }
 
@@ -146,7 +160,7 @@ const (
 )
 
 var (
-	// Updated regex to be more flexible for "user.id=" or "id="
+	// "user.id=" or "id="
 	reUserHash = regexp.MustCompile(`(?:user\.id|id)=([a-f0-9]+)`)
 	reIPAddr   = regexp.MustCompile(`(?:remote_address|remote_addr|ip)=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)`)
 )
@@ -798,7 +812,34 @@ type adminConsole struct {
 	hasPTY bool
 }
 
-func (s *Server) handleAdminChannel(ch ssh.Channel, reqs <-chan *ssh.Request, sid string) {
+const adminBanner = `
+┏━┓╻ ╻┏━┓╺┳╸┏━╸┏┳┓   ╻ ╻┏━┓┏━╸┏━┓
+┗━┓┗┳┛┗━┓ ┃ ┣╸ ┃┃┃   ┃ ┃┗━┓┣╸ ┣┳┛
+┗━┛ ╹ ┗━┛ ╹ ┗━╸╹ ╹   ┗━┛┗━┛┗━╸╹┗╸
+`
+
+const adminWelcome = `%s
+
+%s
+
+Users: %d | Contributors: %d | Files: %d | Size: %s\r\n
+`
+
+func (s *Server) WelcomeAdmin(stderr io.ReadWriter) {
+	u, c, f, b := s.store.GetBannerStats(s.cfg.ContributorThreshold)
+
+	fmt.Fprintf(stderr, adminWelcome,
+		cyan.Bold(adminBanner),
+		yellow.Italic(s.getRandomFortune()), u, c, f, formatBytes(int64(b)))
+}
+
+func (s *Server) handleAdminChannel(ch ssh.Channel,
+	reqs <-chan *ssh.Request,
+	sid string,
+	counters *sessionCounters,
+	sConn *ssh.ServerConn,
+	logger *slog.Logger) {
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer ch.Close()
@@ -816,6 +857,32 @@ func (s *Server) handleAdminChannel(ch ssh.Channel, reqs <-chan *ssh.Request, si
 	go func() {
 		for r := range reqs {
 			switch r.Type {
+			case "subsystem":
+				if string(r.Payload[4:]) == "sftp" {
+					r.Reply(true, nil)
+					s.WelcomeAdmin(ch.Stderr())
+
+					handler := &fsHandler{
+						srv:        s,
+						pubHash:    systemOwner,
+						stderr:     ch.Stderr(),
+						logger:     *logger.WithGroup("admin"),
+						remoteAddr: sConn.RemoteAddr(),
+						sessionID:  sid,
+						isBanned:   false,
+						isAdmin:    true,
+						counters:   counters,
+					}
+
+					server := sftp.NewRequestServer(ch, sftp.Handlers{
+						FileGet: handler, FilePut: handler, FileCmd: handler, FileList: handler,
+					})
+					server.Serve()
+					return
+				}
+				s.logger.Debug("rejected subsystem", "subsystem", r.Payload[4:])
+				r.Reply(false, nil)
+
 			case "pty-req":
 				c.hasPTY = true
 				r.Reply(true, nil)

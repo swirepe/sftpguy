@@ -65,7 +65,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go admin_http*.go install.go fortunes.txt
+//go:embed sftpguy.go admin.go admin_http*.go install.go iplist.go test_client.go test_server.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -282,8 +282,10 @@ func (u userStats) IsContributor(threshold int64) (bool, int64) {
 }
 
 type Store struct {
-	db     *sql.DB
-	logger *slog.Logger
+	db        *sql.DB
+	logger    *slog.Logger
+	blacklist *IPList
+	whitelist *IPList
 }
 
 func NewStore(path string, logger *slog.Logger) (*Store, error) {
@@ -299,7 +301,13 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	if _, err := db.Exec(Schema); err != nil {
 		return nil, err
 	}
-	return &Store{db: db, logger: logger}, nil
+
+	black := NewIPList(context.Background(), "blacklist.txt", logger)
+	white := NewIPList(context.Background(), "whitelist.txt", logger)
+	return &Store{db: db,
+		logger:    logger,
+		blacklist: black,
+		whitelist: white}, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
@@ -361,6 +369,14 @@ func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
 }
 
 func (s *Store) Close() error {
+	if s.blacklist != nil {
+		s.blacklist.Stop()
+	}
+
+	if s.whitelist != nil {
+		s.whitelist.Stop()
+	}
+
 	return s.db.Close()
 }
 
@@ -616,6 +632,8 @@ type Config struct {
 	BootstrapSrc            bool
 	AdminEnabled            bool
 	SshNoAuth               bool
+	SelfTest                bool
+	SelfTestContinue        bool
 }
 
 func LoadConfig() (Config, error) {
@@ -643,6 +661,9 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
+
+	EnvFlag(&cfg.SelfTest, "test", "SELF_TEST", false, "Run integration self-test suite after startup then exit")
+	EnvFlag(&cfg.SelfTestContinue, "test.continue", "SELF_TEST_CONTINUE", false, "Run integration self-test suite after startup, then keep serving")
 
 	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
@@ -1079,34 +1100,11 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
+	loginType := loginTypeFromHash(pubHash)
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 	sessionStarted := time.Now()
 	sessionCounts := &sessionCounters{}
 
-	if s.cfg.AdminEnabled && s.isAdminConn(sConn.Permissions) {
-		// ── Admin fast-path ───────────────────────────────────────────
-		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
-		go ssh.DiscardRequests(reqs)
-		for newCh := range chans {
-			if newCh.ChannelType() != "session" {
-				newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
-				continue
-			}
-			ch, chReqs, _ := newCh.Accept()
-			go s.handleAdminChannel(ch, chReqs, sessionID)
-		}
-		return
-	}
-
-	stats, _ := s.store.UpsertUserSession(pubHash)
-	logger := s.logger.With(s.userGroup(pubHash, sessionID, sConn.RemoteAddr()))
-	isBanned := s.store.IsBanned(pubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
-	loginType := loginTypeFromHash(pubHash)
-
-	s.store.LogEvent(EventSessionStart, pubHash, sessionID, sConn.RemoteAddr(),
-		"login_type", loginType,
-		"banned", isBanned,
-	)
 	defer func() {
 		duration := time.Since(sessionStarted)
 		s.store.LogEvent(EventSessionEnd, pubHash, sessionID, sConn.RemoteAddr(),
@@ -1120,6 +1118,31 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 			"denied", sessionCounts.denied.Load(),
 		)
 	}()
+
+	logger := s.logger.With(s.userGroup(pubHash, sessionID, sConn.RemoteAddr()))
+	if s.cfg.AdminEnabled && s.isAdminConn(sConn.Permissions) {
+		// ── Admin fast-path ───────────────────────────────────────────
+		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
+		go ssh.DiscardRequests(reqs)
+		for newCh := range chans {
+			if newCh.ChannelType() != "session" {
+				newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
+				continue
+			}
+			ch, chReqs, _ := newCh.Accept()
+			go s.handleAdminChannel(ch, chReqs, sessionID, sessionCounts, sConn, s.logger)
+		}
+		return
+	}
+
+	stats, _ := s.store.UpsertUserSession(pubHash)
+
+	isBanned := s.store.IsBanned(pubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
+
+	s.store.LogEvent(EventSessionStart, pubHash, sessionID, sConn.RemoteAddr(),
+		"login_type", loginType,
+		"banned", isBanned,
+	)
 
 	logger.Info("login", "banned", isBanned)
 	go ssh.DiscardRequests(reqs)
@@ -1144,8 +1167,8 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	logger *slog.Logger,
 	isBanned bool,
 	counters *sessionCounters) {
-
 	defer ch.Close()
+
 	for req := range reqs {
 		s.logger.Debug("handleChannel", "req", req)
 		switch req.Type {
@@ -1162,6 +1185,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 					remoteAddr: sConn.RemoteAddr(),
 					sessionID:  sessionID,
 					isBanned:   isBanned,
+					isAdmin:    false,
 					counters:   counters,
 				}
 				handler.logLogin(stats)
@@ -1452,6 +1476,7 @@ type fsHandler struct {
 	sessionID   string
 	readLimiter *rate.Limiter // nil if not banned
 	isBanned    bool
+	isAdmin     bool
 	counters    *sessionCounters
 }
 
@@ -1769,7 +1794,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 }
 
 func (h *fsHandler) canModify(meta *pathMeta) error {
-	if !meta.exists || meta.owner == "" {
+	if h.isAdmin || !meta.exists || meta.owner == "" {
 		return nil
 	}
 
@@ -2500,11 +2525,30 @@ func main() {
 			logger.Error("ssh listener failed", "err", err)
 		}
 	}()
+
 	if cfg.AdminHTTP != "" {
 		go func() {
 			if err := srv.ListenAdminHTTP(); err != nil {
 				logger.Error("admin http listener failed", "err", err)
 			}
+		}()
+	}
+
+	if cfg.SelfTest || cfg.SelfTestContinue {
+		go func() {
+			tStart := time.Now()
+			failures := RunSelfTest(srv, cfg, logger)
+			logger.Info("Self test complete", "failures", failures, "duration", time.Since(tStart))
+			if cfg.SelfTestContinue {
+				// Keep serving regardless of result; operator can inspect logs.
+				return
+			}
+			// -test: always exit, code reflects pass/fail.
+			srv.Shutdown()
+			if failures > 0 {
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}()
 	}
 

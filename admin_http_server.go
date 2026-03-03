@@ -17,6 +17,8 @@ func (s *Server) ListenAdminHTTP() error {
 		http.Redirect(w, r, "/admin", http.StatusFound)
 	})
 	mux.HandleFunc("/admin", s.adminAuth(s.handleAdminPage))
+	mux.HandleFunc("/admin/static/admin.css", s.adminAuth(s.handleAdminCSS))
+	mux.HandleFunc("/admin/static/admin.js", s.adminAuth(s.handleAdminJS))
 	mux.HandleFunc("/admin/api/health", s.adminAuth(s.handleAdminHealth))
 	mux.HandleFunc("/admin/api/summary", s.adminAuth(s.handleAdminSummary))
 	mux.HandleFunc("/admin/api/users", s.adminAuth(s.handleAdminUsers))
@@ -87,5 +89,25 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(adminHTML))
+	_, _ = w.Write(adminHTML)
+}
+
+func (s *Server) handleAdminCSS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(adminCSS)
+}
+
+func (s *Server) handleAdminJS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(adminJS)
 }
