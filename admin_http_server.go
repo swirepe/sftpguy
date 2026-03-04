@@ -1,91 +1,111 @@
 package main
 
 import (
-	"errors"
+	"context"
+	"log/slog"
 	"net/http"
-	"strings"
-	"time"
+
+	"sftpguy/internal/adminhttp"
 )
 
 func (s *Server) ListenAdminHTTP() error {
-	if s.cfg.AdminHTTP == "" {
-		return nil
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin", http.StatusFound)
-	})
-	mux.HandleFunc("/admin", s.adminAuth(s.handleAdminPage))
-	mux.HandleFunc("/admin/static/admin.css", s.adminAuth(s.handleAdminCSS))
-	mux.HandleFunc("/admin/static/admin.js", s.adminAuth(s.handleAdminJS))
-	mux.HandleFunc("/admin/api/health", s.adminAuth(s.handleAdminHealth))
-	mux.HandleFunc("/admin/api/summary", s.adminAuth(s.handleAdminSummary))
-	mux.HandleFunc("/admin/api/users", s.adminAuth(s.handleAdminUsers))
-	mux.HandleFunc("/admin/api/users/", s.adminAuth(s.handleAdminUser))
-	mux.HandleFunc("/admin/api/files", s.adminAuth(s.handleAdminFiles))
-	mux.HandleFunc("/admin/api/files/search", s.adminAuth(s.handleAdminFileSearch))
-	mux.HandleFunc("/admin/api/audit", s.adminAuth(s.handleAdminAudit))
-	mux.HandleFunc("/admin/api/auth-attempts", s.adminAuth(s.handleAdminAuthAttempts))
-	mux.HandleFunc("/admin/api/events", s.adminAuth(s.handleAdminEvents))
-	mux.HandleFunc("/admin/api/events/stream", s.adminAuth(s.handleAdminEventStream))
-	mux.HandleFunc("/admin/api/insights", s.adminAuth(s.handleAdminInsights))
-	mux.HandleFunc("/admin/api/sessions", s.adminAuth(s.handleAdminSessions))
-	mux.HandleFunc("/admin/api/sessions/", s.adminAuth(s.handleAdminSessionTimeline))
-	mux.HandleFunc("/admin/api/uploads/recent", s.adminAuth(s.handleAdminRecentUploads))
-	mux.HandleFunc("/admin/api/actor", s.adminAuth(s.handleAdminActor))
-	mux.HandleFunc("/admin/api/system-log", s.adminAuth(s.handleAdminSystemLog))
-	mux.HandleFunc("/admin/api/system-log/parsed", s.adminAuth(s.handleAdminParsedSystemLog))
-	mux.HandleFunc("/admin/api/banned", s.adminAuth(s.handleAdminBanned))
-	mux.HandleFunc("/admin/api/banned/ip", s.adminAuth(s.handleAdminBanIP))
-	mux.HandleFunc("/admin/api/banned/ip/", s.adminAuth(s.handleAdminUnbanIP))
-	mux.HandleFunc("/admin/api/ip-lists", s.adminAuth(s.handleAdminIPLists))
-	mux.HandleFunc("/admin/api/ip-lists/test", s.adminAuth(s.handleAdminIPListTest))
-	mux.HandleFunc("/admin/api/ip-lists/", s.adminAuth(s.handleAdminIPList))
-	mux.HandleFunc("/admin/api/self-test", s.adminAuth(s.handleAdminSelfTest))
-	mux.HandleFunc("/admin/api/self-test/run", s.adminAuth(s.handleAdminSelfTestRun))
-
-	httpServer := &http.Server{
-		Addr:              s.cfg.AdminHTTP,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	s.adminShutdownMu.Lock()
-	s.adminShutdown = httpServer.Shutdown
-	s.adminShutdownMu.Unlock()
-	defer func() {
-		s.adminShutdownMu.Lock()
-		s.adminShutdown = nil
-		s.adminShutdownMu.Unlock()
-	}()
-
-	s.logger.Info("admin http console online", "addr", s.cfg.AdminHTTP, "token_required", s.cfg.AdminHTTPToken != "")
-	if err := httpServer.ListenAndServe(); err != nil {
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return adminhttp.Listen(s.adminHTTPDeps())
 }
 
-func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AdminHTTPToken == "" {
-			next(w, r)
-			return
-		}
+func (s *Server) adminHTTPDeps() *adminHTTPDeps {
+	return &adminHTTPDeps{srv: s}
+}
 
-		header := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(header, prefix) || strings.TrimSpace(strings.TrimPrefix(header, prefix)) != s.cfg.AdminHTTPToken {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="sftpguy-admin"`)
-			http.Error(w, "admin token required", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
+type adminHTTPDeps struct {
+	srv *Server
+}
+
+func (d *adminHTTPDeps) AdminHTTPConfig() adminhttp.Config {
+	return adminhttp.Config{
+		Addr:  d.srv.cfg.AdminHTTP,
+		Token: d.srv.cfg.AdminHTTPToken,
 	}
+}
+
+func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
+	return adminhttp.RouteHandlers{
+		Page:            d.srv.handleAdminPage,
+		CSS:             d.srv.handleAdminCSS,
+		JS:              d.srv.handleAdminJS,
+		Health:          adminhttp.HealthHandler(d),
+		Summary:         adminhttp.SummaryHandler(d),
+		Users:           d.srv.handleAdminUsers,
+		User:            d.srv.handleAdminUser,
+		Files:           d.srv.handleAdminFiles,
+		FileSearch:      d.srv.handleAdminFileSearch,
+		Audit:           d.srv.handleAdminAudit,
+		AuthAttempts:    d.srv.handleAdminAuthAttempts,
+		Events:          d.srv.handleAdminEvents,
+		EventStream:     d.srv.handleAdminEventStream,
+		Insights:        d.srv.handleAdminInsights,
+		Sessions:        d.srv.handleAdminSessions,
+		SessionTimeline: d.srv.handleAdminSessionTimeline,
+		RecentUploads:   d.srv.handleAdminRecentUploads,
+		Actor:           d.srv.handleAdminActor,
+		SystemLog:       d.srv.handleAdminSystemLog,
+		ParsedSystemLog: d.srv.handleAdminParsedSystemLog,
+		Banned:          d.srv.handleAdminBanned,
+		BanIP:           d.srv.handleAdminBanIP,
+		UnbanIP:         d.srv.handleAdminUnbanIP,
+		IPLists:         d.srv.handleAdminIPLists,
+		IPListTest:      d.srv.handleAdminIPListTest,
+		IPList:          d.srv.handleAdminIPList,
+		SelfTest:        d.srv.handleAdminSelfTest,
+		SelfTestRun:     d.srv.handleAdminSelfTestRun,
+	}
+}
+
+func (d *adminHTTPDeps) SetAdminShutdown(fn func(context.Context) error) {
+	d.srv.adminShutdownMu.Lock()
+	d.srv.adminShutdown = fn
+	d.srv.adminShutdownMu.Unlock()
+}
+
+func (d *adminHTTPDeps) ClearAdminShutdown() {
+	d.srv.adminShutdownMu.Lock()
+	d.srv.adminShutdown = nil
+	d.srv.adminShutdownMu.Unlock()
+}
+
+func (d *adminHTTPDeps) Logger() *slog.Logger {
+	return d.srv.logger
+}
+
+func (d *adminHTTPDeps) ArchiveName() string {
+	return d.srv.cfg.Name
+}
+
+func (d *adminHTTPDeps) AppVersion() string {
+	return AppVersion
+}
+
+func (d *adminHTTPDeps) SSHPort() int {
+	return d.srv.cfg.Port
+}
+
+func (d *adminHTTPDeps) AdminHTTPAddr() string {
+	return d.srv.cfg.AdminHTTP
+}
+
+func (d *adminHTTPDeps) ContributorThreshold() int64 {
+	return d.srv.cfg.ContributorThreshold
+}
+
+func (d *adminHTTPDeps) BannerStats(threshold int64) (users, contributors, files, bytes uint64) {
+	return d.srv.store.GetBannerStats(threshold)
+}
+
+func (d *adminHTTPDeps) DirectoryCount() (int, error) {
+	return d.srv.store.GetDirectoryCount()
+}
+
+func (d *adminHTTPDeps) FormatBytes(n int64) string {
+	return formatBytes(n)
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {

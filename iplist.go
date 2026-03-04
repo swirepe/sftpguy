@@ -138,6 +138,11 @@ func (bl *IPList) Reload(filepath string) (entries int, addresses uint64, err er
 	return entries, addresses, nil
 }
 
+// reload is kept for backward compatibility with existing tests/helpers.
+func (bl *IPList) reload(filepath string) (entries int, addresses uint64, err error) {
+	return bl.Reload(filepath)
+}
+
 // normalizeIPPattern converts 1.2.*.* to 1.2.0.0/16
 func normalizeIPPattern(input string) string {
 	if !strings.Contains(input, "*") {

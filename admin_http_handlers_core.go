@@ -8,37 +8,16 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"sftpguy/internal/adminhttp"
 )
 
 func (s *Server) handleAdminHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"archive": s.cfg.Name,
-		"version": AppVersion,
-		"time":    time.Now().UTC().Format(time.RFC3339),
-	})
+	adminhttp.HealthHandler(s.adminHTTPDeps())(w, r)
 }
 
 func (s *Server) handleAdminSummary(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	u, c, f, b := s.store.GetBannerStats(s.cfg.ContributorThreshold)
-	dirCount, _ := s.store.GetDirectoryCount()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"archive":               s.cfg.Name,
-		"version":               AppVersion,
-		"ssh_port":              s.cfg.Port,
-		"admin_http":            s.cfg.AdminHTTP,
-		"users":                 u,
-		"contributors":          c,
-		"files":                 f,
-		"directories":           dirCount,
-		"bytes":                 b,
-		"formatted_bytes":       formatBytes(int64(b)),
-		"contributor_threshold": s.cfg.ContributorThreshold,
-	})
+	adminhttp.SummaryHandler(s.adminHTTPDeps())(w, r)
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
