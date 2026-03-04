@@ -31,7 +31,7 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 		cancel: cancel,
 	}
 
-	if entries, addresses, err := bl.reload(filepath); err != nil {
+	if entries, addresses, err := bl.Reload(filepath); err != nil {
 		log.Warn("initial ip list load failed", "error", err)
 	} else {
 		log.Info("initial ip list load complete", "entries", entries, "addresses", addresses)
@@ -46,7 +46,7 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 			select {
 			case <-ticker.C:
 				start := time.Now()
-				entries, addresses, err := bl.reload(filepath)
+				entries, addresses, err := bl.Reload(filepath)
 
 				bl.logger.Debug("reloaded ip list file",
 					"entries", entries,
@@ -70,7 +70,7 @@ func (bl *IPList) Stop() {
 	}
 }
 
-func (bl *IPList) reload(filepath string) (entries int, addresses uint64, err error) {
+func (bl *IPList) Reload(filepath string) (entries int, addresses uint64, err error) {
 	newRanger := cidranger.NewPCTrieRanger()
 
 	file, err := os.Open(filepath)

@@ -26,17 +26,25 @@
       sessionTimeline: null,
       lastEventID: 0,
       selfTest: { running: false, run_id: 0, started_at: "", running_for: "", last_report: null },
-      selfTestPollTimer: 0
+      selfTestPollTimer: 0,
+      ipLists: {
+        whitelist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+        blacklist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+        test: null
+      }
     };
 
     function setStatus(msg) { document.getElementById("status").textContent = msg; }
     function esc(v) {
       return String(v == null ? "" : v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
     }
-    function shortSession(v) {
+    function shortHash(v) {
       const s = String(v || "");
-      if (s.length <= 16) return s;
-      return s.slice(0, 8) + ".." + s.slice(-6);
+      if (s.length <= 12) return s;
+      return s.slice(0, 12);
+    }
+    function shortSession(v) {
+      return shortHash(v);
     }
     function formatBytes(n) {
       let x = Number(n || 0);
@@ -124,7 +132,9 @@
     function setTabCount(name, count) {
       const el = document.querySelector(".tab[data-tab='" + name + "']");
       if (!el) return;
-      const base = name === "selftest" ? "Self Test" : (name.charAt(0).toUpperCase() + name.slice(1));
+      const base = name === "selftest" ? "Self Test" :
+        name === "iplists" ? "IP Lists" :
+        (name.charAt(0).toUpperCase() + name.slice(1));
       el.textContent = count == null ? base : (base + " (" + count + ")");
     }
 
@@ -213,7 +223,7 @@
         return "<code>" + esc(hash || "-") + "</code>";
       }
       const enc = encodeURIComponent(hash);
-      return "<button class=\"owner-link\" onclick=\"openActor('user', decodeURIComponent('" + enc + "'))\"><code>" + esc(hash) + "</code></button>" +
+      return "<button class=\"owner-link\" onclick=\"openActor('user', decodeURIComponent('" + enc + "'))\"><code title=\"" + esc(hash) + "\">" + esc(shortHash(hash)) + "</code></button>" +
         " <button class=\"tiny\" onclick=\"copyText('" + esc(hash) + "')\">Copy</button>";
     }
     function ipCell(ip) {
@@ -226,7 +236,8 @@
       const value = String(session || "");
       if (!value) return "<code>-</code>";
       const enc = encodeURIComponent(value);
-      return "<button class=\"owner-link\" onclick=\"openSessionTimeline(decodeURIComponent('" + enc + "'))\"><code>" + esc(shortSession(value)) + "</code></button>";
+      return "<button class=\"owner-link\" onclick=\"openSessionTimeline(decodeURIComponent('" + enc + "'))\"><code title=\"" + esc(value) + "\">" + esc(shortSession(value)) + "</code></button>" +
+        " <button class=\"tiny\" onclick=\"copyText('" + esc(value) + "')\">Copy</button>";
     }
 
     function closeActorDrawer() {
@@ -706,8 +717,8 @@
             "<code>" + esc(a.username || "") + "</code>",
             "<code>" + esc(a.password || "") + "</code>",
             ipCell(a.ip || ""),
-            "<code>" + esc(shortSession(a.session || "")) + "</code>",
-            "<code>" + esc(a.user_id || "") + "</code>",
+            sessionCell(a.session || ""),
+            ownerCell(a.user_id || ""),
             "<button class=\"tiny\" onclick=\"copyText('" + esc((a.username || "") + ":" + (a.password || "")) + "')\">Copy user:pass</button>"
           ]
         };
@@ -848,7 +859,7 @@
       });
       document.getElementById("session-out").innerHTML =
         "<div class=\"row\"><h3>Session Timeline</h3><button class=\"tiny\" onclick=\"closeSessionTimeline()\">Close</button></div>" +
-        "<div class=\"muted\">session=<code>" + esc(d.session || "") + "</code> user=" + ownerCell(d.user_id) + " ip=" + ipCell(d.ip) + " start=<code>" + esc(d.start_time || "") + "</code> end=<code>" + esc(d.end_time || "") + "</code></div>" +
+        "<div class=\"muted\">session=" + sessionCell(d.session || "") + " user=" + ownerCell(d.user_id) + " ip=" + ipCell(d.ip) + " start=<code>" + esc(d.start_time || "") + "</code> end=<code>" + esc(d.end_time || "") + "</code></div>" +
         renderActionTimeline(events, { empty: "No session events" });
     }
 
@@ -915,6 +926,93 @@
       document.getElementById("banned-out").innerHTML =
         "<h3>Pubkey bans</h3>" + renderSimpleTable(["Hash", "Banned At", "Action"], hashRows) +
         "<h3>IP bans</h3>" + renderSimpleTable(["IP", "Banned At", "Action"], ipRows);
+    }
+
+    async function loadIPLists() {
+      const d = await api("/admin/api/ip-lists");
+      state.ipLists = {
+        whitelist: (d && d.whitelist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+        blacklist: (d && d.blacklist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+        test: state.ipLists ? state.ipLists.test : null
+      };
+
+      const wlEditor = document.getElementById("iplist-whitelist-content");
+      const blEditor = document.getElementById("iplist-blacklist-content");
+      if (wlEditor && document.activeElement !== wlEditor) wlEditor.value = state.ipLists.whitelist.content || "";
+      if (blEditor && document.activeElement !== blEditor) blEditor.value = state.ipLists.blacklist.content || "";
+
+      setTabCount("iplists", null);
+      renderIPLists();
+    }
+
+    function renderIPLists() {
+      const wl = (state.ipLists || {}).whitelist || {};
+      const bl = (state.ipLists || {}).blacklist || {};
+      const test = (state.ipLists || {}).test || null;
+
+      const wlMeta = "path=<code>" + esc(wl.path || "") + "</code> entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
+      const blMeta = "path=<code>" + esc(bl.path || "") + "</code> entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
+      document.getElementById("iplist-whitelist-meta").innerHTML = wlMeta;
+      document.getElementById("iplist-blacklist-meta").innerHTML = blMeta;
+      document.getElementById("iplist-whitelist-invalid").innerHTML = (wl.invalid_lines || []).length
+        ? ("Invalid lines: <code>" + esc((wl.invalid_lines || []).join(", ")) + "</code>")
+        : "";
+      document.getElementById("iplist-blacklist-invalid").innerHTML = (bl.invalid_lines || []).length
+        ? ("Invalid lines: <code>" + esc((bl.invalid_lines || []).join(", ")) + "</code>")
+        : "";
+
+      if (!test) {
+        document.getElementById("iplist-test-out").innerHTML = "<div class=\"muted\">Enter an IP to test effective ban behavior.</div>";
+        return;
+      }
+      const m = test.matches || {};
+      document.getElementById("iplist-test-out").innerHTML =
+        "<div class=\"row\">" +
+          "<span class=\"pill\">ip <code>" + esc(test.ip || "") + "</code></span>" +
+          "<span class=\"tag " + (m.whitelist ? "ok" : "") + "\">whitelist=" + esc(m.whitelist ? "yes" : "no") + "</span>" +
+          "<span class=\"tag " + (m.blacklist ? "bad" : "") + "\">blacklist=" + esc(m.blacklist ? "yes" : "no") + "</span>" +
+          "<span class=\"tag " + (m.db_banned ? "warn" : "") + "\">db_banned=" + esc(m.db_banned ? "yes" : "no") + "</span>" +
+          "<span class=\"tag " + (m.effective_banned ? "bad" : "ok") + "\">effective=" + esc(m.effective_banned ? "BANNED" : "ALLOWED") + "</span>" +
+        "</div>" +
+        "<div class=\"muted\">Whitelist has highest precedence.</div>";
+    }
+
+    async function saveIPList(kind) {
+      const editorID = kind === "whitelist" ? "iplist-whitelist-content" : "iplist-blacklist-content";
+      const editor = document.getElementById(editorID);
+      if (!editor) return;
+      const content = editor.value || "";
+      const d = await api("/admin/api/ip-lists/" + encodeURIComponent(kind), {
+        method: "POST",
+        body: JSON.stringify({ content: content })
+      });
+      const info = (d && d.list) || {};
+      if (!state.ipLists) state.ipLists = {};
+      state.ipLists[kind] = {
+        path: info.path || "",
+        content: info.content || content,
+        entries: Number(info.entries || 0),
+        invalid_count: Number(info.invalid_count || 0),
+        invalid_lines: info.invalid_lines || []
+      };
+      editor.value = state.ipLists[kind].content || "";
+      addHistory("saved " + kind + " ip list");
+      toast("Saved " + kind);
+      renderIPLists();
+    }
+
+    async function testIPList() {
+      const input = document.getElementById("iplist-test-ip");
+      const ip = (input && input.value ? input.value : "").trim();
+      if (!ip) return;
+      const d = await api("/admin/api/ip-lists/test", {
+        method: "POST",
+        body: JSON.stringify({ ip: ip })
+      });
+      if (!state.ipLists) state.ipLists = {};
+      state.ipLists.test = d || null;
+      addHistory("tested ip list for " + ip);
+      renderIPLists();
     }
 
     function clearSelfTestPoll() {
@@ -1006,7 +1104,7 @@
               };
             });
             return "<div class=\"suite-session\">" +
-              "<div class=\"muted\">session=<code>" + esc(sessionBlock.session || "") + "</code> ip=" + ipCell(sessionBlock.ip || "") + " duration=<code>" + esc((sessionBlock.duration_sec || 0) + "s") + "</code></div>" +
+              "<div class=\"muted\">session=" + sessionCell(sessionBlock.session || "") + " ip=" + ipCell(sessionBlock.ip || "") + " duration=<code>" + esc((sessionBlock.duration_sec || 0) + "s") + "</code></div>" +
               renderActionTimeline(actions, { empty: "No actions for this session" }) +
             "</div>";
           }).join("");
@@ -1047,6 +1145,7 @@
       const s = d.summary || {};
       const stats = s.user_stats || {};
       const isUser = d.actor_type === "user";
+      const actorDisplay = isUser ? ownerCell(d.actor) : ipCell(d.actor);
 
       const uploadRows = (d.recent_uploads || []).slice(0, 20).map(function(u) {
         return ["<code>" + esc(u.time || "") + "</code>", "<code>" + esc(u.path || "") + "</code>", esc(formatBytes(u.delta || 0)), sessionCell(u.session)];
@@ -1068,7 +1167,7 @@
 
       document.getElementById("actor-out").innerHTML =
         "<div class=\"row\"><h3>Actor Drawer</h3><button class=\"tiny\" onclick=\"closeActorDrawer()\">Close</button></div>" +
-        "<div class=\"row\"><span class=\"pill\">" + esc(d.actor_type || "") + "</span><b><code>" + esc(d.actor || "") + "</code></b>" +
+        "<div class=\"row\"><span class=\"pill\">" + esc(d.actor_type || "") + "</span><b>" + actorDisplay + "</b>" +
           "<span class=\"tag " + (s.is_banned ? "bad" : "ok") + "\">" + (s.is_banned ? "BANNED" : "ACTIVE") + "</span>" +
           actionButtons +
         "</div>" +
@@ -1083,12 +1182,13 @@
     async function userAction(hash, action) {
       if (!hash || hash === "system") return;
       if (action === "purge" && !confirm("Purge " + hash + "? This deletes files and metadata.")) return;
-      await api("/admin/api/users/" + encodeURIComponent(hash) + "/" + action, { method: "POST" });
-      toast((action + " " + hash).toUpperCase());
-      addHistory(action + " owner " + hash);
+      const resp = await api("/admin/api/users/" + encodeURIComponent(hash) + "/" + action, { method: "POST" });
+      const userID = (resp && resp.user) ? resp.user : hash;
+      toast((action + " " + shortHash(userID)).toUpperCase());
+      addHistory(action + " owner " + userID);
       await Promise.all([loadUsers(), loadBanned(), loadAudit(), loadSessions(), loadUploads()]);
-      if (state.actor && state.actor.actor_type === "user" && state.actor.actor === hash) {
-        await openActor("user", hash);
+      if (state.actor && state.actor.actor_type === "user" && state.actor.actor === userID) {
+        await openActor("user", userID);
       }
     }
 
@@ -1200,6 +1300,7 @@
       if (state.activeTab === "uploads") renderUploads();
       if (state.activeTab === "banned") renderBanned();
       if (state.activeTab === "selftest") renderSelfTest();
+      if (state.activeTab === "iplists") renderIPLists();
       renderActorDrawer();
       renderSessionTimeline();
     }
@@ -1207,6 +1308,9 @@
     async function refreshAll() {
       try {
         await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
+        if (state.activeTab === "iplists") {
+          await loadIPLists();
+        }
         if (state.fileSearch && state.fileSearch.q) {
           await searchFiles();
         }
@@ -1237,7 +1341,8 @@
             state.activeTab === "auth" ? loadAuthAttempts :
             state.activeTab === "sessions" ? loadSessions :
             state.activeTab === "uploads" ? loadUploads :
-            state.activeTab === "banned" ? loadBanned : loadSelfTest;
+            state.activeTab === "banned" ? loadBanned :
+            state.activeTab === "selftest" ? loadSelfTest : loadIPLists;
           fn().catch(function(err) { setStatus("error: " + err.message); });
         }, seconds * 1000);
         addHistory("enabled auto-refresh every " + seconds + "s");
@@ -1251,7 +1356,7 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
@@ -1265,7 +1370,8 @@
         name === "auth" ? loadAuthAttempts :
         name === "sessions" ? loadSessions :
         name === "uploads" ? loadUploads :
-        name === "banned" ? loadBanned : loadSelfTest;
+        name === "banned" ? loadBanned :
+        name === "selftest" ? loadSelfTest : loadIPLists;
       fn().catch(function(err) { setStatus("error: " + err.message); });
     }
 
@@ -1275,8 +1381,8 @@
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0"].includes(e.key)) {
-        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-"].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"iplists"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {

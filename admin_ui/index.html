@@ -11,7 +11,7 @@
     <div class="card">
       <h1>sftpguy web admin console</h1>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -50,7 +50,7 @@
         <button onclick="exportAuditCSV()">Export Audit CSV</button>
       </div>
       <div class="row">
-        <input id="quick-owner" placeholder="owner hash" />
+        <input id="quick-owner" placeholder="owner hash (short or full)" />
         <button class="btn-danger" onclick="quickBanOwner()">Ban Owner</button>
         <button class="btn-good" onclick="quickUnbanOwner()">Unban Owner</button>
         <button onclick="quickOpenOwner()">Open Actor</button>
@@ -76,6 +76,7 @@
         <button class="tab" data-tab="uploads">Uploads</button>
         <button class="tab" data-tab="banned">Banned</button>
         <button class="tab" data-tab="selftest">Self Test</button>
+        <button class="tab" data-tab="iplists">IP Lists</button>
       </div>
     </div>
 
@@ -168,6 +169,38 @@
         <button onclick="loadSelfTest()">Refresh</button>
       </div>
       <div id="selftest-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-iplists">
+      <div class="row">
+        <button onclick="loadIPLists()">Refresh</button>
+      </div>
+      <div class="grid iplists-grid">
+        <div class="iplist-box">
+          <h3>Whitelist</h3>
+          <div class="muted" id="iplist-whitelist-meta"></div>
+          <textarea id="iplist-whitelist-content" spellcheck="false" class="editor"></textarea>
+          <div class="row">
+            <button class="btn-good" onclick="saveIPList('whitelist')">Save Whitelist</button>
+          </div>
+          <div class="muted" id="iplist-whitelist-invalid"></div>
+        </div>
+        <div class="iplist-box">
+          <h3>Blacklist</h3>
+          <div class="muted" id="iplist-blacklist-meta"></div>
+          <textarea id="iplist-blacklist-content" spellcheck="false" class="editor"></textarea>
+          <div class="row">
+            <button class="btn-danger" onclick="saveIPList('blacklist')">Save Blacklist</button>
+          </div>
+          <div class="muted" id="iplist-blacklist-invalid"></div>
+        </div>
+      </div>
+      <h3>Test IP</h3>
+      <div class="row">
+        <input id="iplist-test-ip" placeholder="IP address (e.g. 1.2.3.4)" />
+        <button onclick="testIPList()">Test</button>
+      </div>
+      <div id="iplist-test-out"></div>
     </div>
   </div>
   <div class="toast" id="toast"></div>

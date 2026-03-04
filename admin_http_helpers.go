@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -240,4 +242,124 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+var (
+	errAdminLookupNotFound  = errors.New("identifier not found")
+	errAdminLookupAmbiguous = errors.New("identifier is ambiguous")
+)
+
+func normalizeAdminLookupToken(token string) string {
+	token = strings.TrimSpace(token)
+	token = strings.ReplaceAll(token, "…", "")
+	token = strings.ReplaceAll(token, "..", "")
+	return strings.TrimSpace(token)
+}
+
+func resolveAdminUserHash(db *sql.DB, token string) (string, error) {
+	token = normalizeAdminLookupToken(token)
+	if token == "" {
+		return "", errAdminLookupNotFound
+	}
+	if token == systemOwner {
+		return token, nil
+	}
+
+	// Exact match across known user-id sources.
+	var exact string
+	_ = db.QueryRow(`
+		SELECT hash FROM (
+			SELECT pubkey_hash AS hash FROM users
+			UNION
+			SELECT pubkey_hash AS hash FROM shadow_banned
+			UNION
+			SELECT user_id AS hash FROM log WHERE user_id != ''
+		)
+		WHERE hash = ?
+		LIMIT 1`, token).Scan(&exact)
+	if exact != "" {
+		return exact, nil
+	}
+
+	rows, err := db.Query(`
+		SELECT hash FROM (
+			SELECT pubkey_hash AS hash FROM users
+			UNION
+			SELECT pubkey_hash AS hash FROM shadow_banned
+			UNION
+			SELECT user_id AS hash FROM log WHERE user_id != ''
+		)
+		WHERE hash LIKE ?
+		ORDER BY hash
+		LIMIT 3`, token+"%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	matches := make([]string, 0, 3)
+	for rows.Next() {
+		var m string
+		if scanErr := rows.Scan(&m); scanErr == nil && strings.TrimSpace(m) != "" {
+			matches = append(matches, strings.TrimSpace(m))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	if len(matches) == 0 {
+		return "", errAdminLookupNotFound
+	}
+	if len(matches) > 1 {
+		return "", errAdminLookupAmbiguous
+	}
+	return matches[0], nil
+}
+
+func resolveAdminSessionID(db *sql.DB, token string) (string, error) {
+	token = normalizeAdminLookupToken(token)
+	if token == "" {
+		return "", errAdminLookupNotFound
+	}
+
+	var exact string
+	_ = db.QueryRow(`
+		SELECT user_session
+		FROM log
+		WHERE user_session = ? AND user_session != ''
+		LIMIT 1`, token).Scan(&exact)
+	if exact != "" {
+		return exact, nil
+	}
+
+	rows, err := db.Query(`
+		SELECT DISTINCT user_session
+		FROM log
+		WHERE user_session LIKE ? AND user_session != ''
+		ORDER BY user_session
+		LIMIT 3`, token+"%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	matches := make([]string, 0, 3)
+	for rows.Next() {
+		var m string
+		if scanErr := rows.Scan(&m); scanErr == nil && strings.TrimSpace(m) != "" {
+			matches = append(matches, strings.TrimSpace(m))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	if len(matches) == 0 {
+		return "", errAdminLookupNotFound
+	}
+	if len(matches) > 1 {
+		return "", errAdminLookupAmbiguous
+	}
+	return matches[0], nil
 }

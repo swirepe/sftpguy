@@ -39,6 +39,9 @@ func (s *Server) ListenAdminHTTP() error {
 	mux.HandleFunc("/admin/api/banned", s.adminAuth(s.handleAdminBanned))
 	mux.HandleFunc("/admin/api/banned/ip", s.adminAuth(s.handleAdminBanIP))
 	mux.HandleFunc("/admin/api/banned/ip/", s.adminAuth(s.handleAdminUnbanIP))
+	mux.HandleFunc("/admin/api/ip-lists", s.adminAuth(s.handleAdminIPLists))
+	mux.HandleFunc("/admin/api/ip-lists/test", s.adminAuth(s.handleAdminIPListTest))
+	mux.HandleFunc("/admin/api/ip-lists/", s.adminAuth(s.handleAdminIPList))
 	mux.HandleFunc("/admin/api/self-test", s.adminAuth(s.handleAdminSelfTest))
 	mux.HandleFunc("/admin/api/self-test/run", s.adminAuth(s.handleAdminSelfTestRun))
 

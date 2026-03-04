@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"net/http"
 	"sort"
@@ -431,6 +432,20 @@ func (s *Server) handleAdminSessionTimeline(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "missing session id", http.StatusBadRequest)
 		return
 	}
+	resolvedSessionID, err := resolveAdminSessionID(s.store.db, sessionID)
+	if err != nil {
+		if errors.Is(err, errAdminLookupNotFound) {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAdminLookupAmbiguous) {
+			http.Error(w, "session id is ambiguous; provide a longer session prefix", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sessionID = resolvedSessionID
 	limit := parseIntQuery(r, "limit", 400, 10, 2000)
 
 	rows, err := s.store.db.Query(`
@@ -620,6 +635,21 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		whereField = "ip_address"
+	} else {
+		resolvedUser, err := resolveAdminUserHash(s.store.db, value)
+		if err != nil {
+			if errors.Is(err, errAdminLookupNotFound) {
+				http.Error(w, "user not found", http.StatusNotFound)
+				return
+			}
+			if errors.Is(err, errAdminLookupAmbiguous) {
+				http.Error(w, "user id is ambiguous; provide a longer hash prefix", http.StatusConflict)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		value = resolvedUser
 	}
 
 	eventRows, err := s.store.db.Query(`

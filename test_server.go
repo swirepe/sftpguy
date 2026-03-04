@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -71,16 +72,26 @@ type selfTestRunner struct {
 	cfg         Config
 	log         *slog.Logger
 	knownHashes []string
+	knownUsers  map[string]string
 }
 
 func (r *selfTestRunner) run() SelfTestReport {
 	startedAt := time.Now().UTC()
 
 	// ── identities ────────────────────────────────────────────────────────────
-	firstAuth, firstLabel := r.newPubKeyAuth()
-	secondAuth, secondLabel := r.newPubKeyAuth()
+	firstAuth, firstLabel, firstHash := r.newPubKeyAuth()
+	secondAuth, secondLabel, secondHash := r.newPubKeyAuth()
 	banVictimAuth, banVictimLabel, banVictimHash := r.newPubKeyAuthWithHash()
-	kbAuth, kbLabel := r.newKbAuth()
+	kbAuth, kbLabel, kbHash := r.newKbAuth()
+
+	r.rememberTestUser(firstHash, "first ("+firstLabel+")")
+	r.rememberTestUser(secondHash, "second ("+secondLabel+")")
+	r.rememberTestUser(banVictimHash, "ban_victim ("+banVictimLabel+")")
+	r.rememberTestUser(kbHash, "kbint ("+kbLabel+")")
+	if r.cfg.SshNoAuth {
+		r.rememberActivityUser(stAnonHash("127.0.0.1"), "noauth (127.0.0.1)")
+		r.rememberActivityUser(stAnonHash("::1"), "noauth (::1)")
+	}
 
 	r.log.Info("identities",
 		"first", firstLabel,
@@ -130,8 +141,32 @@ func (r *selfTestRunner) run() SelfTestReport {
 // Suites
 // ============================================================================
 
+func (r *selfTestRunner) startSuite(name string) *stSuite {
+	s := newStSuite(name)
+	s.logStartID = r.maxLogID()
+	return s
+}
+
+func (r *selfTestRunner) finishSuite(s *stSuite) {
+	if s == nil {
+		return
+	}
+	s.finish()
+	s.logEndID = r.maxLogID()
+}
+
+func (r *selfTestRunner) maxLogID() int64 {
+	var id int64
+	if err := r.srv.store.db.QueryRow(`SELECT IFNULL(MAX(id), 0) FROM log`).Scan(&id); err != nil {
+		r.log.Debug("failed to read max log id", "err", err)
+		return 0
+	}
+	return id
+}
+
 func (r *selfTestRunner) runSetup(auth ssh.AuthMethod, preexisting string) *stSuite {
-	s := newStSuite("Setup")
+	s := r.startSuite("Setup")
+	defer r.finishSuite(s)
 	sshCli, sftpCli, err := r.openSFTP(auth)
 	s.check("connect as first user", err)
 	if err != nil {
@@ -144,7 +179,8 @@ func (r *selfTestRunner) runSetup(auth ssh.AuthMethod, preexisting string) *stSu
 }
 
 func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMethod) *stSuite {
-	s := newStSuite("Non-owner: " + label)
+	s := r.startSuite("Non-owner: " + label)
+	defer r.finishSuite(s)
 
 	sfx := stRandHex()
 	newFile := "selftest_new_" + sfx + ".txt"
@@ -153,7 +189,7 @@ func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMet
 	// 1. Basic SSH security checks (Protocol level)
 	probeAuth := auth
 	if auth == nil {
-		probeAuth, _ = r.newKbAuth()
+		probeAuth, _, _ = r.newKbAuth()
 	}
 	s.wantFail("exec rejected", r.tryExec(probeAuth))
 	s.wantFail("shell rejected", r.tryShell(probeAuth))
@@ -223,7 +259,8 @@ func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMet
 func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 	sysName := "selftest_sysfile_" + stRandHex() + ".txt"
 
-	s := newStSuite("System file protection (" + sysName + ")")
+	s := r.startSuite("System file protection (" + sysName + ")")
+	defer r.finishSuite(s)
 
 	// 1. Setup: Create file on disk and register it as unrestricted
 	fullPath := r.local(sysName)
@@ -266,7 +303,8 @@ func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 }
 
 func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, victimHash, preexisting string) *stSuite {
-	s := newStSuite("Ban / unban (" + victimLabel + ")")
+	s := r.startSuite("Ban / unban (" + victimLabel + ")")
+	defer r.finishSuite(s)
 	victimFile := "selftest_ban_" + stRandHex() + ".txt"
 
 	// 1. Setup file
@@ -313,7 +351,8 @@ func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, vic
 }
 
 func (r *selfTestRunner) runOwnerCleanup(auth ssh.AuthMethod, preexisting string) *stSuite {
-	s := newStSuite("Owner cleanup")
+	s := r.startSuite("Owner cleanup")
+	defer r.finishSuite(s)
 	sshCli, sftpCli, err := r.openSFTP(auth)
 	s.check("connect as owner", err)
 	if err != nil {
@@ -361,12 +400,15 @@ type SelfTestReport struct {
 }
 
 type SelfTestSuiteReport struct {
-	Name     string
-	Passed   int
-	Failed   int
-	Skipped  int
-	Duration time.Duration
-	Steps    []SelfTestStepReport
+	Name        string
+	Passed      int
+	Failed      int
+	Skipped     int
+	Duration    time.Duration
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	Steps       []SelfTestStepReport
+	UserActions []SelfTestUserActionsReport
 }
 
 type SelfTestStepReport struct {
@@ -379,6 +421,30 @@ type SelfTestStepReport struct {
 	Duration time.Duration
 }
 
+type SelfTestUserActionsReport struct {
+	UserID    string
+	UserLabel string
+	Sessions  []SelfTestSessionActionsReport
+}
+
+type SelfTestSessionActionsReport struct {
+	Session     string
+	IP          string
+	StartedAt   int64
+	EndedAt     int64
+	DurationSec int64
+	Actions     []SelfTestActionEvent
+}
+
+type SelfTestActionEvent struct {
+	ID        int64
+	Timestamp int64
+	Time      string
+	Event     string
+	Path      string
+	Meta      string
+}
+
 func (r *selfTestRunner) buildReport(startedAt time.Time, suites []*stSuite, runErr string) SelfTestReport {
 	report := SelfTestReport{
 		StartedAt:  startedAt.UTC(),
@@ -389,8 +455,10 @@ func (r *selfTestRunner) buildReport(startedAt time.Time, suites []*stSuite, run
 
 	for _, suite := range suites {
 		suiteReport := SelfTestSuiteReport{
-			Name:  suite.name,
-			Steps: make([]SelfTestStepReport, 0, len(suite.steps)),
+			Name:       suite.name,
+			StartedAt:  suite.start.UTC(),
+			FinishedAt: suite.endTime().UTC(),
+			Steps:      make([]SelfTestStepReport, 0, len(suite.steps)),
 		}
 		var suiteDur time.Duration
 
@@ -423,6 +491,7 @@ func (r *selfTestRunner) buildReport(startedAt time.Time, suites []*stSuite, run
 			suiteDur = suite.duration()
 		}
 		suiteReport.Duration = suiteDur.Round(time.Millisecond)
+		suiteReport.UserActions = r.collectSuiteUserActions(suite)
 
 		report.Passed += suiteReport.Passed
 		report.Failed += suiteReport.Failed
@@ -436,6 +505,154 @@ func (r *selfTestRunner) buildReport(startedAt time.Time, suites []*stSuite, run
 	}
 
 	return report
+}
+
+func (r *selfTestRunner) collectSuiteUserActions(suite *stSuite) []SelfTestUserActionsReport {
+	if suite == nil {
+		return nil
+	}
+	if suite.logEndID <= suite.logStartID {
+		return nil
+	}
+
+	rows, err := r.srv.store.db.Query(`
+		SELECT
+			id,
+			timestamp,
+			IFNULL(user_id, ''),
+			IFNULL(user_session, ''),
+			IFNULL(ip_address, ''),
+			IFNULL(event, ''),
+			IFNULL(path, ''),
+			IFNULL(meta, '')
+		FROM log
+		WHERE id > ? AND id <= ?
+		ORDER BY id ASC
+	`, suite.logStartID, suite.logEndID)
+	if err != nil {
+		r.log.Warn("failed to query suite user actions", "suite", suite.name, "err", err)
+		return nil
+	}
+	defer rows.Close()
+
+	type actionRow struct {
+		id        int64
+		ts        int64
+		userID    string
+		sessionID string
+		ip        string
+		event     string
+		path      string
+		meta      string
+	}
+
+	byUserSession := make(map[string]*SelfTestSessionActionsReport)
+
+	for rows.Next() {
+		var row actionRow
+		if scanErr := rows.Scan(&row.id, &row.ts, &row.userID, &row.sessionID, &row.ip, &row.event, &row.path, &row.meta); scanErr != nil {
+			r.log.Warn("failed scanning suite user action row", "suite", suite.name, "err", scanErr)
+			return nil
+		}
+
+		row.userID = strings.TrimSpace(row.userID)
+		if row.userID == "" || row.userID == systemOwner {
+			continue
+		}
+
+		label, known := r.knownUsers[row.userID]
+		if !known {
+			continue
+		}
+		if strings.TrimSpace(label) == "" {
+			label = shortID(row.userID)
+		}
+
+		sessionID := strings.TrimSpace(row.sessionID)
+		if sessionID == "" {
+			sessionID = "no-session"
+		}
+		key := row.userID + "\x00" + sessionID
+		session, ok := byUserSession[key]
+		if !ok {
+			session = &SelfTestSessionActionsReport{
+				Session:   sessionID,
+				IP:        strings.TrimSpace(row.ip),
+				StartedAt: row.ts,
+				EndedAt:   row.ts,
+				Actions:   make([]SelfTestActionEvent, 0, 16),
+			}
+			byUserSession[key] = session
+		}
+
+		if row.ts < session.StartedAt || session.StartedAt == 0 {
+			session.StartedAt = row.ts
+		}
+		if row.ts > session.EndedAt {
+			session.EndedAt = row.ts
+		}
+		if session.IP == "" && row.ip != "" {
+			session.IP = row.ip
+		}
+
+		session.Actions = append(session.Actions, SelfTestActionEvent{
+			ID:        row.id,
+			Timestamp: row.ts,
+			Time:      formatUnix(row.ts),
+			Event:     row.event,
+			Path:      row.path,
+			Meta:      row.meta,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		r.log.Warn("suite user actions rows error", "suite", suite.name, "err", err)
+		return nil
+	}
+
+	byUser := make(map[string][]SelfTestSessionActionsReport)
+	for key, session := range byUserSession {
+		parts := strings.SplitN(key, "\x00", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if session.EndedAt >= session.StartedAt {
+			session.DurationSec = session.EndedAt - session.StartedAt
+		}
+		byUser[parts[0]] = append(byUser[parts[0]], *session)
+	}
+
+	for userID := range byUser {
+		sort.Slice(byUser[userID], func(i, j int) bool {
+			if byUser[userID][i].StartedAt == byUser[userID][j].StartedAt {
+				return byUser[userID][i].Session < byUser[userID][j].Session
+			}
+			return byUser[userID][i].StartedAt < byUser[userID][j].StartedAt
+		})
+	}
+
+	knownOrder := make([]string, 0, len(r.knownUsers))
+	for userID := range r.knownUsers {
+		knownOrder = append(knownOrder, userID)
+	}
+	sort.Slice(knownOrder, func(i, j int) bool {
+		leftLabel := r.knownUsers[knownOrder[i]]
+		rightLabel := r.knownUsers[knownOrder[j]]
+		if leftLabel == rightLabel {
+			return knownOrder[i] < knownOrder[j]
+		}
+		return leftLabel < rightLabel
+	})
+
+	out := make([]SelfTestUserActionsReport, 0, len(knownOrder))
+	for _, userID := range knownOrder {
+		out = append(out, SelfTestUserActionsReport{
+			UserID:    userID,
+			UserLabel: r.knownUsers[userID],
+			Sessions:  byUser[userID],
+		})
+	}
+
+	return out
 }
 
 func (r *selfTestRunner) logReport(suites []*stSuite) {
@@ -494,13 +711,43 @@ func (r *selfTestRunner) purgeTestUsers() {
 	}
 }
 
+func (r *selfTestRunner) rememberTestUser(hash, label string) {
+	r.rememberActivityUser(hash, label)
+
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return
+	}
+	for _, existing := range r.knownHashes {
+		if existing == hash {
+			return
+		}
+	}
+	r.knownHashes = append(r.knownHashes, hash)
+}
+
+func (r *selfTestRunner) rememberActivityUser(hash, label string) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return
+	}
+
+	if r.knownUsers == nil {
+		r.knownUsers = make(map[string]string, 8)
+	}
+	if strings.TrimSpace(label) != "" {
+		r.knownUsers[hash] = strings.TrimSpace(label)
+	} else if _, exists := r.knownUsers[hash]; !exists {
+		r.knownUsers[hash] = shortID(hash)
+	}
+}
+
 // ============================================================================
 // Identity factories
 // ============================================================================
 
-func (r *selfTestRunner) newPubKeyAuth() (ssh.AuthMethod, string) {
-	auth, label, _ := r.newPubKeyAuthWithHash()
-	return auth, label
+func (r *selfTestRunner) newPubKeyAuth() (ssh.AuthMethod, string, string) {
+	return r.newPubKeyAuthWithHash()
 }
 
 func (r *selfTestRunner) newPubKeyAuthWithHash() (ssh.AuthMethod, string, string) {
@@ -513,11 +760,11 @@ func (r *selfTestRunner) newPubKeyAuthWithHash() (ssh.AuthMethod, string, string
 	fp := ssh.FingerprintSHA256(signer.PublicKey())
 	sum := sha256.Sum256(signer.PublicKey().Marshal())
 	hash := fmt.Sprintf("%x", sum)
-	r.knownHashes = append(r.knownHashes, hash)
+	r.rememberTestUser(hash, "pubkey "+fp[:16])
 	return ssh.PublicKeys(signer), fp[:16], hash
 }
 
-func (r *selfTestRunner) newKbAuth() (ssh.AuthMethod, string) {
+func (r *selfTestRunner) newKbAuth() (ssh.AuthMethod, string, string) {
 	b := make([]byte, 8)
 	cryptorand.Read(b) //nolint:errcheck
 	pw := fmt.Sprintf("selftest-%x", b)
@@ -528,7 +775,11 @@ func (r *selfTestRunner) newKbAuth() (ssh.AuthMethod, string) {
 		}
 		return answers, nil
 	})
-	return method, "kbint:" + pw[:16]
+	sum := sha256.Sum256([]byte("pwd-auth:anonymous:" + pw))
+	hash := fmt.Sprintf("pwd-auth:%x", sum)
+	label := "kbint:" + pw[:16]
+	r.rememberTestUser(hash, label)
+	return method, label, hash
 }
 
 // ============================================================================
@@ -704,6 +955,11 @@ func stRandHex() string {
 	return fmt.Sprintf("%08x", binary.BigEndian.Uint32(b))
 }
 
+func stAnonHash(ip string) string {
+	sum := sha256.Sum256([]byte("anon-auth:" + strings.TrimSpace(ip)))
+	return fmt.Sprintf("anon-auth:%x", sum)
+}
+
 func stTrunc(s string, n int) string {
 	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", "")
 	if len(s) > n {
@@ -755,16 +1011,32 @@ func (s stStep) LogValue() slog.Value {
 }
 
 type stSuite struct {
-	name  string
-	steps []stStep
-	start time.Time
+	name       string
+	steps      []stStep
+	start      time.Time
+	end        time.Time
+	logStartID int64
+	logEndID   int64
 }
 
 func newStSuite(name string) *stSuite {
 	return &stSuite{name: name, start: time.Now()}
 }
 
-func (s *stSuite) duration() time.Duration { return time.Since(s.start) }
+func (s *stSuite) finish() {
+	if s.end.IsZero() {
+		s.end = time.Now()
+	}
+}
+
+func (s *stSuite) endTime() time.Time {
+	if s.end.IsZero() {
+		return time.Now()
+	}
+	return s.end
+}
+
+func (s *stSuite) duration() time.Duration { return s.endTime().Sub(s.start) }
 
 func (s *stSuite) record(name string, wantFail bool, err error, start time.Time) {
 	s.steps = append(s.steps, stStep{

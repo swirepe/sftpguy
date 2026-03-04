@@ -282,14 +282,16 @@ func (u userStats) IsContributor(threshold int64) (bool, int64) {
 }
 
 type Store struct {
-	db        *sql.DB
-	logger    *slog.Logger
-	blacklist *IPList
-	whitelist *IPList
+	db            *sql.DB
+	logger        *slog.Logger
+	blacklist     *IPList
+	whitelist     *IPList
+	blacklistPath string
+	whitelistPath string
 }
 
-func NewStore(path string, logger *slog.Logger) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
+	db, err := sql.Open("sqlite", cfg.DBPath)
 	if err != nil {
 		return nil, err
 	}
@@ -301,13 +303,25 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	if _, err := db.Exec(Schema); err != nil {
 		return nil, err
 	}
+
+	blackPath := strings.TrimSpace(cfg.BlacklistPath)
+	if blackPath == "" {
+		blackPath = "blacklist.txt"
+	}
+	whitePath := strings.TrimSpace(cfg.WhitelistPath)
+	if whitePath == "" {
+		whitePath = "whitelist.txt"
+	}
+
 	ctx := context.Background()
-	black := NewIPList(ctx, "blacklist.txt", logger)
-	white := NewIPList(ctx, "whitelist.txt", logger)
+	black := NewIPList(ctx, blackPath, logger)
+	white := NewIPList(ctx, whitePath, logger)
 	return &Store{db: db,
-		logger:    logger,
-		blacklist: black,
-		whitelist: white}, nil
+		logger:        logger,
+		blacklist:     black,
+		whitelist:     white,
+		blacklistPath: blackPath,
+		whitelistPath: whitePath}, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
@@ -822,7 +836,7 @@ type Server struct {
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 
-	store, err := NewStore(cfg.DBPath, logger)
+	store, err := NewStore(cfg, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init store: %w", err)
 	}

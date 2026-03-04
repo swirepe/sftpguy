@@ -99,7 +99,19 @@ func (s *Server) handleAdminUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing user id", http.StatusBadRequest)
 		return
 	}
-	hash := parts[0]
+	hash, err := resolveAdminUserHash(s.store.db, parts[0])
+	if err != nil {
+		if errors.Is(err, errAdminLookupNotFound) {
+			http.Error(w, "user not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAdminLookupAmbiguous) {
+			http.Error(w, "user id is ambiguous; provide a longer hash prefix", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	if len(parts) == 1 {
 		if r.Method != http.MethodGet {
