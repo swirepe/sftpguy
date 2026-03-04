@@ -277,8 +277,8 @@ func explorerUpload(client *http.Client, postURL, csrfToken, filename string, pa
 		return err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return nil

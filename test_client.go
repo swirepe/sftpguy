@@ -834,8 +834,8 @@ func tcExplorerUploadParts(client *http.Client, postURL, csrfToken string, parts
 		return err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return nil

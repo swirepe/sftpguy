@@ -1273,8 +1273,8 @@ func stExplorerUploadParts(client *http.Client, postURL, csrfToken string, parts
 		return err
 	}
 	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
