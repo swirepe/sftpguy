@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sftpguy admin</title>
+  <link rel="stylesheet" href="/admin/static/admin.css" />
+</head>
+<body>
+  <div class="shell">
+    <div class="card">
+      <h1>sftpguy web admin console</h1>
+      <div class="muted" id="status">loading...</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button class="btn-warn" onclick="refreshAll()">Refresh All</button>
+        <label>Range
+          <select id="time-range" onchange="changeRange()">
+            <option value="15m">Last 15m</option>
+            <option value="1h">Last 1h</option>
+            <option value="6h">Last 6h</option>
+            <option value="12h">Last 12h</option>
+            <option value="24h" selected>Last 24h</option>
+	          <option value="48h">Last 48h</option>
+	          <option value="7d">Last 7d</option>
+	          <option value="14d">Last 14d</option>
+	          <option value="30d">Last 30d</option>
+	          <option value="all">All Time</option>
+	        </select>
+	      </label>
+        <label>Rows / page
+          <select id="table-page-size" onchange="changePageSize()">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+        </label>
+        <label><input id="auto-refresh" type="checkbox" onchange="toggleAutoRefresh()" /> Auto refresh</label>
+        <select id="auto-seconds" onchange="toggleAutoRefresh()">
+          <option value="10">10s</option>
+          <option value="20">20s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+        </select>
+        <button onclick="exportUsersCSV()">Export Users CSV</button>
+        <button onclick="exportAuditCSV()">Export Audit CSV</button>
+      </div>
+      <div class="row">
+        <input id="quick-owner" placeholder="owner hash" />
+        <button class="btn-danger" onclick="quickBanOwner()">Ban Owner</button>
+        <button class="btn-good" onclick="quickUnbanOwner()">Unban Owner</button>
+        <button onclick="quickOpenOwner()">Open Actor</button>
+      </div>
+      <div class="row">
+        <input id="quick-ip" placeholder="ip address" />
+        <button class="btn-danger" onclick="quickBanIP()">Ban IP</button>
+        <button onclick="quickOpenIP()">Open Actor</button>
+      </div>
+      <h3>Action History</h3>
+      <ol class="history" id="action-history"></ol>
+    </div>
+
+    <div class="card">
+      <div class="tabs" id="tabs">
+        <button class="tab active" data-tab="summary">Summary</button>
+        <button class="tab" data-tab="users">Users</button>
+        <button class="tab" data-tab="files">Files</button>
+        <button class="tab" data-tab="audit">Audit</button>
+        <button class="tab" data-tab="logs">Logs</button>
+        <button class="tab" data-tab="auth">Auth</button>
+        <button class="tab" data-tab="sessions">Sessions</button>
+        <button class="tab" data-tab="uploads">Uploads</button>
+        <button class="tab" data-tab="banned">Banned</button>
+        <button class="tab" data-tab="selftest">Self Test</button>
+      </div>
+    </div>
+
+    <div class="card drawer hidden" id="actor-drawer">
+      <div id="actor-out"></div>
+    </div>
+
+    <div class="card drawer hidden" id="session-timeline">
+      <div id="session-out"></div>
+    </div>
+
+    <div class="card" id="tab-summary"></div>
+
+    <div class="card hidden" id="tab-users">
+      <div class="row">
+        <input id="user-q" placeholder="search hash..." />
+        <button onclick="loadUsers()">Refresh</button>
+      </div>
+      <div id="users-out"></div>
+    </div>
+
+	    <div class="card hidden" id="tab-files">
+	      <div class="row">
+	        <input id="files-path" placeholder="." value="." />
+	        <button onclick="loadFiles()">Open</button>
+	        <button onclick="filesUp()">Up</button>
+	      </div>
+	      <div class="row">
+	        <input id="files-q" placeholder="search files by path/owner..." />
+	        <button onclick="searchFiles()">Search Files</button>
+	        <button onclick="clearFileSearch()">Clear Search</button>
+	      </div>
+	      <div id="files-out"></div>
+	    </div>
+
+    <div class="card hidden" id="tab-audit">
+      <div class="row">
+        <input id="audit-q" placeholder="filter event/path/user/ip/session..." />
+        <button onclick="loadAudit()">Refresh</button>
+      </div>
+      <div id="audit-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-logs">
+      <div class="row">
+        <input id="log-q" placeholder="filter events..." />
+        <button onclick="loadLogs()">Refresh</button>
+        <button onclick="loadOlderLogs()">Older</button>
+        <button onclick="loadNewestLogs()">Newest</button>
+        <label><input id="logs-live" type="checkbox" onchange="toggleLogLive()" /> Live stream</label>
+      </div>
+      <div id="logs-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-auth">
+      <div class="row">
+        <input id="auth-q" placeholder="filter username/password/ip/hash..." />
+        <button onclick="loadAuthAttempts()">Refresh</button>
+      </div>
+      <div id="auth-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-sessions">
+      <div class="row">
+        <input id="sessions-q" placeholder="filter session/user/ip..." />
+        <button onclick="loadSessions()">Refresh</button>
+      </div>
+      <div id="sessions-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-uploads">
+      <div class="row">
+        <input id="uploads-q" placeholder="filter path/user/ip..." />
+        <button onclick="loadUploads()">Refresh</button>
+      </div>
+      <div id="uploads-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-banned">
+      <div class="row">
+        <input id="ban-ip" placeholder="IP to ban (e.g. 1.2.3.4)" />
+        <button class="btn-danger" onclick="banIP()">Ban IP</button>
+      </div>
+      <div id="banned-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-selftest">
+      <div class="row">
+        <button id="selftest-run" class="btn-warn" onclick="runSelfTest()">Run Self Test</button>
+        <button onclick="loadSelfTest()">Refresh</button>
+      </div>
+      <div id="selftest-out"></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script src="/admin/static/admin.js"></script>
+</body>
+</html>
