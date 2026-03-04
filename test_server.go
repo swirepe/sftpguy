@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
@@ -121,6 +122,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 	if r.cfg.SshNoAuth {
 		suites = append(suites, r.runNonOwner("noClientAuth (anon-by-IP)", preexisting, nil))
 	}
+	suites = append(suites, r.runResumeUploads("second (pubkey "+secondLabel+")", secondAuth))
 	suites = append(suites, r.runSystemFile(secondAuth))
 	suites = append(suites, r.runBanUnban(banVictimAuth, banVictimLabel, banVictimHash, preexisting))
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
@@ -250,6 +252,53 @@ func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMet
 	r.checkRename(s, sftpCli, preexisting, preexisting+".bak2", false)
 	r.checkWrite(s, sftpCli, preexisting, []byte("bad2"), false)
 	r.checkDelete(s, sftpCli, preexisting, false)
+
+	return s
+}
+
+func (r *selfTestRunner) runResumeUploads(label string, auth ssh.AuthMethod) *stSuite {
+	s := r.startSuite("Resume uploads: " + label)
+	defer r.finishSuite(s)
+
+	sshCli, sftpCli, err := r.openSFTP(auth)
+	s.check("connect", err)
+	if err != nil {
+		return s
+	}
+	defer sshCli.Close()
+	defer sftpCli.Close()
+
+	sfx := stRandHex()
+
+	// Single-file resume upload (same behavior as `reput`).
+	resumeFile := "selftest_resume_" + sfx + ".txt"
+	initial := []byte("initial contents\n")
+	appended := []byte("updated contents\n")
+	updated := append(append([]byte{}, initial...), appended...)
+
+	s.check("write initial file", stWrite(sftpCli, resumeFile, initial))
+	s.check("resume upload append (reput)", stAppend(sftpCli, resumeFile, appended))
+	r.checkFileContent(s, resumeFile, updated)
+
+	// Recursive resume upload (same behavior as `reput -r`) on nested files.
+	baseDir := "selftest_resume_dir_" + sfx
+	rootFile := path.Join(baseDir, "root.txt")
+	nestedFile := path.Join(baseDir, "nested", "child.txt")
+
+	rootInitial := []byte("root-v1\n")
+	rootAppended := []byte("root-v2\n")
+	rootUpdated := append(append([]byte{}, rootInitial...), rootAppended...)
+
+	nestedInitial := []byte("child-v1\n")
+	nestedAppended := []byte("child-v2\n")
+	nestedUpdated := append(append([]byte{}, nestedInitial...), nestedAppended...)
+
+	s.check("write initial folder file root.txt", stWrite(sftpCli, rootFile, rootInitial))
+	s.check("write initial folder file nested/child.txt", stWrite(sftpCli, nestedFile, nestedInitial))
+	s.check("resume folder upload root.txt (reput -r)", stAppend(sftpCli, rootFile, rootAppended))
+	s.check("resume folder upload nested/child.txt (reput -r)", stAppend(sftpCli, nestedFile, nestedAppended))
+	r.checkFileContent(s, rootFile, rootUpdated)
+	r.checkFileContent(s, nestedFile, nestedUpdated)
 
 	return s
 }
@@ -923,6 +972,19 @@ func stWrite(c *sftp.Client, p string, data []byte) error {
 	return closeErr
 }
 
+func stAppend(c *sftp.Client, p string, data []byte) error {
+	f, err := c.OpenFile(path.Clean("/"+p), os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
 func stPayload(n int64) []byte {
 	if n <= 0 {
 		n = 1024
@@ -1138,6 +1200,27 @@ func (r *selfTestRunner) checkWrite(s *stSuite, sftp *sftp.Client, sftpPath stri
 	}
 
 	s.record("write "+sftpPath, false, diskErr, start)
+}
+
+func (r *selfTestRunner) checkFileContent(s *stSuite, sftpPath string, want []byte) {
+	start := time.Now()
+	got, err := os.ReadFile(r.local(sftpPath))
+	if err != nil {
+		s.record("verify "+sftpPath+" contents", false, fmt.Errorf("disk: read failed: %w", err), start)
+		return
+	}
+
+	if !bytes.Equal(got, want) {
+		s.record(
+			"verify "+sftpPath+" contents",
+			false,
+			fmt.Errorf("disk: content mismatch (got %q want %q)", stTrunc(string(got), 120), stTrunc(string(want), 120)),
+			start,
+		)
+		return
+	}
+
+	s.record("verify "+sftpPath+" contents", false, nil, start)
 }
 
 func (r *selfTestRunner) checkRename(s *stSuite, sftp *sftp.Client, oldP, newP string, wantMoved bool) {

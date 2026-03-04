@@ -1799,8 +1799,12 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		return nil, h.deny(errMsgFilenameClaimed, "path", meta.rel)
 	}
 
+	appendMode := r.Pflags().Append
+
 	flags := os.O_RDWR | os.O_CREATE
-	if !r.Pflags().Append {
+	if appendMode {
+		flags |= os.O_APPEND
+	} else {
 		flags |= os.O_TRUNC
 	}
 
@@ -1814,7 +1818,13 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		oldSize = fi.Size()
 	}
 
-	return &statWriter{File: f, h: h, rel: meta.rel, oldSize: oldSize}, nil
+	return &statWriter{
+		File:       f,
+		h:          h,
+		rel:        meta.rel,
+		oldSize:    oldSize,
+		appendMode: appendMode,
+	}, nil
 }
 
 func (h *fsHandler) canModify(meta *pathMeta) error {
@@ -2035,12 +2045,28 @@ func (t *throttledReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 type statWriter struct {
 	*os.File
-	h       *fsHandler
-	rel     string
-	oldSize int64
+	h          *fsHandler
+	rel        string
+	oldSize    int64
+	appendMode bool
 }
 
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
+	// For append requests (e.g. OpenSSH `reput`), writes should be appended
+	// regardless of the incoming offset.
+	if sw.appendMode {
+		effectiveOff := sw.oldSize
+		if fi, err := sw.File.Stat(); err == nil {
+			effectiveOff = fi.Size()
+		}
+
+		if sw.h.srv.cfg.MaxFileSize > 0 && effectiveOff+int64(len(p)) > sw.h.srv.cfg.MaxFileSize {
+			return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
+				"path", sw.rel, "offset", effectiveOff, "size", len(p))
+		}
+		return sw.File.Write(p)
+	}
+
 	if sw.h.srv.cfg.MaxFileSize > 0 && off+int64(len(p)) > sw.h.srv.cfg.MaxFileSize {
 		return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
 			"path", sw.rel, "offset", off, "size", len(p))
