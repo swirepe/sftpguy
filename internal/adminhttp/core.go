@@ -11,6 +11,8 @@ type CoreDeps interface {
 	AppVersion() string
 	SSHPort() int
 	AdminHTTPAddr() string
+	ExplorerHTTPAddr() string
+	ExplorerMaxFileSize() int64
 	ContributorThreshold() int64
 	BannerStats(threshold int64) (users, contributors, files, bytes uint64)
 	DirectoryCount() (int, error)
@@ -39,17 +41,20 @@ func SummaryHandler(deps CoreDeps) http.HandlerFunc {
 		dirCount, _ := deps.DirectoryCount()
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"archive":               deps.ArchiveName(),
-			"version":               deps.AppVersion(),
-			"ssh_port":              deps.SSHPort(),
-			"admin_http":            deps.AdminHTTPAddr(),
-			"users":                 u,
-			"contributors":          c,
-			"files":                 f,
-			"directories":           dirCount,
-			"bytes":                 b,
-			"formatted_bytes":       deps.FormatBytes(int64(b)),
-			"contributor_threshold": deps.ContributorThreshold(),
+			"archive":                 deps.ArchiveName(),
+			"version":                 deps.AppVersion(),
+			"ssh_port":                deps.SSHPort(),
+			"admin_http":              deps.AdminHTTPAddr(),
+			"explorer_http":           deps.ExplorerHTTPAddr(),
+			"explorer_max_file":       deps.ExplorerMaxFileSize(),
+			"explorer_max_file_human": deps.FormatBytes(deps.ExplorerMaxFileSize()),
+			"users":                   u,
+			"contributors":            c,
+			"files":                   f,
+			"directories":             dirCount,
+			"bytes":                   b,
+			"formatted_bytes":         deps.FormatBytes(int64(b)),
+			"contributor_threshold":   deps.ContributorThreshold(),
 		})
 	}
 }

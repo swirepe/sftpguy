@@ -11,6 +11,7 @@
 //   -system     A system-owned file on the server (default: README.txt)
 //   -threshold  Contributor threshold bytes, match -contrib (default: 1048576)
 //   -noauth     Run noClientAuth suite, server needs -noauth (default: true)
+//   -explorer   Explorer base URL to run explorer HTTP suite (optional)
 //   -v          Verbose error detail for all steps
 
 package main
@@ -24,9 +25,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -41,6 +47,7 @@ var (
 	flagSystem    = flag.String("system", "README.txt", "A system-owned file present on the server")
 	flagThreshold = flag.Int64("threshold", 1048576, "Contributor threshold bytes")
 	flagNoAuth    = flag.Bool("noauth", true, "Run noClientAuth suite")
+	flagExplorer  = flag.String("explorer", "", "Explorer base URL (optional), e.g. http://127.0.0.1:8081")
 	flagVerbose   = flag.Bool("v", false, "Verbose error detail")
 )
 
@@ -475,25 +482,32 @@ func runResumeSuite(label string, auth ssh.AuthMethod) *suite {
 	s.check("resume upload append (reput)", "ok", sftpAppend(sftpCli, resumeFile, appended))
 	s.check("verify resumed file contents", "ok", sftpCheckContent(sftpCli, resumeFile, updated))
 
-	// Recursive resume (`reput -r`) behavior.
+	// Missing single-file case: `reput` preflight stat fails, then fallback create.
+	missingResumeFile := "testclient_resume_missing_" + sfx + ".txt"
+	missingResumeFull := []byte("new file sent during resume\n")
+	_, statErr := sftpCli.Stat(path.Clean("/" + missingResumeFile))
+	s.check("stat missing file (reput preflight)", "fail", statErr)
+	s.check("resume missing file fallback create (put)", "ok", sftpWrite(sftpCli, missingResumeFile, missingResumeFull))
+	s.check("verify missing resumed file contents", "ok", sftpCheckContent(sftpCli, missingResumeFile, missingResumeFull))
+
+	// Recursive resume (`reput -r`) behavior with mixed existing + missing files.
 	baseDir := "testclient_resume_dir_" + sfx
-	rootFile := path.Join(baseDir, "root.txt")
-	nestedFile := path.Join(baseDir, "nested", "child.txt")
+	existingFile := path.Join(baseDir, "root.txt")
+	missingFile := path.Join(baseDir, "nested", "child.txt")
 
-	rootInitial := []byte("root-v1\n")
-	rootAppended := []byte("root-v2\n")
-	rootUpdated := append(append([]byte{}, rootInitial...), rootAppended...)
+	existingInitial := []byte("root-v1\n")
+	existingAppended := []byte("root-v2\n")
+	existingUpdated := append(append([]byte{}, existingInitial...), existingAppended...)
 
-	nestedInitial := []byte("child-v1\n")
-	nestedAppended := []byte("child-v2\n")
-	nestedUpdated := append(append([]byte{}, nestedInitial...), nestedAppended...)
+	missingFull := []byte("child-v1\nchild-v2\n")
 
-	s.check("write initial folder file root.txt", "ok", sftpWrite(sftpCli, rootFile, rootInitial))
-	s.check("write initial folder file nested/child.txt", "ok", sftpWrite(sftpCli, nestedFile, nestedInitial))
-	s.check("resume folder upload root.txt (reput -r)", "ok", sftpAppend(sftpCli, rootFile, rootAppended))
-	s.check("resume folder upload nested/child.txt (reput -r)", "ok", sftpAppend(sftpCli, nestedFile, nestedAppended))
-	s.check("verify resumed folder root.txt", "ok", sftpCheckContent(sftpCli, rootFile, rootUpdated))
-	s.check("verify resumed folder nested/child.txt", "ok", sftpCheckContent(sftpCli, nestedFile, nestedUpdated))
+	s.check("write initial folder file root.txt", "ok", sftpWrite(sftpCli, existingFile, existingInitial))
+	_, statErr = sftpCli.Stat(path.Clean("/" + missingFile))
+	s.check("stat missing folder file (reput -r preflight)", "fail", statErr)
+	s.check("resume folder upload existing root.txt (reput -r)", "ok", sftpAppend(sftpCli, existingFile, existingAppended))
+	s.check("resume folder upload missing child.txt fallback create (put)", "ok", sftpWrite(sftpCli, missingFile, missingFull))
+	s.check("verify resumed folder existing root.txt", "ok", sftpCheckContent(sftpCli, existingFile, existingUpdated))
+	s.check("verify resumed folder missing child.txt", "ok", sftpCheckContent(sftpCli, missingFile, missingFull))
 
 	return s
 }
@@ -539,6 +553,152 @@ func runOwnerCleanupSuite(firstAuth ssh.AuthMethod, preexisting string) *suite {
 	s.check("update preexisting.txt", "ok", sftpWrite(sftpCli, preexisting, []byte("updated by owner")))
 	s.check("delete preexisting.txt", "ok", sftpCli.Remove(preexisting))
 	return s
+}
+
+func runExplorerSuite(baseURL, preexisting string) *suite {
+	s := &suite{name: "Explorer HTTP permissions"}
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		s.skip("explorer suite", "no -explorer URL provided")
+		return s
+	}
+
+	clientA, err := tcHTTPClient()
+	s.check("client A init", "ok", err)
+	if err != nil {
+		return s
+	}
+	clientB, err := tcHTTPClient()
+	s.check("client B init", "ok", err)
+	if err != nil {
+		return s
+	}
+
+	status, body, err := tcExplorerGET(clientA, strings.TrimRight(baseURL, "/")+"/")
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("bootstrap status %d", status)
+	}
+	s.check("bootstrap explorer (A)", "ok", err)
+	if err != nil {
+		return s
+	}
+
+	csrf, err := tcExplorerCSRF(body)
+	s.check("extract csrf token (A)", "ok", err)
+	if err != nil {
+		return s
+	}
+
+	status, _, err = tcExplorerGET(clientA, strings.TrimRight(baseURL, "/")+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 before contributing, got %d", status)
+	}
+	s.check("download locked file blocked (A)", "ok", err)
+
+	err = tcExplorerUpload(clientA, strings.TrimRight(baseURL, "/")+"/", csrf, "testclient_explorer_"+randSuffix()+".bin", payload(*flagThreshold))
+	s.check("upload via explorer (A)", "ok", err)
+	if err != nil {
+		return s
+	}
+
+	status, _, err = tcExplorerGET(clientA, strings.TrimRight(baseURL, "/")+"/"+preexisting)
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("expected 200 after contributing, got %d", status)
+	}
+	s.check("download locked file allowed (A)", "ok", err)
+
+	status, _, err = tcExplorerGET(clientB, strings.TrimRight(baseURL, "/")+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 for separate client, got %d", status)
+	}
+	s.check("download still blocked (B)", "ok", err)
+
+	u, _ := url.Parse(baseURL)
+	idCookie := ""
+	for _, c := range clientA.Jar.Cookies(u) {
+		if strings.Contains(c.Name, "_id") {
+			idCookie = c.Name
+			break
+		}
+	}
+	if idCookie == "" {
+		s.check("tamper identity cookie", "ok", fmt.Errorf("identity cookie not found"))
+		return s
+	}
+	clientA.Jar.SetCookies(u, []*http.Cookie{{
+		Name:  idCookie,
+		Value: "v1.tampered.bad-signature",
+		Path:  "/",
+	}})
+	status, _, err = tcExplorerGET(clientA, strings.TrimRight(baseURL, "/")+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 after tampering cookie, got %d", status)
+	}
+	s.check("tampered identity loses access (A)", "ok", err)
+
+	return s
+}
+
+func tcHTTPClient() (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Jar: jar}, nil
+}
+
+func tcExplorerGET(client *http.Client, rawURL string) (status int, body string, err error) {
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(data), nil
+}
+
+func tcExplorerCSRF(html string) (string, error) {
+	re := regexp.MustCompile(`value=\"([a-f0-9]{64})\"`)
+	m := re.FindStringSubmatch(html)
+	if len(m) != 2 {
+		return "", fmt.Errorf("csrf token not found")
+	}
+	return m[1], nil
+}
+
+func tcExplorerUpload(client *http.Client, postURL, csrfToken, filename string, data []byte) error {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("csrf_token", csrfToken); err != nil {
+		return err
+	}
+	fw, err := mw.CreateFormFile("uploadFiles", filename)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return err
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, postURL, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
 }
 
 func main() {
@@ -600,6 +760,7 @@ func main() {
 	suites = append(suites, runResumeSuite(
 		fmt.Sprintf("second (pubkey %s)", secondLabel), secondAuth))
 	suites = append(suites, runSystemFileSuite(secondAuth))
+	suites = append(suites, runExplorerSuite(*flagExplorer, preexisting))
 	suites = append(suites, runOwnerCleanupSuite(firstAuth, preexisting))
 
 	totalPass, totalFail, totalSkip := 0, 0, 0

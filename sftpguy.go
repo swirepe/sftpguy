@@ -65,7 +65,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go test_client.go test_server.go fortunes.txt
+//go:embed sftpguy.go admin.go explorerv2.go explorer_http*.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go test_client.go test_server.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -628,6 +628,8 @@ type Config struct {
 	Port                    int
 	AdminHTTP               string
 	AdminHTTPToken          string
+	ExplorerHTTP            string
+	ExplorerCookieSecret    string
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -642,6 +644,7 @@ type Config struct {
 	Debug                   bool
 	QuietConsole            bool
 	MaxFileSize             int64
+	ExplorerMaxFileSize     int64
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
 	BootstrapSrc            bool
@@ -662,6 +665,8 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port", "p")
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
+	EnvFlag(&cfg.ExplorerHTTP, "explorer.http", "EXPLORER_HTTP", "", "Enable web explorer on this address (example: 127.0.0.1:8081)")
+	EnvFlag(&cfg.ExplorerCookieSecret, "explorer.cookie.secret", "EXPLORER_COOKIE_SECRET", "", "Optional secret used to sign explorer cookies")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -678,6 +683,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
 	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
+	EnvSizeFlag(&cfg.ExplorerMaxFileSize, "explorer.maxsize", "EXPLORER_MAX_FILE_SIZE", "8gb", "Max explorer upload size per file (0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
 
 	EnvFlag(&cfg.SelfTest, "test", "SELF_TEST", false, "Run integration self-test suite after startup then exit")
@@ -776,6 +782,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("admin.http must be host:port, got %q: %w", c.AdminHTTP, err)
 		}
 	}
+	if c.ExplorerHTTP != "" {
+		if _, _, err := net.SplitHostPort(c.ExplorerHTTP); err != nil {
+			return fmt.Errorf("explorer.http must be host:port, got %q: %w", c.ExplorerHTTP, err)
+		}
+	}
 	if c.Name == "" || c.HostKeyFile == "" || c.DBPath == "" || c.UploadDir == "" {
 		return errors.New("required configuration fields missing")
 	}
@@ -830,6 +841,9 @@ type Server struct {
 	cancel           context.CancelFunc
 	adminShutdownMu  sync.Mutex
 	adminShutdown    func(context.Context) error
+	explorerSvc      *explorerService
+	explorerMu       sync.Mutex
+	explorerShutdown func(context.Context) error
 	selfTestMu       sync.Mutex
 	selfTestState    adminSelfTestState
 }
@@ -921,6 +935,16 @@ func (s *Server) Shutdown() error {
 		defer cancel()
 		if err := adminShutdown(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			s.logger.Warn("admin http shutdown failed", "err", err)
+		}
+	}
+	s.explorerMu.Lock()
+	explorerShutdown := s.explorerShutdown
+	s.explorerMu.Unlock()
+	if explorerShutdown != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := explorerShutdown(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Warn("explorer http shutdown failed", "err", err)
 		}
 	}
 	s.wg.Wait()
@@ -2481,6 +2505,9 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"admin.ssh", cfg.AdminEnabled,
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
+		"explorer.http", cfg.ExplorerHTTP,
+		"explorer.maxsize", cfg.ExplorerMaxFileSize,
+		"explorer.cookie.secret", cfg.ExplorerCookieSecret != "",
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"upload_path", cfg.UploadDir,
@@ -2616,6 +2643,14 @@ func main() {
 		go func() {
 			if err := srv.ListenAdminHTTP(); err != nil {
 				logger.Error("admin http listener failed", "err", err)
+			}
+		}()
+	}
+
+	if cfg.ExplorerHTTP != "" {
+		go func() {
+			if err := srv.ListenExplorerHTTP(); err != nil {
+				logger.Error("explorer http listener failed", "err", err)
 			}
 		}()
 	}

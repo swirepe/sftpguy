@@ -17,10 +17,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -124,6 +130,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 	}
 	suites = append(suites, r.runResumeUploads("second (pubkey "+secondLabel+")", secondAuth))
 	suites = append(suites, r.runSystemFile(secondAuth))
+	suites = append(suites, r.runExplorerHTTP(preexisting))
 	suites = append(suites, r.runBanUnban(banVictimAuth, banVictimLabel, banVictimHash, preexisting))
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
@@ -280,25 +287,32 @@ func (r *selfTestRunner) runResumeUploads(label string, auth ssh.AuthMethod) *st
 	s.check("resume upload append (reput)", stAppend(sftpCli, resumeFile, appended))
 	r.checkFileContent(s, resumeFile, updated)
 
-	// Recursive resume upload (same behavior as `reput -r`) on nested files.
+	// Missing single-file case: `reput` preflight stat fails, then fallback create.
+	missingResumeFile := "selftest_resume_missing_" + sfx + ".txt"
+	missingResumeFull := []byte("new file sent during resume\n")
+	_, statErr := sftpCli.Stat(path.Clean("/" + missingResumeFile))
+	s.wantFail("stat missing file (reput preflight)", statErr)
+	s.check("resume missing file fallback create (put)", stWrite(sftpCli, missingResumeFile, missingResumeFull))
+	r.checkFileContent(s, missingResumeFile, missingResumeFull)
+
+	// Recursive resume upload (`reput -r`) with mixed existing + missing files.
 	baseDir := "selftest_resume_dir_" + sfx
-	rootFile := path.Join(baseDir, "root.txt")
-	nestedFile := path.Join(baseDir, "nested", "child.txt")
+	existingFile := path.Join(baseDir, "root.txt")
+	missingFile := path.Join(baseDir, "nested", "child.txt")
 
-	rootInitial := []byte("root-v1\n")
-	rootAppended := []byte("root-v2\n")
-	rootUpdated := append(append([]byte{}, rootInitial...), rootAppended...)
+	existingInitial := []byte("root-v1\n")
+	existingAppended := []byte("root-v2\n")
+	existingUpdated := append(append([]byte{}, existingInitial...), existingAppended...)
 
-	nestedInitial := []byte("child-v1\n")
-	nestedAppended := []byte("child-v2\n")
-	nestedUpdated := append(append([]byte{}, nestedInitial...), nestedAppended...)
+	missingFull := []byte("child-v1\nchild-v2\n")
 
-	s.check("write initial folder file root.txt", stWrite(sftpCli, rootFile, rootInitial))
-	s.check("write initial folder file nested/child.txt", stWrite(sftpCli, nestedFile, nestedInitial))
-	s.check("resume folder upload root.txt (reput -r)", stAppend(sftpCli, rootFile, rootAppended))
-	s.check("resume folder upload nested/child.txt (reput -r)", stAppend(sftpCli, nestedFile, nestedAppended))
-	r.checkFileContent(s, rootFile, rootUpdated)
-	r.checkFileContent(s, nestedFile, nestedUpdated)
+	s.check("write initial folder file root.txt", stWrite(sftpCli, existingFile, existingInitial))
+	_, statErr = sftpCli.Stat(path.Clean("/" + missingFile))
+	s.wantFail("stat missing folder file (reput -r preflight)", statErr)
+	s.check("resume folder upload existing root.txt (reput -r)", stAppend(sftpCli, existingFile, existingAppended))
+	s.check("resume folder upload missing child.txt fallback create (put)", stWrite(sftpCli, missingFile, missingFull))
+	r.checkFileContent(s, existingFile, existingUpdated)
+	r.checkFileContent(s, missingFile, missingFull)
 
 	return s
 }
@@ -347,6 +361,95 @@ func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 
 	// wantDeleted=false: Verify the file is still present on disk
 	r.checkDelete(s, sftpCli, sysName, false)
+
+	return s
+}
+
+func (r *selfTestRunner) runExplorerHTTP(preexisting string) *stSuite {
+	s := r.startSuite("Explorer HTTP permissions")
+	defer r.finishSuite(s)
+
+	handler, err := r.srv.ExplorerHandler()
+	s.check("init explorer handler", err)
+	if err != nil {
+		return s
+	}
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	clientA, err := stHTTPClient()
+	s.check("client A init", err)
+	if err != nil {
+		return s
+	}
+
+	clientB, err := stHTTPClient()
+	s.check("client B init", err)
+	if err != nil {
+		return s
+	}
+
+	status, body, err := stExplorerGET(clientA, ts.URL+"/")
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("bootstrap status %d", status)
+	}
+	s.check("bootstrap explorer (A)", err)
+	if err != nil {
+		return s
+	}
+
+	tokenA, err := stExplorerCSRF(body)
+	s.check("extract csrf token (A)", err)
+	if err != nil {
+		return s
+	}
+
+	status, _, err = stExplorerGET(clientA, ts.URL+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 before contributing, got %d", status)
+	}
+	s.check("download locked file blocked (A)", err)
+
+	err = stExplorerUpload(clientA, ts.URL+"/", tokenA, "selftest_explorer_"+stRandHex()+".bin", stPayload(r.cfg.ContributorThreshold))
+	s.check("upload via explorer (A)", err)
+	if err != nil {
+		return s
+	}
+
+	status, _, err = stExplorerGET(clientA, ts.URL+"/"+preexisting)
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("expected 200 after contributing, got %d", status)
+	}
+	s.check("download locked file allowed (A)", err)
+
+	status, _, err = stExplorerGET(clientB, ts.URL+"/")
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("bootstrap status %d", status)
+	}
+	s.check("bootstrap explorer (B)", err)
+	if err != nil {
+		return s
+	}
+
+	status, _, err = stExplorerGET(clientB, ts.URL+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 for separate client, got %d", status)
+	}
+	s.check("download still blocked (B)", err)
+
+	u, _ := url.Parse(ts.URL)
+	identityCookie, _ := r.srv.ExplorerCookieNames()
+	clientA.Jar.SetCookies(u, []*http.Cookie{{
+		Name:  identityCookie,
+		Value: "v1.tampered.bad-signature",
+		Path:  "/",
+	}})
+	status, _, err = stExplorerGET(clientA, ts.URL+"/"+preexisting)
+	if err == nil && status != http.StatusForbidden {
+		err = fmt.Errorf("expected 403 after tampering identity cookie, got %d", status)
+	}
+	s.check("tampered identity loses access (A)", err)
 
 	return s
 }
@@ -983,6 +1086,68 @@ func stAppend(c *sftp.Client, p string, data []byte) error {
 		return writeErr
 	}
 	return closeErr
+}
+
+func stHTTPClient() (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Jar: jar}, nil
+}
+
+func stExplorerGET(client *http.Client, rawURL string) (status int, body string, err error) {
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(data), nil
+}
+
+func stExplorerCSRF(html string) (string, error) {
+	re := regexp.MustCompile(`value=\"([a-f0-9]{64})\"`)
+	m := re.FindStringSubmatch(html)
+	if len(m) != 2 {
+		return "", fmt.Errorf("csrf token not found")
+	}
+	return m[1], nil
+}
+
+func stExplorerUpload(client *http.Client, postURL, csrfToken, filename string, payload []byte) error {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("csrf_token", csrfToken); err != nil {
+		return err
+	}
+	fw, err := mw.CreateFormFile("uploadFiles", filename)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(payload); err != nil {
+		return err
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, postURL, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 func stPayload(n int64) []byte {

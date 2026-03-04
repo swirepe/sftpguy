@@ -20,6 +20,7 @@ type RouteHandlers struct {
 	JS              http.HandlerFunc
 	Health          http.HandlerFunc
 	Summary         http.HandlerFunc
+	Explorer        http.HandlerFunc
 	Users           http.HandlerFunc
 	User            http.HandlerFunc
 	Files           http.HandlerFunc
@@ -71,6 +72,7 @@ func Listen(deps Deps) error {
 	register(mux, "/admin/static/admin.js", cfg.Token, handlers.JS)
 	register(mux, "/admin/api/health", cfg.Token, handlers.Health)
 	register(mux, "/admin/api/summary", cfg.Token, handlers.Summary)
+	register(mux, "/admin/api/explorer", cfg.Token, handlers.Explorer)
 	register(mux, "/admin/api/users", cfg.Token, handlers.Users)
 	register(mux, "/admin/api/users/", cfg.Token, handlers.User)
 	register(mux, "/admin/api/files", cfg.Token, handlers.Files)
