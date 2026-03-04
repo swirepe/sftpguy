@@ -35,12 +35,26 @@ import (
 // report, purges temporary users, then returns the failure count.
 // The caller decides whether to exit or continue based on cfg flags.
 func RunSelfTest(srv *Server, cfg Config, logger *slog.Logger) int {
+	report := RunSelfTestWithReport(srv, cfg, logger)
+	return report.Failed
+}
+
+// RunSelfTestWithReport runs the integration self-test suite and returns a
+// structured report with per-suite and per-step results.
+func RunSelfTestWithReport(srv *Server, cfg Config, logger *slog.Logger) SelfTestReport {
 	log := logger.WithGroup("test") //("component", "self-test")
+	startedAt := time.Now().UTC()
+	report := SelfTestReport{StartedAt: startedAt}
 
 	log.Info("waiting for server to become ready")
 	if !stWaitReady(cfg.Port, 10*time.Second) {
-		log.Error("server did not become ready within timeout")
-		return 1
+		const msg = "server did not become ready within timeout"
+		log.Error(msg)
+		report.FinishedAt = time.Now().UTC()
+		report.Duration = report.FinishedAt.Sub(report.StartedAt)
+		report.Failed = 1
+		report.Error = msg
+		return report
 	}
 	log.Info("server ready – starting suite")
 
@@ -59,7 +73,8 @@ type selfTestRunner struct {
 	knownHashes []string
 }
 
-func (r *selfTestRunner) run() (failures int) {
+func (r *selfTestRunner) run() SelfTestReport {
+	startedAt := time.Now().UTC()
 
 	// ── identities ────────────────────────────────────────────────────────────
 	firstAuth, firstLabel := r.newPubKeyAuth()
@@ -80,10 +95,12 @@ func (r *selfTestRunner) run() (failures int) {
 
 	setupSuite := r.runSetup(firstAuth, preexisting)
 	if setupSuite.failCount() > 0 {
+		suites := []*stSuite{setupSuite}
 		r.logSuite(setupSuite)
+		r.logReport(suites)
 		r.log.Error("setup failed, aborting run")
 		r.purgeTestUsers()
-		return setupSuite.failCount()
+		return r.buildReport(startedAt, suites, "setup failed, aborting run")
 	}
 
 	// ── suites ────────────────────────────────────────────────────────────────
@@ -98,9 +115,7 @@ func (r *selfTestRunner) run() (failures int) {
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
 	// ── log each suite then print report ─────────────────────────────────────
-
 	for _, s := range suites {
-		failures = failures + s.failCount()
 		r.logSuite(s)
 	}
 	r.logReport(suites)
@@ -108,7 +123,7 @@ func (r *selfTestRunner) run() (failures int) {
 	// ── purge ─────────────────────────────────────────────────────────────────
 	r.purgeTestUsers()
 
-	return failures
+	return r.buildReport(startedAt, suites, "")
 }
 
 // ============================================================================
@@ -332,6 +347,95 @@ func (ss stSteps) LogValue() slog.Value {
 		values[i] = s.LogValue()
 	}
 	return slog.AnyValue(values)
+}
+
+type SelfTestReport struct {
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Duration   time.Duration
+	Passed     int
+	Failed     int
+	Skipped    int
+	Error      string
+	Suites     []SelfTestSuiteReport
+}
+
+type SelfTestSuiteReport struct {
+	Name     string
+	Passed   int
+	Failed   int
+	Skipped  int
+	Duration time.Duration
+	Steps    []SelfTestStepReport
+}
+
+type SelfTestStepReport struct {
+	Name     string
+	WantFail bool
+	Skipped  bool
+	Passed   bool
+	Error    string
+	Note     string
+	Duration time.Duration
+}
+
+func (r *selfTestRunner) buildReport(startedAt time.Time, suites []*stSuite, runErr string) SelfTestReport {
+	report := SelfTestReport{
+		StartedAt:  startedAt.UTC(),
+		FinishedAt: time.Now().UTC(),
+		Error:      strings.TrimSpace(runErr),
+		Suites:     make([]SelfTestSuiteReport, 0, len(suites)),
+	}
+
+	for _, suite := range suites {
+		suiteReport := SelfTestSuiteReport{
+			Name:  suite.name,
+			Steps: make([]SelfTestStepReport, 0, len(suite.steps)),
+		}
+		var suiteDur time.Duration
+
+		for _, step := range suite.steps {
+			stepReport := SelfTestStepReport{
+				Name:     step.Name,
+				WantFail: step.WantFail,
+				Skipped:  step.Skipped,
+				Passed:   step.passed(),
+				Note:     step.Note,
+				Duration: step.Dur.Round(time.Millisecond),
+			}
+			suiteDur += step.Dur
+			if step.Err != nil {
+				stepReport.Error = step.Err.Error()
+			}
+
+			suiteReport.Steps = append(suiteReport.Steps, stepReport)
+
+			switch {
+			case step.Skipped:
+				suiteReport.Skipped++
+			case step.passed():
+				suiteReport.Passed++
+			default:
+				suiteReport.Failed++
+			}
+		}
+		if suiteDur <= 0 {
+			suiteDur = suite.duration()
+		}
+		suiteReport.Duration = suiteDur.Round(time.Millisecond)
+
+		report.Passed += suiteReport.Passed
+		report.Failed += suiteReport.Failed
+		report.Skipped += suiteReport.Skipped
+		report.Suites = append(report.Suites, suiteReport)
+	}
+
+	report.Duration = report.FinishedAt.Sub(report.StartedAt)
+	if report.Duration < 0 {
+		report.Duration = 0
+	}
+
+	return report
 }
 
 func (r *selfTestRunner) logReport(suites []*stSuite) {

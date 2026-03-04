@@ -34,6 +34,7 @@ const (
 	EventAdminBan   EventKind = "admin/ban"
 	EventAdminUnban EventKind = "admin/unban"
 	EventAdminPurge EventKind = "admin/purge"
+	EventAdminSelf  EventKind = "admin/selftest"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -816,6 +816,8 @@ type Server struct {
 	cancel           context.CancelFunc
 	adminShutdownMu  sync.Mutex
 	adminShutdown    func(context.Context) error
+	selfTestMu       sync.Mutex
+	selfTestState    adminSelfTestState
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
