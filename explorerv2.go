@@ -363,7 +363,8 @@ func (e *explorerService) handlePOST(
 		return
 	}
 
-	if err := e.streamParts(mr, relPath, h); err != nil {
+	resumeMode := explorerResumeRequested(r)
+	if err := e.streamParts(mr, relPath, h, resumeMode); err != nil {
 		if errors.Is(err, errExplorerUploadTooLarge) {
 			http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
 			return
@@ -379,7 +380,7 @@ func (e *explorerService) handlePOST(
 	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
-func (e *explorerService) streamParts(mr *multipart.Reader, dirRel string, h *fsHandler) error {
+func (e *explorerService) streamParts(mr *multipart.Reader, dirRel string, h *fsHandler, resumeMode bool) error {
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
@@ -437,7 +438,12 @@ func (e *explorerService) streamParts(mr *multipart.Reader, dirRel string, h *fs
 			oldSize = meta.fi.Size()
 		}
 
-		size, err := explorerWriteFileAtomically(meta.full, part, e.maxFileSize)
+		var size int64
+		if resumeMode && meta.exists && !meta.isDir {
+			size, err = explorerAppendFile(meta.full, part, e.maxFileSize, oldSize)
+		} else {
+			size, err = explorerWriteFileAtomically(meta.full, part, e.maxFileSize)
+		}
 		_ = part.Close()
 		if err != nil {
 			if errors.Is(err, errExplorerUploadTooLarge) {
@@ -477,6 +483,27 @@ func explorerWriteFileAtomically(fullPath string, src io.Reader, maxSize int64) 
 	return written, nil
 }
 
+func explorerAppendFile(fullPath string, src io.Reader, maxSize, existingSize int64) (int64, error) {
+	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, permFile)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	remaining := maxSize
+	if maxSize > 0 {
+		remaining = maxSize - existingSize
+		if remaining <= 0 {
+			return existingSize, errExplorerUploadTooLarge
+		}
+	}
+	written, err := explorerCopyWithLimit(f, src, remaining)
+	if err != nil {
+		return existingSize, err
+	}
+	return existingSize + written, nil
+}
+
 func explorerCopyWithLimit(dst io.Writer, src io.Reader, maxSize int64) (int64, error) {
 	if maxSize <= 0 {
 		return io.Copy(dst, src)
@@ -487,6 +514,15 @@ func explorerCopyWithLimit(dst io.Writer, src io.Reader, maxSize int64) (int64, 
 		return maxSize, errExplorerUploadTooLarge
 	}
 	return n, err
+}
+
+func explorerResumeRequested(r *http.Request) bool {
+	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("resume")))
+	if v == "1" || v == "true" || v == "yes" || v == "on" {
+		return true
+	}
+	hv := strings.TrimSpace(strings.ToLower(r.Header.Get("X-SFTPGuy-Resume")))
+	return hv == "1" || hv == "true" || hv == "yes" || hv == "on"
 }
 
 func (e *explorerService) readDir(fullPath, relPath string, contributor bool, h *fsHandler) ([]explorerEntry, error) {

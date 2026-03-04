@@ -114,6 +114,52 @@ func TestExplorerPermissionsBoundToSignedIdentityCookie(t *testing.T) {
 	}
 }
 
+func TestExplorerResumeUploadAppendsContent(t *testing.T) {
+	srv := newExplorerTestServer(t)
+	defer func() {
+		_ = srv.Shutdown()
+	}()
+
+	h, err := srv.ExplorerHandler()
+	if err != nil {
+		t.Fatalf("explorer handler: %v", err)
+	}
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	client := newExplorerHTTPClient(t)
+	csrf, err := explorerFetchCSRF(client, ts.URL+"/")
+	if err != nil {
+		t.Fatalf("fetch csrf: %v", err)
+	}
+
+	// Cross contributor threshold first so file downloads are permitted.
+	if err := explorerUpload(client, ts.URL+"/", csrf, "unlock.bin", bytes.Repeat([]byte("u"), 96)); err != nil {
+		t.Fatalf("unlock upload: %v", err)
+	}
+
+	base := []byte("resume-a:")
+	appendPart := []byte("resume-b")
+	if err := explorerUpload(client, ts.URL+"/", csrf, "resume.txt", base); err != nil {
+		t.Fatalf("base upload: %v", err)
+	}
+	if err := explorerUpload(client, ts.URL+"/?resume=1", csrf, "resume.txt", appendPart); err != nil {
+		t.Fatalf("resume upload: %v", err)
+	}
+
+	resp, got, err := explorerDownload(client, ts.URL+"/resume.txt")
+	if err != nil {
+		t.Fatalf("download resumed file: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	want := append(append([]byte{}, base...), appendPart...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("resume mismatch: got %q want %q", string(got), string(want))
+	}
+}
+
 func newExplorerTestServer(t *testing.T) *Server {
 	t.Helper()
 	root := t.TempDir()
@@ -236,4 +282,14 @@ func explorerUpload(client *http.Client, postURL, csrfToken, filename string, pa
 		return fmt.Errorf("upload status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return nil
+}
+
+func explorerDownload(client *http.Client, rawURL string) (*http.Response, []byte, error) {
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp, body, nil
 }

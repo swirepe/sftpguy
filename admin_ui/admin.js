@@ -424,8 +424,12 @@
       const data = state.explorer || {};
       const ex = data.explorer || {};
       const activity = data.activity || {};
+      const sessions = data.sessions || [];
+      const topPaths = data.top_paths || [];
+      const deniedReasons = data.denied_reasons || [];
+      const rateLimit = data.rate_limit || {};
       const win = activity.window || {};
-      setTabCount("explorer", ex.enabled ? null : 0);
+      setTabCount("explorer", ex.enabled ? Number(activity.sessions || sessions.length || 0) : 0);
 
       const configRows = [
         ["Enabled", ex.enabled ? "<span class=\"tag ok\">YES</span>" : "<span class=\"tag warn\">NO</span>"],
@@ -439,15 +443,62 @@
         ["Window", esc(win.label || state.timeRange)],
         ["Events", esc(activity.events || 0)],
         ["Users", esc(activity.users || 0)],
+        ["Sessions", esc(activity.sessions || sessions.length || 0)],
         ["Uploads", esc(activity.uploads || 0)],
         ["Downloads", esc(activity.downloads || 0)],
-        ["Denied", esc(activity.denied || 0)]
+        ["Denied", esc(activity.denied || 0)],
+        ["Contributor Locks", esc(activity.contributor_locks || 0)],
+        ["Rate-limit Hits", esc(activity.rate_limit_hits || 0)]
       ];
+      const sessionRows = sessions.slice(0, 300).map(function(x) {
+        return [
+          sessionCell(x.session),
+          ownerCell(x.user_id),
+          ipCell(x.ip),
+          "<code>" + esc(x.start_time || "") + "</code>",
+          "<code>" + esc(x.end_time || "") + "</code>",
+          esc(String(x.duration_sec || 0) + "s"),
+          esc(x.event_count || 0),
+          esc(x.uploads || 0),
+          esc(x.downloads || 0),
+          esc(x.denied || 0),
+          esc(x.rate_limit_hits || 0)
+        ];
+      });
+      const pathRows = topPaths.map(function(x) {
+        return [
+          "<code>" + esc(x.path || "") + "</code>",
+          esc(x.count || 0),
+          esc(x.uploads || 0),
+          esc(x.downloads || 0),
+          esc(x.denied || 0)
+        ];
+      });
+      const deniedRows = deniedReasons.map(function(x) {
+        return ["<code>" + esc(x.reason || "") + "</code>", esc(x.count || 0)];
+      });
+      const rateUserRows = (rateLimit.by_user || []).map(function(x) {
+        return [ownerCell(x.name), esc(x.count || 0)];
+      });
+      const rateIPRows = (rateLimit.by_ip || []).map(function(x) {
+        return [ipCell(x.name), esc(x.count || 0)];
+      });
+      const ratePathRows = (rateLimit.by_path || []).map(function(x) {
+        return ["<code>" + esc(x.name || "") + "</code>", esc(x.count || 0)];
+      });
       const quickLink = ex.addr ? "<a href=\"http://" + esc(ex.addr) + "\" target=\"_blank\" rel=\"noreferrer\">Open Explorer</a>" : "<span class=\"muted\">Explorer disabled</span>";
       document.getElementById("explorer-out").innerHTML =
         "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span><span class=\"pill\">" + quickLink + "</span></div>" +
         "<h3>Configuration</h3>" + renderSimpleTable(["Field", "Value"], configRows) +
-        "<h3>Activity</h3>" + renderSimpleTable(["Metric", "Value"], activityRows);
+        "<h3>Activity</h3>" + renderSimpleTable(["Metric", "Value"], activityRows) +
+        "<h3>Explorer Sessions</h3>" + renderSimpleTable(["Session", "User", "IP", "Start", "End", "Duration", "Events", "Uploads", "Downloads", "Denied", "Rate-limit"], sessionRows) +
+        "<h3>Top Paths</h3>" + renderSimpleTable(["Path", "Events", "Uploads", "Downloads", "Denied"], pathRows) +
+        "<h3>Denied Reasons</h3>" + renderSimpleTable(["Reason", "Count"], deniedRows) +
+        "<h3>Rate-limit Hits</h3>" +
+        "<div class=\"row\"><span class=\"pill\">total " + esc(rateLimit.total || activity.rate_limit_hits || 0) + "</span></div>" +
+        renderSimpleTable(["User", "Hits"], rateUserRows) +
+        renderSimpleTable(["IP", "Hits"], rateIPRows) +
+        renderSimpleTable(["Path", "Hits"], ratePathRows);
     }
 
     async function loadUsers() {
