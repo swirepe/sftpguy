@@ -255,23 +255,44 @@ func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, vic
 	victimFile := "selftest_ban_" + stRandHex() + ".txt"
 
 	// 1. Setup file
-	_, sftpCli, _ := r.openSFTP(victimAuth)
+	sshCli, sftpCli, err := r.openSFTP(victimAuth)
+	s.check("connect (pre-ban)", err)
+	if err != nil {
+		return s
+	}
 	r.checkWrite(s, sftpCli, victimFile, stPayload(r.cfg.ContributorThreshold), true)
+	_ = sftpCli.Close()
+	_ = sshCli.Close()
 
 	// 2. BAN
 	r.srv.Ban(victimHash)
 	s.assert("victimHash is banned", r.srv.store.IsBanned(victimHash))
+
+	sshCli, sftpCli, err = r.openSFTP(victimAuth)
+	s.check("connect while banned", err)
+	if err != nil {
+		return s
+	}
 	// 3. Victim tries to delete.
 	// The test passes IF the file is NOT deleted (wantDeleted=false).
 	// We don't care if the server says "OK" or "Permission Denied".
 	r.checkDelete(s, sftpCli, victimFile, false)
+	_ = sftpCli.Close()
+	_ = sshCli.Close()
 
 	// 4. UNBAN
 	r.srv.Unban(victimHash)
 	s.assert("victimHash is unbanned", !r.srv.store.IsBanned(victimHash))
 
+	sshCli, sftpCli, err = r.openSFTP(victimAuth)
+	s.check("connect after unban", err)
+	if err != nil {
+		return s
+	}
 	// 5. Normal operation (wantDeleted=true)
 	r.checkDelete(s, sftpCli, victimFile, true)
+	_ = sftpCli.Close()
+	_ = sshCli.Close()
 
 	return s
 }
@@ -656,6 +677,48 @@ func (r *selfTestRunner) local(sftpPath string) string {
 	return filepath.Join(r.srv.absUploadDir, path.Clean("/"+sftpPath))
 }
 
+type stDiskSnapshot struct {
+	exists bool
+	isDir  bool
+	size   int64
+	hash   [sha256.Size]byte
+}
+
+func stSnapshot(fullPath string) (stDiskSnapshot, error) {
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return stDiskSnapshot{}, nil
+		}
+		return stDiskSnapshot{}, err
+	}
+
+	snap := stDiskSnapshot{
+		exists: true,
+		isDir:  fi.IsDir(),
+		size:   fi.Size(),
+	}
+	if fi.Mode().IsRegular() {
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			return stDiskSnapshot{}, err
+		}
+		snap.hash = sha256.Sum256(data)
+	}
+
+	return snap, nil
+}
+
+func (s stDiskSnapshot) equal(other stDiskSnapshot) bool {
+	if s.exists != other.exists || s.isDir != other.isDir || s.size != other.size {
+		return false
+	}
+	if !s.exists || s.isDir {
+		return true
+	}
+	return s.hash == other.hash
+}
+
 // checkDelete verifies disk state after a removal attempt.
 func (r *selfTestRunner) checkDelete(s *stSuite, sftp *sftp.Client, sftpPath string, wantDeleted bool) {
 	start := time.Now()
@@ -676,16 +739,26 @@ func (r *selfTestRunner) checkDelete(s *stSuite, sftp *sftp.Client, sftpPath str
 
 func (r *selfTestRunner) checkWrite(s *stSuite, sftp *sftp.Client, sftpPath string, data []byte, wantExists bool) {
 	start := time.Now()
+	fullPath := r.local(sftpPath)
+	before, snapErr := stSnapshot(fullPath)
+	if snapErr != nil {
+		s.record("write "+sftpPath, false, fmt.Errorf("disk: snapshot before write failed: %w", snapErr), start)
+		return
+	}
+
 	protoErr := stWrite(sftp, sftpPath, data)
 
-	_, statErr := os.Stat(r.local(sftpPath))
-	exists := !os.IsNotExist(statErr)
+	after, snapErr := stSnapshot(fullPath)
+	if snapErr != nil {
+		s.record("write "+sftpPath, false, fmt.Errorf("disk: snapshot after write failed: %w (proto: %v)", snapErr, protoErr), start)
+		return
+	}
 
 	var diskErr error
-	if wantExists && !exists {
+	if wantExists && !after.exists {
 		diskErr = fmt.Errorf("disk: file missing (proto: %v)", protoErr)
-	} else if !wantExists && exists {
-		diskErr = fmt.Errorf("disk: file created/updated unexpectedly (proto: %v)", protoErr)
+	} else if !wantExists && !before.equal(after) {
+		diskErr = fmt.Errorf("disk: file changed unexpectedly (proto: %v)", protoErr)
 	}
 
 	s.record("write "+sftpPath, false, diskErr, start)
