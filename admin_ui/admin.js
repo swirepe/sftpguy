@@ -46,6 +46,21 @@
     function shortSession(v) {
       return shortHash(v);
     }
+    function timestampToMs(v) {
+      const n = Number(v || 0);
+      if (!isFinite(n) || n <= 0) return 0;
+      return n >= 1000000000000 ? n : (n * 1000);
+    }
+    function secondsToMs(v) {
+      const n = Number(v || 0);
+      if (!isFinite(n) || n <= 0) return 0;
+      return n * 1000;
+    }
+    function formatMs(v) {
+      const n = Number(v || 0);
+      if (!isFinite(n) || n <= 0) return "0ms";
+      return Math.round(n) + "ms";
+    }
     function formatBytes(n) {
       let x = Number(n || 0);
       if (!isFinite(x) || x <= 0) return "0 B";
@@ -271,8 +286,8 @@
     function renderActionTimeline(actions, opts) {
       opts = opts || {};
       const rows = (actions || []).slice().sort(function(a, b) {
-        const ta = Number(a.timestamp || 0);
-        const tb = Number(b.timestamp || 0);
+        const ta = timestampToMs(a.timestamp);
+        const tb = timestampToMs(b.timestamp);
         if (ta === tb) return Number(a.id || 0) - Number(b.id || 0);
         return ta - tb;
       });
@@ -280,10 +295,10 @@
         return "<div class=\"muted\">" + esc(opts.empty || "No actions") + "</div>";
       }
 
-      const startTs = Number(rows[0].timestamp || 0);
-      const endTs = Number(rows[rows.length - 1].timestamp || startTs);
-      const spanSec = Math.max(0, endTs - startTs);
-      const spanDivisor = Math.max(1, spanSec);
+      const startMs = timestampToMs(rows[0].timestamp);
+      const endMs = timestampToMs(rows[rows.length - 1].timestamp);
+      const spanMs = Math.max(0, endMs - startMs);
+      const spanDivisor = Math.max(1, spanMs);
       const counts = {};
       rows.forEach(function(x) {
         const key = String(x.event || "unknown");
@@ -295,19 +310,19 @@
       }).slice(0, 8);
 
       const markerHtml = rows.map(function(a) {
-        const ts = Number(a.timestamp || startTs);
-        const left = ((ts - startTs) / spanDivisor) * 100;
+        const ts = timestampToMs(a.timestamp) || startMs;
+        const left = ((ts - startMs) / spanDivisor) * 100;
         const tone = eventTone(a.event);
         return "<span class=\"timeline-dot " + tone + "\" style=\"left:" + left.toFixed(2) + "%\"></span>";
       }).join("");
 
       const rowHtml = rows.map(function(a) {
-        const ts = Number(a.timestamp || startTs);
-        const offset = Math.max(0, ts - startTs);
+        const ts = timestampToMs(a.timestamp) || startMs;
+        const offset = Math.max(0, ts - startMs);
         const tone = eventTone(a.event);
         const detail = a.path ? String(a.path) : (a.meta ? String(a.meta) : "");
         return "<div class=\"timeline-item\">" +
-          "<code class=\"timeline-offset\">+" + esc(offset) + "s</code>" +
+          "<code class=\"timeline-offset\">+" + esc(formatMs(offset)) + "</code>" +
           "<code class=\"timeline-time\">" + esc(a.time || "") + "</code>" +
           "<span class=\"evt-chip " + tone + "\">" + esc(String(a.event || "").toUpperCase()) + "</span>" +
           "<code class=\"timeline-detail\">" + esc(detail) + "</code>" +
@@ -319,7 +334,7 @@
       }).join("");
 
       return "<div class=\"action-viz\">" +
-        "<div class=\"row\"><span class=\"pill\">events " + esc(rows.length) + "</span><span class=\"pill\">span " + esc(spanSec) + "s</span>" + summaryPills + "</div>" +
+        "<div class=\"row\"><span class=\"pill\">events " + esc(rows.length) + "</span><span class=\"pill\">span " + esc(formatMs(spanMs)) + "</span>" + summaryPills + "</div>" +
         "<div class=\"timeline-rail\">" + markerHtml + "</div>" +
         "<div class=\"timeline-list\">" + rowHtml + "</div>" +
       "</div>";
@@ -1091,8 +1106,20 @@
             detail
           ];
         });
-        const userActionBlocks = (suite.user_actions || []).map(function(userBlock) {
-          const sessionBlocks = (userBlock.sessions || []).map(function(sessionBlock) {
+        const activeUserActions = (suite.user_actions || []).map(function(userBlock) {
+          const activeSessions = (userBlock.sessions || []).filter(function(sessionBlock) {
+            return (sessionBlock.actions || []).length > 0;
+          });
+          if (!activeSessions.length) return null;
+          return {
+            user: userBlock,
+            sessions: activeSessions
+          };
+        }).filter(Boolean);
+
+        const userActionBlocks = activeUserActions.map(function(userEntry) {
+          const userBlock = userEntry.user;
+          const sessionBlocks = userEntry.sessions.map(function(sessionBlock) {
             const actions = (sessionBlock.actions || []).map(function(a) {
               return {
                 id: a.id,
@@ -1104,15 +1131,14 @@
               };
             });
             return "<div class=\"suite-session\">" +
-              "<div class=\"muted\">session=" + sessionCell(sessionBlock.session || "") + " ip=" + ipCell(sessionBlock.ip || "") + " duration=<code>" + esc((sessionBlock.duration_sec || 0) + "s") + "</code></div>" +
+              "<div class=\"muted\">session=" + sessionCell(sessionBlock.session || "") + " ip=" + ipCell(sessionBlock.ip || "") + " duration=<code>" + esc(formatMs(secondsToMs(sessionBlock.duration_sec))) + "</code></div>" +
               renderActionTimeline(actions, { empty: "No actions for this session" }) +
             "</div>";
           }).join("");
-          const sessionContent = sessionBlocks || "<div class=\"muted\">No actions for this user in this suite.</div>";
 
           return "<div class=\"suite-user\">" +
             "<h3>User " + ownerCell(userBlock.user_id) + " <span class=\"pill\">" + esc(userBlock.user_label || "") + "</span></h3>" +
-            sessionContent +
+            sessionBlocks +
           "</div>";
         }).join("");
 
