@@ -15,19 +15,30 @@ import (
 )
 
 type IPList struct {
-	ranger atomic.Pointer[cidranger.Ranger]
+	// ranger stores the cidranger.Ranger interface
+	ranger atomic.Value
 	logger *slog.Logger
 	cancel context.CancelFunc
 }
 
+// NewIPList initializes the list and starts a background reloader.
 func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPList {
 	log := logger.With("ip_list", filepath)
-	bl := &IPList{logger: log}
-	bl.reload(filepath) // Initial load
+	ctx, cancel := context.WithCancel(ctx)
+
+	bl := &IPList{
+		logger: log,
+		cancel: cancel,
+	}
+
+	if entries, addresses, err := bl.reload(filepath); err != nil {
+		log.Error("initial load failed", "error", err)
+	} else {
+		log.Info("initial load complete", "entries", entries, "addresses", addresses)
+	}
 
 	go func() {
 		const period = 30 * time.Second
-		log.Info("Starting ip list reloader", "period", period)
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 
@@ -36,13 +47,14 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 			case <-ticker.C:
 				start := time.Now()
 				entries, addresses, err := bl.reload(filepath)
+
 				bl.logger.Debug("reloaded ip list file",
 					"entries", entries,
 					"addresses", addresses,
 					"duration", time.Since(start),
 					"error", err)
 			case <-ctx.Done():
-				log.Info("Stopping ip list reloader")
+				log.Info("stopping ip list reloader")
 				return
 			}
 		}
@@ -51,19 +63,21 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 	return bl
 }
 
+// Stop halts the background reloader.
 func (bl *IPList) Stop() {
 	if bl.cancel != nil {
 		bl.cancel()
 	}
 }
 
-func (bl *IPList) reload(filepath string) (entries, addresses int, err error) {
+func (bl *IPList) reload(filepath string) (entries int, addresses uint64, err error) {
 	newRanger := cidranger.NewPCTrieRanger()
 
 	file, err := os.Open(filepath)
 	if err != nil {
-		bl.ranger.Store(&newRanger)
-		return 0, 0, err
+		// IMPORTANT: Do not Store an empty ranger here.
+		// Return the error so the system keeps using the last successful version.
+		return 0, 0, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
@@ -71,7 +85,10 @@ func (bl *IPList) reload(filepath string) (entries, addresses int, err error) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		line = strings.Split(line, "#")[0]
+		// Remove comments
+		if idx := strings.Index(line, "#"); idx != -1 {
+			line = line[:idx]
+		}
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -81,26 +98,43 @@ func (bl *IPList) reload(filepath string) (entries, addresses int, err error) {
 
 		_, network, err := net.ParseCIDR(cidrStr)
 		if err != nil {
-			// Try parsing as a single IP if CIDR failed
+			// Try parsing as a single IP
 			if ip := net.ParseIP(cidrStr); ip != nil {
-				mask := 32
+				maskLen := 32
 				if ip.To4() == nil {
-					mask = 128
+					maskLen = 128
 				}
-				network = &net.IPNet{IP: ip, Mask: net.CIDRMask(mask, mask)}
+				network = &net.IPNet{
+					IP:   ip,
+					Mask: net.CIDRMask(maskLen, maskLen),
+				}
 			} else {
-				continue // Skip invalid lines
+				bl.logger.Warn("skipping invalid line", "line", line)
+				continue
 			}
 		}
 
 		newRanger.Insert(cidranger.NewBasicRangerEntry(*network))
+		entries++
+
+		// Calculate address count safely
 		ones, bits := network.Mask.Size()
-		count := 1 << uint(bits-ones)
-		addresses += count
-		entries += 1
+		diff := bits - ones
+		if diff < 64 {
+			addresses += 1 << uint64(diff)
+		} else {
+			// For IPv6 /64 or larger, math/big would be needed.
+			// We cap it at MaxUint64 to prevent overflow panics.
+			addresses = ^uint64(0)
+		}
 	}
 
-	bl.ranger.Store(&newRanger)
+	if err := scanner.Err(); err != nil {
+		return entries, addresses, fmt.Errorf("scanner error: %w", err)
+	}
+
+	// Swap the old ranger with the new one atomically
+	bl.ranger.Store(newRanger)
 	return entries, addresses, nil
 }
 
@@ -111,27 +145,31 @@ func normalizeIPPattern(input string) string {
 	}
 
 	parts := strings.Split(input, ".")
-	wildcards := 0
+	if len(parts) != 4 {
+		return input // Only handle IPv4 wildcards
+	}
+
+	mask := 0
 	for i, part := range parts {
 		if part == "*" {
 			parts[i] = "0"
-			wildcards++
+		} else {
+			// The mask length is determined by the last non-wildcard octet
+			mask = (i + 1) * 8
 		}
 	}
 
-	// If it's IPv4 (4 parts), calculate mask
-	if len(parts) == 4 {
-		mask := (4 - wildcards) * 8
-		return fmt.Sprintf("%s/%d", strings.Join(parts, "."), mask)
-	}
-	return input
+	return fmt.Sprintf("%s/%d", strings.Join(parts, "."), mask)
 }
 
+// Matches returns true if the IP is found in the current range list.
 func (bl *IPList) Matches(ipStr string) bool {
-	ranger := *bl.ranger.Load()
-	if ranger == nil {
+	// Retrieve the interface from atomic.Value
+	val := bl.ranger.Load()
+	if val == nil {
 		return false
 	}
+	ranger := val.(cidranger.Ranger)
 
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -144,16 +182,3 @@ func (bl *IPList) Matches(ipStr string) bool {
 	}
 	return contains
 }
-
-// func main() {
-// 	blacklist := NewIPList("ips.txt")
-
-// 	// Example usage
-// 	for {
-// 		testIP := "23.45.1.1"
-// 		if blacklist.Matches(testIP) {
-// 			fmt.Printf("IP %s is blocked!\n", testIP)
-// 		}
-// 		time.Sleep(5 * time.Second)
-// 	}
-// }

@@ -301,9 +301,9 @@ func NewStore(path string, logger *slog.Logger) (*Store, error) {
 	if _, err := db.Exec(Schema); err != nil {
 		return nil, err
 	}
-
-	black := NewIPList(context.Background(), "blacklist.txt", logger)
-	white := NewIPList(context.Background(), "whitelist.txt", logger)
+	ctx := context.Background()
+	black := NewIPList(ctx, "blacklist.txt", logger)
+	white := NewIPList(ctx, "whitelist.txt", logger)
 	return &Store{db: db,
 		logger:    logger,
 		blacklist: black,
@@ -634,6 +634,8 @@ type Config struct {
 	SshNoAuth               bool
 	SelfTest                bool
 	SelfTestContinue        bool
+	BlacklistPath           string
+	WhitelistPath           string
 }
 
 func LoadConfig() (Config, error) {
@@ -641,8 +643,8 @@ func LoadConfig() (Config, error) {
 
 	cfg := Config{}
 
-	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name")
-	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port")
+	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name", "n")
+	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port", "p")
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
@@ -655,7 +657,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 10000, "Maximum total directories allowed in archive")
 	EnvFlag(&cfg.Unrestricted, "unrestricted", "UNRESTRICTED_PATHS", strings.Join(defaultUnrestrictedPaths, ","), "Comma-separated list of paths always available for download")
 	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
-	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.")
+	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.", "v")
 	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Enable debug logging")
 	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
 	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
@@ -663,7 +665,10 @@ func LoadConfig() (Config, error) {
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
 
 	EnvFlag(&cfg.SelfTest, "test", "SELF_TEST", false, "Run integration self-test suite after startup then exit")
-	EnvFlag(&cfg.SelfTestContinue, "test.continue", "SELF_TEST_CONTINUE", false, "Run integration self-test suite after startup, then keep serving")
+	EnvFlag(&cfg.SelfTestContinue, "test.continue", "SELF_TEST_CONTINUE", false, "Run integration self-test suite after startup, then keep serving", "T")
+
+	EnvFlag(&cfg.BlacklistPath, "blacklist", "BLACKLIST", "blacklist.txt", "Text file of IP addresses to blacklist, one per line")
+	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 
 	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
@@ -812,6 +817,7 @@ type Server struct {
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
+
 	store, err := NewStore(cfg.DBPath, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init store: %w", err)
@@ -1307,7 +1313,7 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		welcomeMsg = fmt.Sprintf("\r\nWelcome, %s\r\n", color.Bold(userLabel))
 	}
 
-	fmt.Fprintf(w, welcomeMsg)
+	fmt.Fprintf(w, "%s", welcomeMsg)
 	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
 	fmt.Fprintf(w, "* You may always modify or delete files or directories you have created.\r\n")
 
@@ -2142,9 +2148,16 @@ func getEnv(key string) (string, bool) {
 	}
 	return os.LookupEnv(key)
 }
-
-func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
+func EnvFlag[T any](ptr *T, name string, env string, def T, usage string, aliases ...string) {
 	val, ok := getEnv(env)
+
+	if len(aliases) > 0 {
+		var formattedAliases []string
+		for _, a := range aliases {
+			formattedAliases = append(formattedAliases, "-"+a)
+		}
+		usage = fmt.Sprintf("%s (aliases: %s)", usage, strings.Join(formattedAliases, ", "))
+	}
 
 	switch p := any(ptr).(type) {
 	case *string:
@@ -2153,34 +2166,59 @@ func EnvFlag[T any](ptr *T, name string, env string, def T, usage string) {
 			*p = val
 		}
 		flag.StringVar(p, name, *p, usage)
+
+		for _, a := range aliases {
+			flag.StringVar(p, a, *p, "alias for -"+name)
+		}
 	case *int:
 		*p = any(def).(int)
 		if ok {
 			*p, _ = strconv.Atoi(val)
 		}
 		flag.IntVar(p, name, *p, usage)
+		for _, a := range aliases {
+			flag.IntVar(p, a, *p, "alias for -"+name)
+		}
 	case *bool:
 		*p = any(def).(bool)
 		if ok {
 			*p, _ = strconv.ParseBool(val)
 		}
 		flag.BoolVar(p, name, *p, usage)
+		for _, a := range aliases {
+			flag.BoolVar(p, a, *p, "alias for -"+name) //usage + " (alias)")
+		}
 	case *float64:
 		*p = any(def).(float64)
 		if ok {
 			*p, _ = strconv.ParseFloat(val, 64)
 		}
 		flag.Float64Var(p, name, *p, usage)
+		for _, a := range aliases {
+			flag.Float64Var(p, a, *p, "alias for -"+name)
+		}
 	}
 }
 
-func EnvSizeFlag(ptr *int64, name string, env string, def string, usage string) {
+func EnvSizeFlag(ptr *int64, name string, env string, def string, usage string, aliases ...string) {
 	val, ok := getEnv(env)
 	if !ok {
 		val = def
 	}
+
+	if len(aliases) > 0 {
+		var formattedAliases []string
+		for _, a := range aliases {
+			formattedAliases = append(formattedAliases, "-"+a)
+		}
+		usage = fmt.Sprintf("%s (aliases: %s)", usage, strings.Join(formattedAliases, ", "))
+	}
+
 	intVal, _ := parseSize(val)
 	flag.Int64Var(ptr, name, intVal, usage)
+	for _, a := range aliases {
+		flag.Int64Var(ptr, a, intVal, "alias for -"+name)
+	}
 }
 
 func parseSize(s string) (int64, error) {
@@ -2544,7 +2582,6 @@ func main() {
 				return
 			}
 			// -test: always exit, code reflects pass/fail.
-			srv.Shutdown()
 			if failures > 0 {
 				os.Exit(1)
 			}

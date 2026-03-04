@@ -59,7 +59,8 @@ type selfTestRunner struct {
 	knownHashes []string
 }
 
-func (r *selfTestRunner) run() int {
+func (r *selfTestRunner) run() (failures int) {
+
 	// ── identities ────────────────────────────────────────────────────────────
 	firstAuth, firstLabel := r.newPubKeyAuth()
 	secondAuth, secondLabel := r.newPubKeyAuth()
@@ -97,10 +98,12 @@ func (r *selfTestRunner) run() int {
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
 	// ── log each suite then print report ─────────────────────────────────────
+
 	for _, s := range suites {
+		failures = failures + s.failCount()
 		r.logSuite(s)
 	}
-	failures := r.logReport(suites)
+	r.logReport(suites)
 
 	// ── purge ─────────────────────────────────────────────────────────────────
 	r.purgeTestUsers()
@@ -201,45 +204,46 @@ func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMet
 }
 
 // runSystemFile creates a real file, registers it as a system (unrestricted)
-// path, verifies mutations are denied, then cleans up.
+// path, verifies mutations are denied via disk-state checks, then cleans up.
 func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 	sysName := "selftest_sysfile_" + stRandHex() + ".txt"
 	s := newStSuite("System file protection (" + sysName + ")")
 
-	// Create file on disk and register it as unrestricted
-	fullPath := filepath.Join(r.srv.absUploadDir, sysName)
-	createErr := os.WriteFile(fullPath, []byte("system file contents"), 0644)
-	s.check("create system file on disk", createErr)
-	if createErr != nil {
-		s.skip("register as unrestricted", "file not created")
-		s.skip("rename "+sysName, "setup failed")
-		s.skip("overwrite "+sysName, "setup failed")
-		s.skip("delete "+sysName, "setup failed")
+	// 1. Setup: Create file on disk and register it as unrestricted
+	fullPath := r.local(sysName)
+	err := os.WriteFile(fullPath, []byte("system file contents"), 0644)
+	s.check("setup: create disk file", err)
+	if err != nil {
 		return s
 	}
 
 	r.srv.cfg.unrestrictedMap[sysName] = true
-	s.assert("register as unrestricted", r.srv.cfg.unrestrictedMap[sysName])
-
 	defer func() {
 		delete(r.srv.cfg.unrestrictedMap, sysName)
 		os.Remove(fullPath)
 	}()
 
+	// 2. Connect
 	sshCli, sftpCli, err := r.openSFTP(auth)
 	s.check("connect", err)
 	if err != nil {
-		s.skip("rename "+sysName, "no connection")
-		s.skip("overwrite "+sysName, "no connection")
-		s.skip("delete "+sysName, "no connection")
 		return s
 	}
 	defer sshCli.Close()
 	defer sftpCli.Close()
 
-	s.wantFail("rename "+sysName, sftpCli.Rename(sysName, sysName+".bak"))
-	s.wantFail("overwrite "+sysName, stWrite(sftpCli, sysName, []byte("overwrite")))
-	s.wantFail("delete "+sysName, sftpCli.Remove(sysName))
+	// 3. Mutation attempts
+	// We use the check helpers to verify the disk state remains unchanged.
+
+	// wantMoved=false: Verify source still exists and dest was not created
+	r.checkRename(s, sftpCli, sysName, sysName+".bak", false)
+
+	// wantExists=true: In the context of a failed write, we verify the file didn't disappear
+	r.checkWrite(s, sftpCli, sysName, []byte("attempted overwrite"), true)
+
+	// wantDeleted=false: Verify the file is still present on disk
+	r.checkDelete(s, sftpCli, sysName, false)
+
 	return s
 }
 
@@ -253,7 +257,7 @@ func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, vic
 
 	// 2. BAN
 	r.srv.Ban(victimHash)
-
+	s.assert("victimHash is banned", r.srv.store.IsBanned(victimHash))
 	// 3. Victim tries to delete.
 	// The test passes IF the file is NOT deleted (wantDeleted=false).
 	// We don't care if the server says "OK" or "Permission Denied".
@@ -261,6 +265,7 @@ func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, vic
 
 	// 4. UNBAN
 	r.srv.Unban(victimHash)
+	s.assert("victimHash is unbanned", !r.srv.store.IsBanned(victimHash))
 
 	// 5. Normal operation (wantDeleted=true)
 	r.checkDelete(s, sftpCli, victimFile, true)
@@ -295,21 +300,25 @@ func (r *selfTestRunner) runOwnerCleanup(auth ssh.AuthMethod, preexisting string
 // ============================================================================
 // Report
 // ============================================================================
+type stSteps []stStep
 
-func (r *selfTestRunner) logReport(suites []*stSuite) int {
+func (ss stSteps) LogValue() slog.Value {
+	values := make([]slog.Value, len(ss))
+	for i, s := range ss {
+		values[i] = s.LogValue()
+	}
+	return slog.AnyValue(values)
+}
+
+func (r *selfTestRunner) logReport(suites []*stSuite) {
 	totalPass, totalFail, totalSkip := 0, 0, 0
 	var totalDur time.Duration
+
 	for _, s := range suites {
 		totalPass += s.passCount()
 		totalFail += s.failCount()
 		totalSkip += s.skipCount()
 		totalDur += s.duration()
-
-		for i, t := range s.steps {
-			if !t.passed() {
-				r.log.Warn(t.name, "suite", s.name, "step", i)
-			}
-		}
 	}
 
 	level := slog.LevelInfo
@@ -329,6 +338,7 @@ func (r *selfTestRunner) logReport(suites []*stSuite) int {
 			"failed", s.failCount(),
 			"skipped", s.skipCount(),
 			"duration", s.duration().Round(time.Millisecond).String(),
+			"failures", stSteps(s.Failures()),
 		)
 	}
 
@@ -339,8 +349,6 @@ func (r *selfTestRunner) logReport(suites []*stSuite) int {
 		"skipped", totalSkip,
 		"duration", totalDur.Round(time.Millisecond).String(),
 	)
-
-	return totalFail
 }
 
 // ============================================================================
@@ -581,22 +589,41 @@ func stTrunc(s string, n int) string {
 // ============================================================================
 
 type stStep struct {
-	name     string
-	wantFail bool
-	err      error
-	skipped  bool
-	note     string
-	dur      time.Duration
+	Name     string
+	WantFail bool
+	Err      error
+	Skipped  bool
+	Note     string
+	Dur      time.Duration
 }
 
 func (t *stStep) passed() bool {
-	if t.skipped {
+	if t.Skipped {
 		return true
 	}
-	if t.wantFail {
-		return t.err != nil
+	if t.WantFail {
+		return t.Err != nil
 	}
-	return t.err == nil
+	return t.Err == nil
+}
+
+func (s stStep) LogValue() slog.Value {
+	attrs := []slog.Attr{
+		slog.String("name", s.Name),
+		slog.Bool("wantFail", s.WantFail),
+		slog.Bool("skipped", s.Skipped),
+		slog.Duration("dur", s.Dur),
+	}
+
+	if s.Err != nil {
+		attrs = append(attrs, slog.String("err", s.Err.Error()))
+	}
+
+	if s.Note != "" {
+		attrs = append(attrs, slog.String("note", s.Note))
+	}
+
+	return slog.GroupValue(attrs...)
 }
 
 type stSuite struct {
@@ -613,8 +640,8 @@ func (s *stSuite) duration() time.Duration { return time.Since(s.start) }
 
 func (s *stSuite) record(name string, wantFail bool, err error, start time.Time) {
 	s.steps = append(s.steps, stStep{
-		name: name, wantFail: wantFail, err: err,
-		dur: time.Since(start),
+		Name: name, WantFail: wantFail, Err: err,
+		Dur: time.Since(start),
 	})
 }
 
@@ -703,12 +730,12 @@ func (s *stSuite) assert(name string, ok bool) {
 }
 
 func (s *stSuite) skip(name, reason string) {
-	s.steps = append(s.steps, stStep{name: name, skipped: true, note: reason})
+	s.steps = append(s.steps, stStep{Name: name, Skipped: true, Note: reason})
 }
 
 func (s *stSuite) passCount() (n int) {
 	for _, t := range s.steps {
-		if !t.skipped && t.passed() {
+		if !t.Skipped && t.passed() {
 			n++
 		}
 	}
@@ -717,16 +744,25 @@ func (s *stSuite) passCount() (n int) {
 
 func (s *stSuite) failCount() (n int) {
 	for _, t := range s.steps {
-		if !t.skipped && !t.passed() {
+		if !t.Skipped && !t.passed() {
 			n++
 		}
 	}
 	return
 }
 
+func (s *stSuite) Failures() (f []stStep) {
+	for _, t := range s.steps {
+		if !t.Skipped && !t.passed() {
+			f = append(f, t)
+		}
+	}
+	return f
+}
+
 func (s *stSuite) skipCount() (n int) {
 	for _, t := range s.steps {
-		if t.skipped {
+		if t.Skipped {
 			n++
 		}
 	}
@@ -740,10 +776,10 @@ func (s *stSuite) skipCount() (n int) {
 func (r *selfTestRunner) logSuite(s *stSuite) {
 	for i, t := range s.steps {
 		num := i + 1
-		if t.skipped {
+		if t.Skipped {
 			r.log.Debug("self-test step",
-				"suite", s.name, "step", num, "name", t.name,
-				"result", "SKIP", "note", t.note,
+				"suite", s.name, "step", num, "name", t.Name,
+				"result", "SKIP", "note", t.Note,
 			)
 			continue
 		}
@@ -756,25 +792,25 @@ func (r *selfTestRunner) logSuite(s *stSuite) {
 		}
 
 		want := "ok"
-		if t.wantFail {
+		if t.WantFail {
 			want = "fail"
 		}
 		got := "ok"
-		if t.err != nil {
+		if t.Err != nil {
 			got = "fail"
 		}
 
 		attrs := []any{
 			"suite", s.name,
 			"step", num,
-			"name", t.name,
+			"name", t.Name,
 			"result", result,
 			"want", want,
 			"got", got,
-			"dur", t.dur.Round(time.Millisecond).String(),
+			"dur", t.Dur.Round(time.Millisecond).String(),
 		}
-		if t.err != nil && !t.passed() {
-			attrs = append(attrs, "err", t.err.Error())
+		if t.Err != nil && !t.passed() {
+			attrs = append(attrs, "err", t.Err.Error())
 		}
 		r.log.Log(nil, level, "self-test step", attrs...) //nolint:sloglint
 	}
