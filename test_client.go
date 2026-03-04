@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -305,6 +306,39 @@ func sftpWrite(c *sftp.Client, p string, data []byte) error {
 	return closeErr
 }
 
+func sftpAppend(c *sftp.Client, p string, data []byte) error {
+	f, err := c.OpenFile(path.Clean("/"+p), os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func sftpReadBytes(c *sftp.Client, p string) ([]byte, error) {
+	f, err := c.Open(path.Clean("/" + p))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func sftpCheckContent(c *sftp.Client, p string, want []byte) error {
+	got, err := sftpReadBytes(c, p)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", p, err)
+	}
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("content mismatch for %s (got %q want %q)", p, trunc(string(got), 80), trunc(string(want), 80))
+	}
+	return nil
+}
+
 func randSuffix() string {
 	b := make([]byte, 4)
 	rand.Read(b) //nolint:errcheck
@@ -416,6 +450,54 @@ func runNonOwnerSuite(label, preexisting string, auth ssh.AuthMethod) *suite {
 	return s
 }
 
+func runResumeSuite(label string, auth ssh.AuthMethod) *suite {
+	s := &suite{name: "Resume uploads: " + label}
+	sfx := randSuffix()
+
+	sshCli, sftpCli, err := openSFTP(auth)
+	s.check("connect to server (SFTP)", "ok", err)
+	if err != nil {
+		for i := 0; i < 9; i++ {
+			s.skip("(skipped)", "no SFTP connection")
+		}
+		return s
+	}
+	defer sshCli.Close()
+	defer sftpCli.Close()
+
+	// Single file resume (`reput`) behavior.
+	resumeFile := "testclient_resume_" + sfx + ".txt"
+	initial := []byte("initial contents\n")
+	appended := []byte("updated contents\n")
+	updated := append(append([]byte{}, initial...), appended...)
+
+	s.check("write initial file", "ok", sftpWrite(sftpCli, resumeFile, initial))
+	s.check("resume upload append (reput)", "ok", sftpAppend(sftpCli, resumeFile, appended))
+	s.check("verify resumed file contents", "ok", sftpCheckContent(sftpCli, resumeFile, updated))
+
+	// Recursive resume (`reput -r`) behavior.
+	baseDir := "testclient_resume_dir_" + sfx
+	rootFile := path.Join(baseDir, "root.txt")
+	nestedFile := path.Join(baseDir, "nested", "child.txt")
+
+	rootInitial := []byte("root-v1\n")
+	rootAppended := []byte("root-v2\n")
+	rootUpdated := append(append([]byte{}, rootInitial...), rootAppended...)
+
+	nestedInitial := []byte("child-v1\n")
+	nestedAppended := []byte("child-v2\n")
+	nestedUpdated := append(append([]byte{}, nestedInitial...), nestedAppended...)
+
+	s.check("write initial folder file root.txt", "ok", sftpWrite(sftpCli, rootFile, rootInitial))
+	s.check("write initial folder file nested/child.txt", "ok", sftpWrite(sftpCli, nestedFile, nestedInitial))
+	s.check("resume folder upload root.txt (reput -r)", "ok", sftpAppend(sftpCli, rootFile, rootAppended))
+	s.check("resume folder upload nested/child.txt (reput -r)", "ok", sftpAppend(sftpCli, nestedFile, nestedAppended))
+	s.check("verify resumed folder root.txt", "ok", sftpCheckContent(sftpCli, rootFile, rootUpdated))
+	s.check("verify resumed folder nested/child.txt", "ok", sftpCheckContent(sftpCli, nestedFile, nestedUpdated))
+
+	return s
+}
+
 func runSystemFileSuite(auth ssh.AuthMethod) *suite {
 	s := &suite{name: fmt.Sprintf("System file protection (%s)", *flagSystem)}
 	sshCli, sftpCli, err := openSFTP(auth)
@@ -515,6 +597,8 @@ func main() {
 		suites = append(suites, runNonOwnerSuite(
 			"Non-owner: noClientAuth (anonymous-by-IP)", preexisting, nil))
 	}
+	suites = append(suites, runResumeSuite(
+		fmt.Sprintf("second (pubkey %s)", secondLabel), secondAuth))
 	suites = append(suites, runSystemFileSuite(secondAuth))
 	suites = append(suites, runOwnerCleanupSuite(firstAuth, preexisting))
 
