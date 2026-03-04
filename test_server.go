@@ -207,6 +207,7 @@ func (r *selfTestRunner) runNonOwner(label, preexisting string, auth ssh.AuthMet
 // path, verifies mutations are denied via disk-state checks, then cleans up.
 func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 	sysName := "selftest_sysfile_" + stRandHex() + ".txt"
+
 	s := newStSuite("System file protection (" + sysName + ")")
 
 	// 1. Setup: Create file on disk and register it as unrestricted
@@ -218,7 +219,9 @@ func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 	}
 
 	r.srv.cfg.unrestrictedMap[sysName] = true
+	r.srv.store.ClaimFile(systemOwner, sysName)
 	defer func() {
+		r.srv.store.DeletePath(sysName)
 		delete(r.srv.cfg.unrestrictedMap, sysName)
 		os.Remove(fullPath)
 	}()

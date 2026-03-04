@@ -624,8 +624,9 @@ type Config struct {
 	MaxDirs                 int
 	Unrestricted            string
 	LockDirectoriesToOwners bool
-	Verbose                 bool
+	PrettyLog               bool
 	Debug                   bool
+	QuietConsole            bool
 	MaxFileSize             int64
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
@@ -657,8 +658,9 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.MaxDirs, "dir.max", "MAX_DIRECTORIES", 10000, "Maximum total directories allowed in archive")
 	EnvFlag(&cfg.Unrestricted, "unrestricted", "UNRESTRICTED_PATHS", strings.Join(defaultUnrestrictedPaths, ","), "Comma-separated list of paths always available for download")
 	EnvFlag(&cfg.LockDirectoriesToOwners, "dir.owners_only", "LOCK_DIRS_TO_OWNERS", false, "Users can only upload to directories they own")
-	EnvFlag(&cfg.Verbose, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.", "v")
-	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Enable debug logging")
+	EnvFlag(&cfg.PrettyLog, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.", "v")
+	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Sets log level to DEVUG")
+	EnvFlag(&cfg.QuietConsole, "quiet", "DEBUG", false, "Sets log level to WARN only on the console", "q")
 	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
 	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
@@ -1804,7 +1806,7 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 		return nil
 	}
 
-	if meta.owner == systemOwner {
+	if meta.owner == systemOwner || meta.isUnrestricted {
 		return h.deny(errMsgFileProtected.Args(meta.rel))
 	}
 
@@ -2410,17 +2412,21 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	if cfg.Debug {
 		lvl = slog.LevelDebug
 	}
+	cLvl := lvl
+	if cfg.QuietConsole {
+		cLvl = slog.LevelWarn
+	}
 
-	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
-	if cfg.Verbose {
-		consoleHandler = newConsoleHandler(&slog.HandlerOptions{Level: lvl})
+	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cLvl})
+	if cfg.PrettyLog {
+		consoleHandler = newConsoleHandler(&slog.HandlerOptions{Level: cLvl})
 	}
 
 	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: lvl})
+	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: cLvl})
 	// consoleHandler := newConsoleHandler(&slog.HandlerOptions{Level: lvl})
 	// logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
 	logger := slog.New(&MultiLogHandler{

@@ -32,9 +32,9 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 	}
 
 	if entries, addresses, err := bl.reload(filepath); err != nil {
-		log.Error("initial load failed", "error", err)
+		log.Warn("initial ip list load failed", "error", err)
 	} else {
-		log.Info("initial load complete", "entries", entries, "addresses", addresses)
+		log.Info("initial ip list load complete", "entries", entries, "addresses", addresses)
 	}
 
 	go func() {
