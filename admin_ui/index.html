@@ -11,7 +11,7 @@
     <div class="card">
       <h1>sftpguy web admin console</h1>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -67,7 +67,6 @@
     <div class="card">
       <div class="tabs" id="tabs">
         <button class="tab active" data-tab="summary">Summary</button>
-        <button class="tab" data-tab="explorer">Explorer</button>
         <button class="tab" data-tab="users">Users</button>
         <button class="tab" data-tab="files">Files</button>
         <button class="tab" data-tab="audit">Audit</button>
@@ -90,13 +89,6 @@
     </div>
 
     <div class="card" id="tab-summary"></div>
-
-    <div class="card hidden" id="tab-explorer">
-      <div class="row">
-        <button onclick="loadExplorer()">Refresh</button>
-      </div>
-      <div id="explorer-out"></div>
-    </div>
 
     <div class="card hidden" id="tab-users">
       <div class="row">

@@ -34,7 +34,6 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		JS:              d.srv.handleAdminJS,
 		Health:          adminhttp.HealthHandler(d),
 		Summary:         adminhttp.SummaryHandler(d),
-		Explorer:        d.srv.handleAdminExplorer,
 		Users:           d.srv.handleAdminUsers,
 		User:            d.srv.handleAdminUser,
 		Files:           d.srv.handleAdminFiles,
@@ -91,14 +90,6 @@ func (d *adminHTTPDeps) SSHPort() int {
 
 func (d *adminHTTPDeps) AdminHTTPAddr() string {
 	return d.srv.cfg.AdminHTTP
-}
-
-func (d *adminHTTPDeps) ExplorerHTTPAddr() string {
-	return d.srv.cfg.ExplorerHTTP
-}
-
-func (d *adminHTTPDeps) ExplorerMaxFileSize() int64 {
-	return d.srv.cfg.ExplorerMaxFileSize
 }
 
 func (d *adminHTTPDeps) ContributorThreshold() int64 {

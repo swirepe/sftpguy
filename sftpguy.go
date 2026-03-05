@@ -65,7 +65,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go explorerv2.go explorer_http*.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go test_client.go test_server.go fortunes.txt
+//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go test_client.go test_server.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -628,8 +628,6 @@ type Config struct {
 	Port                    int
 	AdminHTTP               string
 	AdminHTTPToken          string
-	ExplorerHTTP            string
-	ExplorerCookieSecret    string
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -644,11 +642,10 @@ type Config struct {
 	Debug                   bool
 	QuietConsole            bool
 	MaxFileSize             int64
-	ExplorerMaxFileSize     int64
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
 	BootstrapSrc            bool
-	AdminEnabled            bool
+	AdminSFTP               bool
 	SshNoAuth               bool
 	SelfTest                bool
 	SelfTestContinue        bool
@@ -665,8 +662,6 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port", "p")
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
-	EnvFlag(&cfg.ExplorerHTTP, "explorer.http", "EXPLORER_HTTP", "", "Enable web explorer on this address (example: 127.0.0.1:8081)")
-	EnvFlag(&cfg.ExplorerCookieSecret, "explorer.cookie.secret", "EXPLORER_COOKIE_SECRET", "", "Optional secret used to sign explorer cookies")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -681,9 +676,8 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Sets log level to DEVUG")
 	EnvFlag(&cfg.QuietConsole, "quiet", "DEBUG", false, "Sets log level to WARN only on the console", "q")
 	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
-	EnvFlag(&cfg.AdminEnabled, "admin.ssh", "ADMIN_SSH", false, "Enable the admin console over ssh")
+	EnvFlag(&cfg.AdminSFTP, "admin.sftp", "ADMIN_SFTP", false, "Enable system-owner SFTP login when client key matches server host key")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
-	EnvSizeFlag(&cfg.ExplorerMaxFileSize, "explorer.maxsize", "EXPLORER_MAX_FILE_SIZE", "8gb", "Max explorer upload size per file (0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
 
 	EnvFlag(&cfg.SelfTest, "test", "SELF_TEST", false, "Run integration self-test suite after startup then exit")
@@ -782,11 +776,6 @@ func (c Config) Validate() error {
 			return fmt.Errorf("admin.http must be host:port, got %q: %w", c.AdminHTTP, err)
 		}
 	}
-	if c.ExplorerHTTP != "" {
-		if _, _, err := net.SplitHostPort(c.ExplorerHTTP); err != nil {
-			return fmt.Errorf("explorer.http must be host:port, got %q: %w", c.ExplorerHTTP, err)
-		}
-	}
 	if c.Name == "" || c.HostKeyFile == "" || c.DBPath == "" || c.UploadDir == "" {
 		return errors.New("required configuration fields missing")
 	}
@@ -841,9 +830,6 @@ type Server struct {
 	cancel           context.CancelFunc
 	adminShutdownMu  sync.Mutex
 	adminShutdown    func(context.Context) error
-	explorerSvc      *explorerService
-	explorerMu       sync.Mutex
-	explorerShutdown func(context.Context) error
 	selfTestMu       sync.Mutex
 	selfTestState    adminSelfTestState
 }
@@ -937,16 +923,6 @@ func (s *Server) Shutdown() error {
 			s.logger.Warn("admin http shutdown failed", "err", err)
 		}
 	}
-	s.explorerMu.Lock()
-	explorerShutdown := s.explorerShutdown
-	s.explorerMu.Unlock()
-	if explorerShutdown != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := explorerShutdown(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			s.logger.Warn("explorer http shutdown failed", "err", err)
-		}
-	}
 	s.wg.Wait()
 	return s.store.Close()
 }
@@ -1003,7 +979,7 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 	hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 
 	ext := map[string]string{"pubkey-hash": hash}
-	if s.checkAdminKey(key) {
+	if s.cfg.AdminSFTP && s.checkAdminKey(key) {
 		ext["admin"] = "1"
 	}
 	return &ssh.Permissions{Extensions: ext}, nil
@@ -1151,16 +1127,28 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	defer sConn.Close()
 
 	pubHash := sConn.Permissions.Extensions["pubkey-hash"]
+	effectivePubHash := pubHash
+	isAdminSFTP := s.cfg.AdminSFTP && s.isAdminConn(sConn.Permissions)
+	if isAdminSFTP {
+		effectivePubHash = systemOwner
+	}
 	loginType := loginTypeFromHash(pubHash)
+	if isAdminSFTP {
+		loginType = "admin-sftp"
+	}
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 	sessionStarted := time.Now()
 	sessionCounts := &sessionCounters{}
+	if isAdminSFTP {
+		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
+	}
 
 	defer func() {
 		duration := time.Since(sessionStarted)
-		s.store.LogEvent(EventSessionEnd, pubHash, sessionID, sConn.RemoteAddr(),
+		s.store.LogEvent(EventSessionEnd, effectivePubHash, sessionID, sConn.RemoteAddr(),
 			"duration_ms", duration.Milliseconds(),
 			"login_type", loginType,
+			"admin_sftp", isAdminSFTP,
 			"ops", sessionCounts.totalOps.Load(),
 			"uploads", sessionCounts.uploads.Load(),
 			"uploads_bytes", sessionCounts.uploadsBytes.Load(),
@@ -1170,29 +1158,19 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		)
 	}()
 
-	logger := s.logger.With(s.userGroup(pubHash, sessionID, sConn.RemoteAddr()))
-	if s.cfg.AdminEnabled && s.isAdminConn(sConn.Permissions) {
-		// ── Admin fast-path ───────────────────────────────────────────
-		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
-		go ssh.DiscardRequests(reqs)
-		for newCh := range chans {
-			if newCh.ChannelType() != "session" {
-				newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
-				continue
-			}
-			ch, chReqs, _ := newCh.Accept()
-			go s.handleAdminChannel(ch, chReqs, sessionID, sessionCounts, sConn, s.logger)
-		}
-		return
+	logger := s.logger.With(s.userGroup(effectivePubHash, sessionID, sConn.RemoteAddr()))
+
+	stats, _ := s.store.UpsertUserSession(effectivePubHash)
+
+	isBanned := false
+	if !isAdminSFTP {
+		isBanned = s.store.IsBanned(effectivePubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
 	}
 
-	stats, _ := s.store.UpsertUserSession(pubHash)
-
-	isBanned := s.store.IsBanned(pubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
-
-	s.store.LogEvent(EventSessionStart, pubHash, sessionID, sConn.RemoteAddr(),
+	s.store.LogEvent(EventSessionStart, effectivePubHash, sessionID, sConn.RemoteAddr(),
 		"login_type", loginType,
 		"banned", isBanned,
+		"admin_sftp", isAdminSFTP,
 	)
 
 	logger.Info("login", "banned", isBanned)
@@ -1205,7 +1183,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go s.handleChannel(ch, reqs, pubHash, sessionID, stats, sConn, logger, isBanned, sessionCounts)
+		go s.handleChannel(ch, reqs, effectivePubHash, sessionID, stats, sConn, logger, isBanned, isAdminSFTP, sessionCounts)
 	}
 }
 
@@ -1217,6 +1195,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	sConn *ssh.ServerConn,
 	logger *slog.Logger,
 	isBanned bool,
+	isAdmin bool,
 	counters *sessionCounters) {
 	defer ch.Close()
 
@@ -1243,7 +1222,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 					sessionID:   sessionID,
 					readLimiter: readLimiter,
 					isBanned:    isBanned,
-					isAdmin:     false,
+					isAdmin:     isAdmin,
 					counters:    counters,
 				}
 				handler.logLogin(stats)
@@ -1792,6 +1771,10 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (h *fsHandler) canRead(meta *pathMeta) error {
+	if h.isAdmin {
+		return nil
+	}
+
 	if meta.isUnrestricted {
 		return nil
 	}
@@ -2512,12 +2495,9 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"name", cfg.Name,
 		"version", AppVersion,
 		"port", cfg.Port,
-		"admin.ssh", cfg.AdminEnabled,
+		"admin.sftp", cfg.AdminSFTP,
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
-		"explorer.http", cfg.ExplorerHTTP,
-		"explorer.maxsize", cfg.ExplorerMaxFileSize,
-		"explorer.cookie.secret", cfg.ExplorerCookieSecret != "",
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"upload_path", cfg.UploadDir,
@@ -2653,14 +2633,6 @@ func main() {
 		go func() {
 			if err := srv.ListenAdminHTTP(); err != nil {
 				logger.Error("admin http listener failed", "err", err)
-			}
-		}()
-	}
-
-	if cfg.ExplorerHTTP != "" {
-		go func() {
-			if err := srv.ListenExplorerHTTP(); err != nil {
-				logger.Error("explorer http listener failed", "err", err)
 			}
 		}()
 	}

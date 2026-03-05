@@ -11,7 +11,6 @@
 //   -system     A system-owned file on the server (default: README.txt)
 //   -threshold  Contributor threshold bytes, match -contrib (default: 1048576)
 //   -noauth     Run noClientAuth suite, server needs -noauth (default: true)
-//   -explorer   Explorer base URL to run explorer HTTP suite (optional)
 //   -v          Verbose error detail for all steps
 
 package main
@@ -25,14 +24,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net"
-	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
@@ -47,7 +41,6 @@ var (
 	flagSystem    = flag.String("system", "README.txt", "A system-owned file present on the server")
 	flagThreshold = flag.Int64("threshold", 1048576, "Contributor threshold bytes")
 	flagNoAuth    = flag.Bool("noauth", true, "Run noClientAuth suite")
-	flagExplorer  = flag.String("explorer", "", "Explorer base URL (optional), e.g. http://127.0.0.1:8081")
 	flagVerbose   = flag.Bool("v", false, "Verbose error detail")
 )
 
@@ -555,292 +548,6 @@ func runOwnerCleanupSuite(firstAuth ssh.AuthMethod, preexisting string) *suite {
 	return s
 }
 
-func runExplorerSuite(baseURL, preexisting string) *suite {
-	s := &suite{name: "Explorer HTTP UI"}
-	baseURL = strings.TrimSpace(baseURL)
-	if baseURL == "" {
-		s.skip("explorer suite", "no -explorer URL provided")
-		return s
-	}
-	rootURL := strings.TrimRight(baseURL, "/")
-
-	clientA, err := tcHTTPClient()
-	s.check("client A init", "ok", err)
-	if err != nil {
-		return s
-	}
-	clientB, err := tcHTTPClient()
-	s.check("client B init", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	status, body, err := tcExplorerGETBytes(clientA, rootURL+"/")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("bootstrap status %d", status)
-	}
-	s.check("bootstrap explorer (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	csrf, err := tcExplorerCSRF(string(body))
-	s.check("extract csrf token (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	status, _, err = tcExplorerGETBytes(clientA, rootURL+"/"+preexisting)
-	if err == nil && status != http.StatusForbidden {
-		err = fmt.Errorf("expected 403 before contributing, got %d", status)
-	}
-	s.check("download locked file blocked (A)", "ok", err)
-
-	singleUploadName := "testclient_web_file_" + randSuffix() + ".bin"
-	contribPayload := payload(*flagThreshold)
-	err = tcExplorerUpload(clientA, rootURL+"/", csrf, singleUploadName, contribPayload)
-	s.check("upload file (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	status, gotSingle, err := tcExplorerGETBytes(clientA, rootURL+"/"+singleUploadName)
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for uploaded file, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotSingle, contribPayload) {
-		err = fmt.Errorf("uploaded file content mismatch")
-	}
-	s.check("download uploaded file (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	status, _, err = tcExplorerGETBytes(clientA, rootURL+"/"+preexisting)
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 after contributing, got %d", status)
-	}
-	s.check("download locked file after upload (A)", "ok", err)
-
-	folderName := "testclient_web_dir_" + randSuffix()
-	folderRootContent := []byte("root-v1\n")
-	folderNestedContent := []byte("child-v1\n")
-	err = tcExplorerUploadParts(clientA, rootURL+"/", csrf, []tcExplorerUploadPart{
-		{Name: folderName + "/root.txt", Data: folderRootContent},
-		{Name: folderName + "/nested/child.txt", Data: folderNestedContent},
-	})
-	s.check("upload folder (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	status, gotFolderRoot, err := tcExplorerGETBytes(clientA, rootURL+"/"+folderName+"/root.txt")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for folder root, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotFolderRoot, folderRootContent) {
-		err = fmt.Errorf("folder root content mismatch")
-	}
-	s.check("download folder root file (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	status, gotFolderChild, err := tcExplorerGETBytes(clientA, rootURL+"/"+folderName+"/nested/child.txt")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for folder nested file, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotFolderChild, folderNestedContent) {
-		err = fmt.Errorf("folder nested content mismatch")
-	}
-	s.check("download folder nested file (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	resumeName := "testclient_web_resume_" + randSuffix() + ".txt"
-	resumeChunkA := []byte("resume-A:")
-	resumeChunkB := []byte("resume-B")
-	err = tcExplorerUpload(clientA, rootURL+"/", csrf, resumeName, resumeChunkA)
-	s.check("upload resume base chunk (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	err = tcExplorerUploadParts(clientA, rootURL+"/?resume=1", csrf, []tcExplorerUploadPart{
-		{Name: resumeName, Data: resumeChunkB},
-	})
-	s.check("resume upload append chunk (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	status, gotResume, err := tcExplorerGETBytes(clientA, rootURL+"/"+resumeName)
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for resumed file, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotResume, append(append([]byte{}, resumeChunkA...), resumeChunkB...)) {
-		err = fmt.Errorf("resume file content mismatch")
-	}
-	s.check("download resumed file (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	resumeDir := "testclient_web_resume_dir_" + randSuffix()
-	err = tcExplorerUploadParts(clientA, rootURL+"/", csrf, []tcExplorerUploadPart{
-		{Name: resumeDir + "/root.txt", Data: []byte("r1-")},
-		{Name: resumeDir + "/nested/child.txt", Data: []byte("c1-")},
-	})
-	s.check("upload folder base chunks (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	err = tcExplorerUploadParts(clientA, rootURL+"/?resume=1", csrf, []tcExplorerUploadPart{
-		{Name: resumeDir + "/root.txt", Data: []byte("r2")},
-		{Name: resumeDir + "/nested/child.txt", Data: []byte("c2")},
-	})
-	s.check("resume upload folder append chunks (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	status, gotResumeRoot, err := tcExplorerGETBytes(clientA, rootURL+"/"+resumeDir+"/root.txt")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for resumed folder root, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotResumeRoot, []byte("r1-r2")) {
-		err = fmt.Errorf("resumed folder root content mismatch")
-	}
-	s.check("download resumed folder root (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-	status, gotResumeChild, err := tcExplorerGETBytes(clientA, rootURL+"/"+resumeDir+"/nested/child.txt")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("expected 200 for resumed folder child, got %d", status)
-	}
-	if err == nil && !bytes.Equal(gotResumeChild, []byte("c1-c2")) {
-		err = fmt.Errorf("resumed folder child content mismatch")
-	}
-	s.check("download resumed folder child (A)", "ok", err)
-	if err != nil {
-		return s
-	}
-
-	status, bodyB, err := tcExplorerGETBytes(clientB, rootURL+"/")
-	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("bootstrap status %d", status)
-	}
-	s.check("bootstrap explorer (B)", "ok", err)
-	if err != nil {
-		return s
-	}
-	_, _ = tcExplorerCSRF(string(bodyB))
-
-	status, _, err = tcExplorerGETBytes(clientB, rootURL+"/"+preexisting)
-	if err == nil && status != http.StatusForbidden {
-		err = fmt.Errorf("expected 403 for separate client, got %d", status)
-	}
-	s.check("download locked file blocked (B)", "ok", err)
-
-	u, _ := url.Parse(baseURL)
-	idCookie := ""
-	for _, c := range clientA.Jar.Cookies(u) {
-		if strings.Contains(c.Name, "_id") {
-			idCookie = c.Name
-			break
-		}
-	}
-	if idCookie == "" {
-		s.check("tamper identity cookie", "ok", fmt.Errorf("identity cookie not found"))
-		return s
-	}
-	clientA.Jar.SetCookies(u, []*http.Cookie{{
-		Name:  idCookie,
-		Value: "v1.tampered.bad-signature",
-		Path:  "/",
-	}})
-	status, _, err = tcExplorerGETBytes(clientA, rootURL+"/"+preexisting)
-	if err == nil && status != http.StatusForbidden {
-		err = fmt.Errorf("expected 403 after tampering cookie, got %d", status)
-	}
-	s.check("tampered identity loses access (A)", "ok", err)
-
-	return s
-}
-
-func tcHTTPClient() (*http.Client, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-	return &http.Client{Jar: jar}, nil
-}
-
-func tcExplorerGETBytes(client *http.Client, rawURL string) (status int, body []byte, err error) {
-	resp, err := client.Get(rawURL)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, data, nil
-}
-
-func tcExplorerCSRF(html string) (string, error) {
-	re := regexp.MustCompile(`value=\"([a-f0-9]{64})\"`)
-	m := re.FindStringSubmatch(html)
-	if len(m) != 2 {
-		return "", fmt.Errorf("csrf token not found")
-	}
-	return m[1], nil
-}
-
-type tcExplorerUploadPart struct {
-	Name string
-	Data []byte
-}
-
-func tcExplorerUpload(client *http.Client, postURL, csrfToken, filename string, data []byte) error {
-	return tcExplorerUploadParts(client, postURL, csrfToken, []tcExplorerUploadPart{{
-		Name: filename,
-		Data: data,
-	}})
-}
-
-func tcExplorerUploadParts(client *http.Client, postURL, csrfToken string, parts []tcExplorerUploadPart) error {
-	var body bytes.Buffer
-	mw := multipart.NewWriter(&body)
-	if err := mw.WriteField("csrf_token", csrfToken); err != nil {
-		return err
-	}
-	for _, part := range parts {
-		fw, err := mw.CreateFormFile("uploadFiles", part.Name)
-		if err != nil {
-			return err
-		}
-		if _, err := fw.Write(part.Data); err != nil {
-			return err
-		}
-	}
-	if err := mw.Close(); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, postURL, &body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return nil
-}
-
 func main() {
 	flag.Parse()
 
@@ -900,7 +607,6 @@ func main() {
 	suites = append(suites, runResumeSuite(
 		fmt.Sprintf("second (pubkey %s)", secondLabel), secondAuth))
 	suites = append(suites, runSystemFileSuite(secondAuth))
-	suites = append(suites, runExplorerSuite(*flagExplorer, preexisting))
 	suites = append(suites, runOwnerCleanupSuite(firstAuth, preexisting))
 
 	totalPass, totalFail, totalSkip := 0, 0, 0

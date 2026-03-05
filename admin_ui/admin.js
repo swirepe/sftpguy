@@ -8,7 +8,6 @@
       liveLogTimer: 0,
       actions: [],
       summary: {},
-      explorer: {},
       insights: {},
 	      summaryUploads: [],
 	      users: [],
@@ -150,7 +149,6 @@
       if (!el) return;
       const base = name === "selftest" ? "Self Test" :
         name === "iplists" ? "IP Lists" :
-        name === "explorer" ? "Explorer" :
         (name.charAt(0).toUpperCase() + name.slice(1));
       el.textContent = count == null ? base : (base + " (" + count + ")");
     }
@@ -353,17 +351,12 @@
       state.summaryUploads = (pair[2] || {}).uploads || [];
       renderSummary();
     }
-    async function loadExplorer() {
-      const d = await api(withRange("/admin/api/explorer"));
-      state.explorer = d || {};
-      renderExplorer();
-    }
     function renderSummary() {
       const d = state.summary || {};
       const insight = state.insights || {};
       const kpi = insight.kpi || {};
       const win = insight.window || {};
-      setStatus("archive=" + (d.archive || "") + " version=" + (d.version || "") + " ssh=:" + (d.ssh_port || "") + " admin=" + (d.admin_http || "") + " explorer=" + (d.explorer_http || "") + " range=" + (win.label || state.timeRange));
+      setStatus("archive=" + (d.archive || "") + " version=" + (d.version || "") + " ssh=:" + (d.ssh_port || "") + " admin=" + (d.admin_http || "") + " range=" + (win.label || state.timeRange));
 
       const entries = [
         ["Users", d.users || 0],
@@ -371,9 +364,7 @@
         ["Files", d.files || 0],
         ["Directories", d.directories || 0],
         ["Total Disk", d.formatted_bytes || "0 B"],
-        ["Contrib Threshold", formatBytes(d.contributor_threshold || 0)],
-        ["Explorer HTTP", d.explorer_http || "disabled"],
-        ["Explorer Max File", d.explorer_max_file_human || "0 B"]
+        ["Contrib Threshold", formatBytes(d.contributor_threshold || 0)]
       ];
       const activity = [
         ["Events", kpi.events || 0],
@@ -419,86 +410,6 @@
         "<h3>Top Users</h3>" + renderSimpleTable(["User", "Events", "Denied"], topUsersRows) +
         "<h3>Top IPs</h3>" + renderSimpleTable(["IP", "Events", "Denied", "Action"], topIPRows) +
         "<h3>Recent Uploads (Quick View)</h3>" + renderSimpleTable(["Time", "User", "Path", "Delta", "Session"], quickUploadRows);
-    }
-    function renderExplorer() {
-      const data = state.explorer || {};
-      const ex = data.explorer || {};
-      const activity = data.activity || {};
-      const sessions = data.sessions || [];
-      const topPaths = data.top_paths || [];
-      const deniedReasons = data.denied_reasons || [];
-      const rateLimit = data.rate_limit || {};
-      const win = activity.window || {};
-      setTabCount("explorer", ex.enabled ? Number(activity.sessions || sessions.length || 0) : 0);
-
-      const configRows = [
-        ["Enabled", ex.enabled ? "<span class=\"tag ok\">YES</span>" : "<span class=\"tag warn\">NO</span>"],
-        ["Address", "<code>" + esc(ex.addr || "disabled") + "</code>"],
-        ["Root", "<code>" + esc(ex.root || "") + "</code>"],
-        ["Max File", esc(ex.max_file_size_human || "0 B")],
-        ["Identity Cookie", "<code>" + esc(ex.identity_cookie || "") + "</code>"],
-        ["CSRF Cookie", "<code>" + esc(ex.csrf_cookie || "") + "</code>"]
-      ];
-      const activityRows = [
-        ["Window", esc(win.label || state.timeRange)],
-        ["Events", esc(activity.events || 0)],
-        ["Users", esc(activity.users || 0)],
-        ["Sessions", esc(activity.sessions || sessions.length || 0)],
-        ["Uploads", esc(activity.uploads || 0)],
-        ["Downloads", esc(activity.downloads || 0)],
-        ["Denied", esc(activity.denied || 0)],
-        ["Contributor Locks", esc(activity.contributor_locks || 0)],
-        ["Rate-limit Hits", esc(activity.rate_limit_hits || 0)]
-      ];
-      const sessionRows = sessions.slice(0, 300).map(function(x) {
-        return [
-          sessionCell(x.session),
-          ownerCell(x.user_id),
-          ipCell(x.ip),
-          "<code>" + esc(x.start_time || "") + "</code>",
-          "<code>" + esc(x.end_time || "") + "</code>",
-          esc(String(x.duration_sec || 0) + "s"),
-          esc(x.event_count || 0),
-          esc(x.uploads || 0),
-          esc(x.downloads || 0),
-          esc(x.denied || 0),
-          esc(x.rate_limit_hits || 0)
-        ];
-      });
-      const pathRows = topPaths.map(function(x) {
-        return [
-          "<code>" + esc(x.path || "") + "</code>",
-          esc(x.count || 0),
-          esc(x.uploads || 0),
-          esc(x.downloads || 0),
-          esc(x.denied || 0)
-        ];
-      });
-      const deniedRows = deniedReasons.map(function(x) {
-        return ["<code>" + esc(x.reason || "") + "</code>", esc(x.count || 0)];
-      });
-      const rateUserRows = (rateLimit.by_user || []).map(function(x) {
-        return [ownerCell(x.name), esc(x.count || 0)];
-      });
-      const rateIPRows = (rateLimit.by_ip || []).map(function(x) {
-        return [ipCell(x.name), esc(x.count || 0)];
-      });
-      const ratePathRows = (rateLimit.by_path || []).map(function(x) {
-        return ["<code>" + esc(x.name || "") + "</code>", esc(x.count || 0)];
-      });
-      const quickLink = ex.addr ? "<a href=\"http://" + esc(ex.addr) + "\" target=\"_blank\" rel=\"noreferrer\">Open Explorer</a>" : "<span class=\"muted\">Explorer disabled</span>";
-      document.getElementById("explorer-out").innerHTML =
-        "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span><span class=\"pill\">" + quickLink + "</span></div>" +
-        "<h3>Configuration</h3>" + renderSimpleTable(["Field", "Value"], configRows) +
-        "<h3>Activity</h3>" + renderSimpleTable(["Metric", "Value"], activityRows) +
-        "<h3>Explorer Sessions</h3>" + renderSimpleTable(["Session", "User", "IP", "Start", "End", "Duration", "Events", "Uploads", "Downloads", "Denied", "Rate-limit"], sessionRows) +
-        "<h3>Top Paths</h3>" + renderSimpleTable(["Path", "Events", "Uploads", "Downloads", "Denied"], pathRows) +
-        "<h3>Denied Reasons</h3>" + renderSimpleTable(["Reason", "Count"], deniedRows) +
-        "<h3>Rate-limit Hits</h3>" +
-        "<div class=\"row\"><span class=\"pill\">total " + esc(rateLimit.total || activity.rate_limit_hits || 0) + "</span></div>" +
-        renderSimpleTable(["User", "Hits"], rateUserRows) +
-        renderSimpleTable(["IP", "Hits"], rateIPRows) +
-        renderSimpleTable(["Path", "Hits"], ratePathRows);
     }
 
     async function loadUsers() {
@@ -1406,7 +1317,6 @@
 
     function rerenderCurrent() {
       if (state.activeTab === "summary") renderSummary();
-      if (state.activeTab === "explorer") renderExplorer();
       if (state.activeTab === "users") renderUsers();
       if (state.activeTab === "files") renderFiles();
       if (state.activeTab === "audit") renderAudit();
@@ -1423,7 +1333,7 @@
 
     async function refreshAll() {
       try {
-        await Promise.all([loadSummary(), loadExplorer(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
+        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
         if (state.activeTab === "iplists") {
           await loadIPLists();
         }
@@ -1450,7 +1360,6 @@
       if (enabled) {
         state.autoTimer = setInterval(function() {
           const fn = state.activeTab === "summary" ? loadSummary :
-            state.activeTab === "explorer" ? loadExplorer :
             state.activeTab === "users" ? loadUsers :
             state.activeTab === "files" ? loadFiles :
             state.activeTab === "audit" ? loadAudit :
@@ -1473,14 +1382,13 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","explorer","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
         clearSelfTestPoll();
       }
       const fn = name === "summary" ? loadSummary :
-        name === "explorer" ? loadExplorer :
         name === "users" ? loadUsers :
         name === "files" ? loadFiles :
         name === "audit" ? loadAudit :
@@ -1499,8 +1407,8 @@
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","="].includes(e.key)) {
-        const map = {"1":"summary","2":"explorer","3":"users","4":"files","5":"audit","6":"logs","7":"auth","8":"sessions","9":"uploads","0":"banned","-":"selftest","=":"iplists"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-"].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"iplists"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {
