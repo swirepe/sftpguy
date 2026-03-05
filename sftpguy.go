@@ -988,11 +988,14 @@ func (s *Server) Listen() error {
 			}
 		}
 
+		if s.store.IsBannedByIp(conn.RemoteAddr()) {
+			conn = newThrottledConn(conn, shadowBanBytesPerSec)
+		}
 		s.wg.Add(1)
-		go func() {
+		go func(c net.Conn) {
 			defer s.wg.Done()
-			s.handleSSH(conn, sshConfig)
-		}()
+			s.handleSSH(c, sshConfig)
+		}(conn)
 	}
 }
 
@@ -1225,16 +1228,23 @@ func (s *Server) handleChannel(ch ssh.Channel,
 				req.Reply(true, nil)
 				s.Welcome(ch.Stderr(), pubHash, stats)
 
+				var readLimiter *rate.Limiter
+				if isBanned {
+					// Enable download throttling for banned sessions.
+					readLimiter = rate.NewLimiter(rate.Limit(shadowBanBytesPerSec), shadowBanBytesPerSec)
+				}
+
 				handler := &fsHandler{
-					srv:        s,
-					pubHash:    pubHash,
-					stderr:     ch.Stderr(),
-					logger:     *logger,
-					remoteAddr: sConn.RemoteAddr(),
-					sessionID:  sessionID,
-					isBanned:   isBanned,
-					isAdmin:    false,
-					counters:   counters,
+					srv:         s,
+					pubHash:     pubHash,
+					stderr:      ch.Stderr(),
+					logger:      *logger,
+					remoteAddr:  sConn.RemoteAddr(),
+					sessionID:   sessionID,
+					readLimiter: readLimiter,
+					isBanned:    isBanned,
+					isAdmin:     false,
+					counters:    counters,
 				}
 				handler.logLogin(stats)
 				server := sftp.NewRequestServer(ch, sftp.Handlers{
