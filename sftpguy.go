@@ -832,6 +832,10 @@ type Server struct {
 	adminShutdown    func(context.Context) error
 	selfTestMu       sync.Mutex
 	selfTestState    adminSelfTestState
+	shadowMutateMin  time.Duration
+	shadowMutateMax  time.Duration
+	shadowListMin    time.Duration
+	shadowListMax    time.Duration
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -858,6 +862,17 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		shutdown:         make(chan struct{}),
 		ctx:              ctx,
 		cancel:           cancel,
+		shadowMutateMin:  shadowMutateMinDefault,
+		shadowMutateMax:  shadowMutateMaxDefault,
+		shadowListMin:    shadowListMinDefault,
+		shadowListMax:    shadowListMaxDefault,
+	}
+
+	if cfg.SelfTest || cfg.SelfTestContinue {
+		srv.shadowMutateMin = shadowMutateMinSelfTest
+		srv.shadowMutateMax = shadowMutateMaxSelfTest
+		srv.shadowListMin = shadowListMinSelfTest
+		srv.shadowListMax = shadowListMaxSelfTest
 	}
 
 	if cfg.BootstrapSrc {
@@ -964,7 +979,9 @@ func (s *Server) Listen() error {
 			}
 		}
 
-		if s.store.IsBannedByIp(conn.RemoteAddr()) {
+		addr := conn.RemoteAddr()
+		if s.store.IsBannedByIp(addr) {
+			s.logger.Info("Throttling new connection", "remote_addr", conn.RemoteAddr())
 			conn = newThrottledConn(conn, shadowBanBytesPerSec)
 		}
 		s.wg.Add(1)
@@ -1540,10 +1557,10 @@ func (h *fsHandler) isShadowBanned() bool {
 	return h.srv.store.IsBanned(h.pubHash)
 }
 
-// shadowDelay sleeps for a random duration (2–8s) then returns a generic error.
+// shadowDelay sleeps for a randomized delay window then returns a generic error.
 // Used to make shadow-banned users think operations are just slow/broken.
 func (h *fsHandler) shadowDelay() error {
-	delay := time.Duration(2000+rand.Intn(6000)) * time.Millisecond
+	delay := h.srv.randomShadowDelay(h.srv.shadowMutateMin, h.srv.shadowMutateMax)
 	time.Sleep(delay)
 	return sftp.ErrSSHFxFailure
 }
@@ -1864,7 +1881,7 @@ func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
 
 	if h.isBanned && r.Method == "List" {
-		delay := time.Duration(500+rand.Intn(1500)) * time.Millisecond // 0.5–2s
+		delay := h.srv.randomShadowDelay(h.srv.shadowListMin, h.srv.shadowListMax)
 		time.Sleep(delay)
 	}
 
@@ -1986,7 +2003,28 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 // SHADOW BAN THROTTLING
 // ============================================================================
 
-const shadowBanBytesPerSec = 2 * 1024 // 2 KB/s
+const (
+	shadowBanBytesPerSec = 2 * 1024 // 2 KB/s
+
+	shadowMutateMinDefault = 2 * time.Second
+	shadowMutateMaxDefault = 8 * time.Second
+	shadowListMinDefault   = 500 * time.Millisecond
+	shadowListMaxDefault   = 2 * time.Second
+
+	// Keep self-test runs fast while preserving shadow-ban behavior.
+	shadowMutateMinSelfTest = 5 * time.Millisecond
+	shadowMutateMaxSelfTest = 25 * time.Millisecond
+	shadowListMinSelfTest   = 2 * time.Millisecond
+	shadowListMaxSelfTest   = 10 * time.Millisecond
+)
+
+func (s *Server) randomShadowDelay(minDelay, maxDelay time.Duration) time.Duration {
+	if maxDelay <= minDelay {
+		return minDelay
+	}
+	span := maxDelay - minDelay
+	return minDelay + time.Duration(rand.Int63n(int64(span)+1))
+}
 
 type throttledConn struct {
 	net.Conn
