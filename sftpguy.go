@@ -66,7 +66,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go test_client.go test_server.go fortunes.txt
+//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go log_stub.go log_linux.go test_client.go test_server.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -451,7 +451,9 @@ func (s *Store) ClaimFile(hash, relPath string) error {
 			return err
 		}
 
-		if owner != hash {
+		// Admin sessions authenticate as systemOwner and may overwrite any existing file
+		// without taking ownership of it.
+		if owner != hash && hash != systemOwner {
 			return fmt.Errorf("claimed")
 		}
 
@@ -690,7 +692,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.BlacklistPath, "blacklist", "BLACKLIST", "blacklist.txt", "Text file of IP addresses to blacklist, one per line")
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 
-	flag.BoolVar(&cfg.BootstrapSrc, "src", false, "Copy source code to upload directory on boot")
+	EnvFlag(&cfg.BootstrapSrc, "src", "SRC", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
 
 	install := flag.Bool("install", false, "Install as a systemd service (requires root)")

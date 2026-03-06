@@ -8,6 +8,7 @@
 //   -host       Server host (default: localhost)
 //   -port       Server port (default: 2222)
 //   -hostkey    Server public key .pub file (optional)
+//   -adminkey   Server private host key for admin-sftp login checks (optional)
 //   -system     A system-owned file on the server (default: README.txt)
 //   -threshold  Contributor threshold bytes, match -contrib (default: 1048576)
 //   -noauth     Run noClientAuth suite, server needs -noauth (default: true)
@@ -38,6 +39,7 @@ var (
 	flagHost      = flag.String("host", "localhost", "Server hostname")
 	flagPort      = flag.Int("port", 2222, "Server port")
 	flagHostKey   = flag.String("hostkey", "", "Path to server public key file (optional)")
+	flagAdminKey  = flag.String("adminkey", "", "Path to server private host key for admin-sftp checks (optional)")
 	flagSystem    = flag.String("system", "README.txt", "A system-owned file present on the server")
 	flagThreshold = flag.Int64("threshold", 1048576, "Contributor threshold bytes")
 	flagNoAuth    = flag.Bool("noauth", true, "Run noClientAuth suite")
@@ -145,6 +147,30 @@ func tempKey() (ssh.AuthMethod, string, error) {
 	}
 	fp := ssh.FingerprintSHA256(signer.PublicKey())
 	return ssh.PublicKeys(signer), fp[:16], nil
+}
+
+func adminKeyAuth(keyPath string) (ssh.AuthMethod, string, error) {
+	keyPath = strings.TrimSpace(keyPath)
+	if keyPath == "" {
+		return nil, "", fmt.Errorf("admin key path is empty")
+	}
+
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read admin key %q: %w", keyPath, err)
+	}
+
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse admin key %q: %w", keyPath, err)
+	}
+
+	fp := ssh.FingerprintSHA256(signer.PublicKey())
+	label := fp
+	if len(label) > 16 {
+		label = label[:16]
+	}
+	return ssh.PublicKeys(signer), label, nil
 }
 
 // randUserPass returns keyboard-interactive auth with a unique random password.
@@ -523,6 +549,80 @@ func runSystemFileSuite(auth ssh.AuthMethod) *suite {
 	return s
 }
 
+func runAdminSuite(adminKeyPath string) *suite {
+	s := &suite{name: "Admin SFTP (server host key)"}
+
+	adminAuth, adminLabel, err := adminKeyAuth(adminKeyPath)
+	s.check("load admin host key", "ok", err)
+	if err != nil {
+		for i := 0; i < 11; i++ {
+			s.skip("(skipped)", "admin key unavailable")
+		}
+		return s
+	}
+
+	victimAuth, victimLabel, err := tempKey()
+	s.check("generate victim identity", "ok", err)
+	if err != nil {
+		for i := 0; i < 10; i++ {
+			s.skip("(skipped)", "victim identity unavailable")
+		}
+		return s
+	}
+
+	victimFile := "testclient_admin_victim_" + randSuffix() + ".txt"
+	victimSSH, victimSFTP, err := openSFTP(victimAuth)
+	s.check("setup victim connection ("+victimLabel+")", "ok", err)
+	if err != nil {
+		for i := 0; i < 9; i++ {
+			s.skip("(skipped)", "no victim SFTP connection")
+		}
+		return s
+	}
+	s.check("setup victim write file", "ok", sftpWrite(victimSFTP, victimFile, []byte("victim file contents")))
+	s.check("setup victim verify file", "ok", sftpCheckContent(victimSFTP, victimFile, []byte("victim file contents")))
+	_ = victimSFTP.Close()
+	_ = victimSSH.Close()
+
+	sshCli, sftpCli, err := openSFTP(adminAuth)
+	s.check("connect as admin ("+adminLabel+")", "ok", err)
+	if err != nil {
+		for i := 0; i < 8; i++ {
+			s.skip("(skipped)", "no admin SFTP connection")
+		}
+		return s
+	}
+	defer sshCli.Close()
+	defer sftpCli.Close()
+
+	_, err = sftpCli.ReadDir("/")
+	s.check("admin list directory /", "ok", err)
+	s.check("admin read victim file", "ok", sftpRead(sftpCli, victimFile))
+
+	renamedVictim := victimFile + ".renamed"
+	s.check("admin rename victim file", "ok", sftpCli.Rename(victimFile, renamedVictim))
+	s.check("admin update victim file", "ok", sftpWrite(sftpCli, renamedVictim, []byte("updated by admin")))
+	s.check("admin verify victim file", "ok", sftpCheckContent(sftpCli, renamedVictim, []byte("updated by admin")))
+	s.check("admin chmod victim file", "ok", sftpCli.Chmod(renamedVictim, 0644))
+	_, err = sftpCli.Stat(path.Clean("/" + renamedVictim))
+	s.check("admin stat victim file", "ok", err)
+
+	adminDir := "testclient_admin_dir_" + randSuffix()
+	adminFile := path.Join(adminDir, "admin.txt")
+	s.check("admin mkdir directory", "ok", sftpCli.Mkdir(adminDir))
+	s.check("admin write directory file", "ok", sftpWrite(sftpCli, adminFile, []byte("admin file v1")))
+	s.check("admin verify directory file", "ok", sftpCheckContent(sftpCli, adminFile, []byte("admin file v1")))
+	s.check("admin update directory file", "ok", sftpWrite(sftpCli, adminFile, []byte("admin file v2")))
+	s.check("admin verify updated directory file", "ok", sftpCheckContent(sftpCli, adminFile, []byte("admin file v2")))
+	s.check("admin chmod directory file", "ok", sftpCli.Chmod(adminFile, 0644))
+	s.check("admin read directory file", "ok", sftpRead(sftpCli, adminFile))
+	s.check("admin delete directory file", "ok", sftpCli.Remove(adminFile))
+	s.check("admin rmdir directory", "ok", sftpCli.RemoveDirectory(adminDir))
+	s.check("admin delete victim file", "ok", sftpCli.Remove(renamedVictim))
+
+	return s
+}
+
 func runOwnerCleanupSuite(firstAuth ssh.AuthMethod, preexisting string) *suite {
 	s := &suite{name: "Owner cleanup (first user)"}
 	sshCli, sftpCli, err := openSFTP(firstAuth)
@@ -555,6 +655,9 @@ func main() {
 	fmt.Printf("  server:    %s:%d\n", *flagHost, *flagPort)
 	fmt.Printf("  system:    %s\n", *flagSystem)
 	fmt.Printf("  threshold: %s\n", humanBytes(*flagThreshold))
+	if strings.TrimSpace(*flagAdminKey) != "" {
+		fmt.Printf("  adminkey:  %s\n", *flagAdminKey)
+	}
 	fmt.Println()
 
 	firstAuth, firstLabel, err := tempKey()
@@ -607,6 +710,9 @@ func main() {
 	suites = append(suites, runResumeSuite(
 		fmt.Sprintf("second (pubkey %s)", secondLabel), secondAuth))
 	suites = append(suites, runSystemFileSuite(secondAuth))
+	if strings.TrimSpace(*flagAdminKey) != "" {
+		suites = append(suites, runAdminSuite(*flagAdminKey))
+	}
 	suites = append(suites, runOwnerCleanupSuite(firstAuth, preexisting))
 
 	totalPass, totalFail, totalSkip := 0, 0, 0

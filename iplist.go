@@ -21,6 +21,29 @@ type IPList struct {
 	cancel context.CancelFunc
 }
 
+type ipReloadResult struct {
+	entries   int
+	addresses uint64
+	err       string
+}
+
+func newIPReloadResult(entries int, addresses uint64, err error) ipReloadResult {
+	result := ipReloadResult{
+		entries:   entries,
+		addresses: addresses,
+	}
+	if err != nil {
+		result.err = err.Error()
+	}
+	return result
+}
+
+func (r ipReloadResult) equals(other ipReloadResult) bool {
+	return r.entries == other.entries &&
+		r.addresses == other.addresses &&
+		r.err == other.err
+}
+
 // NewIPList initializes the list and starts a background reloader.
 func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPList {
 	log := logger.With("ip_list", filepath)
@@ -41,18 +64,27 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 		const period = 30 * time.Second
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
-
+		var lastLoggedReload ipReloadResult
+		var hasLastLoggedReload bool
+		var lastChanged = time.Now()
 		for {
 			select {
 			case <-ticker.C:
 				start := time.Now()
 				entries, addresses, err := bl.Reload(filepath)
+				currentReload := newIPReloadResult(entries, addresses, err)
 
-				bl.logger.Debug("reloaded ip list file",
-					"entries", entries,
-					"addresses", addresses,
-					"duration", time.Since(start),
-					"error", err)
+				if !hasLastLoggedReload || !currentReload.equals(lastLoggedReload) {
+					bl.logger.Info("reloaded ip list file",
+						"entries", entries,
+						"addresses", addresses,
+						"duration", time.Since(start),
+						"last_changed", time.Since(lastChanged),
+						"error", err)
+					lastLoggedReload = currentReload
+					hasLastLoggedReload = true
+					lastChanged = time.Now()
+				}
 			case <-ctx.Done():
 				log.Info("stopping ip list reloader")
 				return

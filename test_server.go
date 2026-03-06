@@ -124,6 +124,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 	}
 	suites = append(suites, r.runResumeUploads("second (pubkey "+secondLabel+")", secondAuth))
 	suites = append(suites, r.runSystemFile(secondAuth))
+	suites = append(suites, r.runAdminSFTP())
 	suites = append(suites, r.runBanUnban(banVictimAuth, banVictimLabel, banVictimHash, preexisting))
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
@@ -354,6 +355,78 @@ func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 
 	// wantDeleted=false: Verify the file is still present on disk
 	r.checkDelete(s, sftpCli, sysName, false)
+
+	return s
+}
+
+func (r *selfTestRunner) runAdminSFTP() *stSuite {
+	s := r.startSuite("Admin SFTP (server host key)")
+	defer r.finishSuite(s)
+
+	if !r.cfg.AdminSFTP {
+		s.skip("admin sftp login", "admin.sftp disabled")
+		return s
+	}
+
+	adminAuth, adminLabel, adminHash, err := r.newAdminHostKeyAuth()
+	s.check("load server host key", err)
+	if err != nil {
+		return s
+	}
+
+	// Create a normal user file first, then verify admin can fully manage it.
+	victimAuth, victimLabel, _ := r.newPubKeyAuth()
+	victimFile := "selftest_admin_victim_" + stRandHex() + ".txt"
+	victimSSH, victimSFTP, err := r.openSFTP(victimAuth)
+	s.check("setup victim connection ("+victimLabel+")", err)
+	if err != nil {
+		return s
+	}
+	r.checkWrite(s, victimSFTP, victimFile, []byte("victim file contents"), true)
+	_ = victimSFTP.Close()
+	_ = victimSSH.Close()
+
+	adminSSH, adminSFTP, err := r.openSFTP(adminAuth)
+	s.check("connect as admin ("+adminLabel+")", err)
+	if err != nil {
+		return s
+	}
+	defer adminSFTP.Close()
+	defer adminSSH.Close()
+
+	_, err = adminSFTP.ReadDir("/")
+	s.check("admin list /", err)
+	s.check("admin read victim file", stRead(adminSFTP, victimFile))
+
+	renamedVictim := victimFile + ".renamed"
+	r.checkRename(s, adminSFTP, victimFile, renamedVictim, true)
+	r.checkWrite(s, adminSFTP, renamedVictim, []byte("updated by admin"), true)
+	r.checkFileContent(s, renamedVictim, []byte("updated by admin"))
+	s.check("admin chmod victim file", adminSFTP.Chmod(renamedVictim, 0644))
+	_, err = adminSFTP.Stat(renamedVictim)
+	s.check("admin stat victim file", err)
+
+	adminDir := "selftest_admin_dir_" + stRandHex()
+	s.check("admin mkdir", adminSFTP.Mkdir(adminDir))
+	adminFile := path.Join(adminDir, "admin.txt")
+	r.checkWrite(s, adminSFTP, adminFile, []byte("admin file v1"), true)
+	r.checkFileContent(s, adminFile, []byte("admin file v1"))
+	r.checkWrite(s, adminSFTP, adminFile, []byte("admin file v2"), true)
+	r.checkFileContent(s, adminFile, []byte("admin file v2"))
+	s.check("admin chmod admin file", adminSFTP.Chmod(adminFile, 0644))
+	s.check("admin read admin file", stRead(adminSFTP, adminFile))
+	r.checkDelete(s, adminSFTP, adminFile, true)
+	s.check("admin rmdir", adminSFTP.RemoveDirectory(adminDir))
+	r.checkDelete(s, adminSFTP, renamedVictim, true)
+
+	var loginCount int
+	err = r.srv.store.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM log
+		WHERE id > ? AND event = ? AND user_id = ?
+	`, s.logStartID, EventAdminLogin, adminHash).Scan(&loginCount)
+	s.check("admin login event query", err)
+	s.assert("admin login event recorded", err == nil && loginCount > 0)
 
 	return s
 }
@@ -836,6 +909,28 @@ func (r *selfTestRunner) newKbAuth() (ssh.AuthMethod, string, string) {
 	label := "kbint:" + pw[:16]
 	r.rememberTestUser(hash, label)
 	return method, label, hash
+}
+
+func (r *selfTestRunner) newAdminHostKeyAuth() (ssh.AuthMethod, string, string, error) {
+	keyBytes, err := os.ReadFile(r.cfg.HostKeyFile)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read host key %q: %w", r.cfg.HostKeyFile, err)
+	}
+
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("parse host key %q: %w", r.cfg.HostKeyFile, err)
+	}
+
+	fp := ssh.FingerprintSHA256(signer.PublicKey())
+	label := fp
+	if len(label) > 16 {
+		label = label[:16]
+	}
+
+	hash := fmt.Sprintf("%x", sha256.Sum256(signer.PublicKey().Marshal()))
+	r.rememberActivityUser(hash, "admin-hostkey "+label)
+	return ssh.PublicKeys(signer), label, hash, nil
 }
 
 // ============================================================================
