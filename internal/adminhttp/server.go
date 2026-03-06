@@ -15,35 +15,38 @@ type Config struct {
 }
 
 type RouteHandlers struct {
-	Page            http.HandlerFunc
-	CSS             http.HandlerFunc
-	JS              http.HandlerFunc
-	Health          http.HandlerFunc
-	Summary         http.HandlerFunc
-	Users           http.HandlerFunc
-	User            http.HandlerFunc
-	Files           http.HandlerFunc
-	FileSearch      http.HandlerFunc
-	Audit           http.HandlerFunc
-	AuthAttempts    http.HandlerFunc
-	Events          http.HandlerFunc
-	EventStream     http.HandlerFunc
-	Insights        http.HandlerFunc
-	Sessions        http.HandlerFunc
-	SessionTimeline http.HandlerFunc
-	RecentUploads   http.HandlerFunc
-	Actor           http.HandlerFunc
-	SystemLog       http.HandlerFunc
-	ParsedSystemLog http.HandlerFunc
-	Banned          http.HandlerFunc
-	BanIP           http.HandlerFunc
-	UnbanIP         http.HandlerFunc
-	IPLists         http.HandlerFunc
-	AdminKeys       http.HandlerFunc
-	IPListTest      http.HandlerFunc
-	IPList          http.HandlerFunc
-	SelfTest        http.HandlerFunc
-	SelfTestRun     http.HandlerFunc
+	Page             http.HandlerFunc
+	CSS              http.HandlerFunc
+	JS               http.HandlerFunc
+	Explorer         http.HandlerFunc
+	Health           http.HandlerFunc
+	Summary          http.HandlerFunc
+	Users            http.HandlerFunc
+	User             http.HandlerFunc
+	Files            http.HandlerFunc
+	FileSearch       http.HandlerFunc
+	Audit            http.HandlerFunc
+	AuthAttempts     http.HandlerFunc
+	Events           http.HandlerFunc
+	EventStream      http.HandlerFunc
+	Insights         http.HandlerFunc
+	Sessions         http.HandlerFunc
+	SessionTimeline  http.HandlerFunc
+	RecentUploads    http.HandlerFunc
+	Actor            http.HandlerFunc
+	SystemLog        http.HandlerFunc
+	ParsedSystemLog  http.HandlerFunc
+	Banned           http.HandlerFunc
+	BanIP            http.HandlerFunc
+	UnbanIP          http.HandlerFunc
+	IPLists          http.HandlerFunc
+	AdminKeys        http.HandlerFunc
+	IPListTest       http.HandlerFunc
+	IPList           http.HandlerFunc
+	SelfTest         http.HandlerFunc
+	SelfTestRun      http.HandlerFunc
+	ExplorerDelete   http.HandlerFunc
+	ExplorerBanOwner http.HandlerFunc
 }
 
 type Deps interface {
@@ -68,6 +71,8 @@ func Listen(deps Deps) error {
 	})
 
 	register(mux, "/admin", cfg.Token, handlers.Page)
+	register(mux, "/admin/explorer", cfg.Token, handlers.Explorer)
+	register(mux, "/admin/explorer/", cfg.Token, handlers.Explorer)
 	register(mux, "/admin/static/admin.css", cfg.Token, handlers.CSS)
 	register(mux, "/admin/static/admin.js", cfg.Token, handlers.JS)
 	register(mux, "/admin/api/health", cfg.Token, handlers.Health)
@@ -96,6 +101,8 @@ func Listen(deps Deps) error {
 	register(mux, "/admin/api/ip-lists/", cfg.Token, handlers.IPList)
 	register(mux, "/admin/api/self-test", cfg.Token, handlers.SelfTest)
 	register(mux, "/admin/api/self-test/run", cfg.Token, handlers.SelfTestRun)
+	register(mux, "/admin/api/explorer/delete", cfg.Token, handlers.ExplorerDelete)
+	register(mux, "/admin/api/explorer/ban-owner", cfg.Token, handlers.ExplorerBanOwner)
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,

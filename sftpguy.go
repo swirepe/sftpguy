@@ -45,6 +45,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path"
@@ -853,6 +854,9 @@ type Server struct {
 	adminShutdown    func(context.Context) error
 	selfTestMu       sync.Mutex
 	selfTestState    adminSelfTestState
+	adminExplorerMu  sync.Mutex
+	adminExplorer    http.Handler
+	adminExplorerErr error
 	shadowMutateMin  time.Duration
 	shadowMutateMax  time.Duration
 	shadowListMin    time.Duration

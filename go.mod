@@ -11,7 +11,8 @@ require (
 	github.com/charmbracelet/wish v1.4.7
 	github.com/pkg/sftp v1.13.10
 	golang.org/x/crypto v0.47.0
-	golang.org/x/text v0.33.0
+	golang.org/x/image v0.36.0
+	golang.org/x/text v0.34.0
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.44.3
 )
