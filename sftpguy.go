@@ -58,6 +58,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/log"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
@@ -180,6 +181,7 @@ const (
 type EventKind string
 
 const (
+	EventConnect               EventKind = "connect"
 	EventShell                 EventKind = "shell"
 	EventExec                  EventKind = "exec"
 	EventLogin                 EventKind = "login"
@@ -631,6 +633,7 @@ type Config struct {
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
+	Syslog                  bool
 	UploadDir               string
 	BannerFile              string
 	BannerStats             bool
@@ -665,6 +668,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
+	EnvFlag(&cfg.Syslog, "syslog", "SYSLOG", false, "Enable logging to local syslog (Linux only)")
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
 	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
@@ -980,8 +984,9 @@ func (s *Server) Listen() error {
 		}
 
 		addr := conn.RemoteAddr()
+		log.Info("new connection", "remote_addr", addr)
 		if s.store.IsBannedByIp(addr) {
-			s.logger.Info("Throttling new connection", "remote_addr", conn.RemoteAddr())
+			s.logger.Info("Throttling new connection", "remote_addr", addr)
 			conn = newThrottledConn(conn, shadowBanBytesPerSec)
 		}
 		s.wg.Add(1)
@@ -2513,22 +2518,32 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	if cfg.QuietConsole {
 		cLvl = slog.LevelWarn
 	}
+	var handlers []slog.Handler
 
 	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cLvl})
 	if cfg.PrettyLog {
 		consoleHandler = newConsoleHandler(&slog.HandlerOptions{Level: cLvl})
 	}
+	handlers = append(handlers, consoleHandler)
 
 	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-	fileHandler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: cLvl})
+	handlers = append(handlers, slog.NewTextHandler(f, &slog.HandlerOptions{Level: cLvl}))
+
+	sh, err := cfg.getSyslogHandler()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to initialize syslog: %v\n", err)
+	} else if sh != nil {
+		handlers = append(handlers, sh)
+	}
+
 	// consoleHandler := newConsoleHandler(&slog.HandlerOptions{Level: lvl})
 	// logger := slog.New(slog.NewTextHandler(mw, &slog.HandlerOptions{Level: lvl}))
-	logger := slog.New(&MultiLogHandler{
-		handlers: []slog.Handler{fileHandler, consoleHandler},
-	})
+
+	logger := slog.New(&MultiLogHandler{handlers: handlers})
+
 	logger.Info("configuration",
 		"name", cfg.Name,
 		"version", AppVersion,

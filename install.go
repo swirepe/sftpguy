@@ -23,6 +23,7 @@ type serviceParams struct {
 	BinaryPath  string   // InstallDir/<name>
 	LogFile     string   // /var/log/<name>.log
 	Args        []string // flags to pass on restart (os.Args minus -install)
+	UseSyslog   bool
 }
 
 // serviceTemplate is the systemd unit file template.
@@ -38,8 +39,10 @@ WorkingDirectory={{.InstallDir}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+
+# If server handles syslog internally, discard stdout to avoid duplicate logs in journal
+StandardOutput={{if .UseSyslog}}null{{else}}journal{{end}}
+StandardError={{if .UseSyslog}}null{{else}}journal{{end}}
 SyslogIdentifier={{.Name}}
 
 [Install]
@@ -105,6 +108,15 @@ func runInstall(opts installOptions) error {
 	serviceName := opts.Name + ".service"
 	serviceDst := "/etc/systemd/system/" + serviceName
 
+	useSyslog := false
+	for _, arg := range opts.Args {
+		// Match -syslog or --syslog (and variants like -syslog=true)
+		if strings.HasPrefix(arg, "-syslog") || strings.HasPrefix(arg, "--syslog") {
+			useSyslog = true
+			break
+		}
+	}
+
 	params := serviceParams{
 		Description: opts.Name,
 		Name:        opts.Name,
@@ -113,6 +125,7 @@ func runInstall(opts installOptions) error {
 		InstallDir:  installDir,
 		BinaryPath:  binaryDst,
 		Args:        opts.Args,
+		UseSyslog:   useSyslog,
 	}
 
 	var svcContent strings.Builder
