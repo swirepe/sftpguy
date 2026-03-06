@@ -44,7 +44,7 @@ func RunSelfTest(srv *Server, cfg Config, logger *slog.Logger) int {
 // RunSelfTestWithReport runs the integration self-test suite and returns a
 // structured report with per-suite and per-step results.
 func RunSelfTestWithReport(srv *Server, cfg Config, logger *slog.Logger) SelfTestReport {
-	log := logger.WithGroup("test") //("component", "self-test")
+	log := logger.WithGroup("test")
 	startedAt := time.Now().UTC()
 	report := SelfTestReport{StartedAt: startedAt}
 
