@@ -25,14 +25,15 @@
       actor: null,
       sessionTimeline: null,
       lastEventID: 0,
-      selfTest: { running: false, run_id: 0, started_at: "", running_for: "", last_report: null },
-      selfTestPollTimer: 0,
-      ipLists: {
-        whitelist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
-        blacklist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
-        test: null
-      }
-    };
+	      selfTest: { running: false, run_id: 0, started_at: "", running_for: "", last_report: null },
+	      selfTestPollTimer: 0,
+	      ipLists: {
+	        whitelist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+	        blacklist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+	        test: null
+	      },
+	      adminKeys: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [], hashes: [] }
+	    };
 
     function setStatus(msg) { document.getElementById("status").textContent = msg; }
     function esc(v) {
@@ -943,38 +944,56 @@
         "<h3>IP bans</h3>" + renderSimpleTable(["IP", "Banned At", "Action"], ipRows);
     }
 
-    async function loadIPLists() {
-      const d = await api("/admin/api/ip-lists");
-      state.ipLists = {
-        whitelist: (d && d.whitelist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
-        blacklist: (d && d.blacklist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
-        test: state.ipLists ? state.ipLists.test : null
-      };
+	    async function loadIPLists() {
+	      const out = await Promise.all([api("/admin/api/ip-lists"), api("/admin/api/admin-keys")]);
+	      const d = out[0] || {};
+	      const k = out[1] || {};
+	      state.ipLists = {
+	        whitelist: (d && d.whitelist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+	        blacklist: (d && d.blacklist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
+	        test: state.ipLists ? state.ipLists.test : null
+	      };
+	      state.adminKeys = {
+	        path: k.path || "",
+	        content: k.content || "",
+	        entries: Number(k.entries || 0),
+	        invalid_count: Number(k.invalid_count || 0),
+	        invalid_lines: k.invalid_lines || [],
+	        hashes: k.hashes || []
+	      };
 
-      const wlEditor = document.getElementById("iplist-whitelist-content");
-      const blEditor = document.getElementById("iplist-blacklist-content");
-      if (wlEditor && document.activeElement !== wlEditor) wlEditor.value = state.ipLists.whitelist.content || "";
-      if (blEditor && document.activeElement !== blEditor) blEditor.value = state.ipLists.blacklist.content || "";
+	      const wlEditor = document.getElementById("iplist-whitelist-content");
+	      const blEditor = document.getElementById("iplist-blacklist-content");
+	      const akEditor = document.getElementById("admin-keys-content");
+	      if (wlEditor && document.activeElement !== wlEditor) wlEditor.value = state.ipLists.whitelist.content || "";
+	      if (blEditor && document.activeElement !== blEditor) blEditor.value = state.ipLists.blacklist.content || "";
+	      if (akEditor && document.activeElement !== akEditor) akEditor.value = state.adminKeys.content || "";
 
       setTabCount("iplists", null);
       renderIPLists();
     }
 
-    function renderIPLists() {
-      const wl = (state.ipLists || {}).whitelist || {};
-      const bl = (state.ipLists || {}).blacklist || {};
-      const test = (state.ipLists || {}).test || null;
+	    function renderIPLists() {
+	      const wl = (state.ipLists || {}).whitelist || {};
+	      const bl = (state.ipLists || {}).blacklist || {};
+	      const test = (state.ipLists || {}).test || null;
+	      const ak = state.adminKeys || {};
 
-      const wlMeta = "path=<code>" + esc(wl.path || "") + "</code> entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
-      const blMeta = "path=<code>" + esc(bl.path || "") + "</code> entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
-      document.getElementById("iplist-whitelist-meta").innerHTML = wlMeta;
-      document.getElementById("iplist-blacklist-meta").innerHTML = blMeta;
-      document.getElementById("iplist-whitelist-invalid").innerHTML = (wl.invalid_lines || []).length
-        ? ("Invalid lines: <code>" + esc((wl.invalid_lines || []).join(", ")) + "</code>")
-        : "";
-      document.getElementById("iplist-blacklist-invalid").innerHTML = (bl.invalid_lines || []).length
-        ? ("Invalid lines: <code>" + esc((bl.invalid_lines || []).join(", ")) + "</code>")
-        : "";
+	      const wlMeta = "path=<code>" + esc(wl.path || "") + "</code> entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
+	      const blMeta = "path=<code>" + esc(bl.path || "") + "</code> entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
+	      const akMeta = "path=<code>" + esc(ak.path || "") + "</code> entries=" + esc(ak.entries || 0) + " invalid=" + esc(ak.invalid_count || 0);
+	      document.getElementById("iplist-whitelist-meta").innerHTML = wlMeta;
+	      document.getElementById("iplist-blacklist-meta").innerHTML = blMeta;
+	      document.getElementById("admin-keys-meta").innerHTML = akMeta;
+	      document.getElementById("iplist-whitelist-invalid").innerHTML = (wl.invalid_lines || []).length
+	        ? ("Invalid lines: <code>" + esc((wl.invalid_lines || []).join(", ")) + "</code>")
+	        : "";
+	      document.getElementById("iplist-blacklist-invalid").innerHTML = (bl.invalid_lines || []).length
+	        ? ("Invalid lines: <code>" + esc((bl.invalid_lines || []).join(", ")) + "</code>")
+	        : "";
+	      document.getElementById("admin-keys-invalid").innerHTML = (ak.invalid_lines || []).length
+	        ? ("Invalid lines: <code>" + esc((ak.invalid_lines || []).join(", ")) + "</code>")
+	        : "";
 
       if (!test) {
         document.getElementById("iplist-test-out").innerHTML = "<div class=\"muted\">Enter an IP to test effective ban behavior.</div>";
@@ -992,7 +1011,7 @@
         "<div class=\"muted\">Whitelist has highest precedence.</div>";
     }
 
-    async function saveIPList(kind) {
+	    async function saveIPList(kind) {
       const editorID = kind === "whitelist" ? "iplist-whitelist-content" : "iplist-blacklist-content";
       const editor = document.getElementById(editorID);
       if (!editor) return;
@@ -1013,8 +1032,31 @@
       editor.value = state.ipLists[kind].content || "";
       addHistory("saved " + kind + " ip list");
       toast("Saved " + kind);
-      renderIPLists();
-    }
+	      renderIPLists();
+	    }
+
+	    async function saveAdminKeys() {
+	      const editor = document.getElementById("admin-keys-content");
+	      if (!editor) return;
+	      const content = editor.value || "";
+	      const d = await api("/admin/api/admin-keys", {
+	        method: "POST",
+	        body: JSON.stringify({ content: content })
+	      });
+	      const info = (d && d.keys) || {};
+	      state.adminKeys = {
+	        path: info.path || "",
+	        content: info.content || content,
+	        entries: Number(info.entries || 0),
+	        invalid_count: Number(info.invalid_count || 0),
+	        invalid_lines: info.invalid_lines || [],
+	        hashes: info.hashes || []
+	      };
+	      editor.value = state.adminKeys.content || "";
+	      addHistory("saved admin keys");
+	      toast("Saved admin keys");
+	      renderIPLists();
+	    }
 
     async function testIPList() {
       const input = document.getElementById("iplist-test-ip");

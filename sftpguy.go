@@ -66,7 +66,7 @@ import (
 )
 
 //go:generate go run . -update-version
-//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go log_stub.go log_linux.go test_client.go test_server.go fortunes.txt
+//go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go fortunes.txt
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -288,8 +288,10 @@ type Store struct {
 	logger        *slog.Logger
 	blacklist     *IPList
 	whitelist     *IPList
+	adminKeys     *AdminKeyList
 	blacklistPath string
 	whitelistPath string
+	adminKeysPath string
 }
 
 func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
@@ -314,16 +316,23 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	if whitePath == "" {
 		whitePath = "whitelist.txt"
 	}
+	adminKeysPath := strings.TrimSpace(cfg.AdminKeysPath)
+	if adminKeysPath == "" {
+		adminKeysPath = "admin_keys.txt"
+	}
 
 	ctx := context.Background()
 	black := NewIPList(ctx, blackPath, logger)
 	white := NewIPList(ctx, whitePath, logger)
+	adminKeys := NewAdminKeyList(ctx, adminKeysPath, logger)
 	return &Store{db: db,
 		logger:        logger,
 		blacklist:     black,
 		whitelist:     white,
+		adminKeys:     adminKeys,
 		blacklistPath: blackPath,
-		whitelistPath: whitePath}, nil
+		whitelistPath: whitePath,
+		adminKeysPath: adminKeysPath}, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
@@ -391,6 +400,10 @@ func (s *Store) Close() error {
 
 	if s.whitelist != nil {
 		s.whitelist.Stop()
+	}
+
+	if s.adminKeys != nil {
+		s.adminKeys.Stop()
 	}
 
 	return s.db.Close()
@@ -656,6 +669,7 @@ type Config struct {
 	SelfTestContinue        bool
 	BlacklistPath           string
 	WhitelistPath           string
+	AdminKeysPath           string
 }
 
 func LoadConfig() (Config, error) {
@@ -691,6 +705,7 @@ func LoadConfig() (Config, error) {
 
 	EnvFlag(&cfg.BlacklistPath, "blacklist", "BLACKLIST", "blacklist.txt", "Text file of IP addresses to blacklist, one per line")
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
+	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
 
 	EnvFlag(&cfg.BootstrapSrc, "src", "SRC", false, "Copy source code to upload directory on boot")
 	v := flag.Bool("version", false, "Show version")
@@ -1094,7 +1109,6 @@ func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.K
 
 	user := conn.User()
 	password := answers[0]
-
 	data := fmt.Sprintf("pwd-auth:%s:%s", user, password)
 	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
 	attemptSessionID := fmt.Sprintf("%x", conn.SessionID())
@@ -1229,7 +1243,11 @@ func (s *Server) handleChannel(ch ssh.Channel,
 		case "subsystem":
 			if string(req.Payload[4:]) == "sftp" {
 				req.Reply(true, nil)
-				s.Welcome(ch.Stderr(), pubHash, stats)
+				if isAdmin {
+					s.WelcomeAdmin(ch.Stderr(), sConn.Permissions.Extensions["pubkey-hash"])
+				} else {
+					s.Welcome(ch.Stderr(), pubHash, stats)
+				}
 
 				var readLimiter *rate.Limiter
 				if isBanned {
@@ -1349,6 +1367,31 @@ const contributorMessage = `%s
 %s
 * Welcome back, %s
 `
+
+const adminBanner = `
+┏━┓┏┳┓┏━┓┳┳┓   ┏┳┓┏━┓┳┓┏━╸
+┣━┫┃┃┃┃┃┃┃┃┃   ┃┃┃┃ ┃┃┗┫╺┓
+╹ ╹╹ ╹┗━┛┻┻┛   ╹ ╹┗━┛┻ ┗━┛`
+
+func (s *Server) WelcomeAdmin(wUnbuf io.Writer, loginKeyHash string) {
+	w := bufio.NewWriter(wUnbuf)
+	keyID := shortID(loginKeyHash)
+	if keyID == "" {
+		keyID = "unknown"
+	}
+
+	fmt.Fprintf(w, "\r\n%s\r\n", red.Bold(adminBanner))
+	fmt.Fprintln(w, red.Bold("* ADMIN MODE ACTIVE"))
+	fmt.Fprintln(w, "* You are connected as the system owner.")
+	fmt.Fprintln(w, "* Read/write/rename/delete operations are unrestricted.")
+	fmt.Fprintf(w, "* Login key hash: %s\r\n", cyan.Bold(keyID))
+	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
+		fmt.Fprintf(w, "* Max file size still applies: %s\r\n", bold.Fmt(formatBytes(maxSize)))
+	}
+	fmt.Fprintln(w, "* Use caution: actions affect all users immediately.")
+	fmt.Fprintf(w, "\r\n")
+	w.Flush()
+}
 
 func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	w := bufio.NewWriter(wUnbuf)
@@ -2551,6 +2594,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"version", AppVersion,
 		"port", cfg.Port,
 		"admin.sftp", cfg.AdminSFTP,
+		"admin.keys", cfg.AdminKeysPath,
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
 		"noauth", cfg.SshNoAuth,

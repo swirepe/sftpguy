@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -59,8 +57,16 @@ func (s *Server) isAdminConn(permissions *ssh.Permissions) bool {
 }
 
 func (s *Server) checkAdminKey(key ssh.PublicKey) bool {
-	hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
-	return hash == s.adminHostKeyHash()
+	hash := publicKeyHash(key)
+	if hash == "" {
+		return false
+	}
+
+	if hash == s.adminHostKeyHash() {
+		return true
+	}
+
+	return s.store != nil && s.store.adminKeys != nil && s.store.adminKeys.ContainsHash(hash)
 }
 
 func (s *Server) adminHostKeyHash() string {
@@ -76,7 +82,7 @@ func (s *Server) adminHostKeyHash() string {
 	if err != nil {
 		return ""
 	}
-	h := fmt.Sprintf("%x", sha256.Sum256(signer.PublicKey().Marshal()))
+	h := publicKeyHash(signer.PublicKey())
 	s.adminHash = h
 	return h
 }

@@ -194,6 +194,15 @@
           </div>
           <div class="muted" id="iplist-blacklist-invalid"></div>
         </div>
+        <div class="iplist-box">
+          <h3>Admin Keys</h3>
+          <div class="muted" id="admin-keys-meta"></div>
+          <textarea id="admin-keys-content" spellcheck="false" class="editor" placeholder="ssh-ed25519 AAAAC3... admin-laptop"></textarea>
+          <div class="row">
+            <button class="btn-good" onclick="saveAdminKeys()">Save Admin Keys</button>
+          </div>
+          <div class="muted" id="admin-keys-invalid"></div>
+        </div>
       </div>
       <h3>Test IP</h3>
       <div class="row">

@@ -8,7 +8,7 @@
 //   -host       Server host (default: localhost)
 //   -port       Server port (default: 2222)
 //   -hostkey    Server public key .pub file (optional)
-//   -adminkey   Server private host key for admin-sftp login checks (optional)
+//   -adminkey   Private key for admin-sftp checks (host key or configured admin key)
 //   -system     A system-owned file on the server (default: README.txt)
 //   -threshold  Contributor threshold bytes, match -contrib (default: 1048576)
 //   -noauth     Run noClientAuth suite, server needs -noauth (default: true)
@@ -39,7 +39,7 @@ var (
 	flagHost      = flag.String("host", "localhost", "Server hostname")
 	flagPort      = flag.Int("port", 2222, "Server port")
 	flagHostKey   = flag.String("hostkey", "", "Path to server public key file (optional)")
-	flagAdminKey  = flag.String("adminkey", "", "Path to server private host key for admin-sftp checks (optional)")
+	flagAdminKey  = flag.String("adminkey", "", "Path to private key for admin-sftp checks (host key or configured admin key)")
 	flagSystem    = flag.String("system", "README.txt", "A system-owned file present on the server")
 	flagThreshold = flag.Int64("threshold", 1048576, "Contributor threshold bytes")
 	flagNoAuth    = flag.Bool("noauth", true, "Run noClientAuth suite")
@@ -301,6 +301,29 @@ func tryShell(auth ssh.AuthMethod) error {
 	}
 }
 
+func readSFTPWelcome(auth ssh.AuthMethod) (string, error) {
+	cli, err := dialSSH(sshCfg(auth))
+	if err != nil {
+		return "", fmt.Errorf("dial: %w", err)
+	}
+	defer cli.Close()
+
+	sess, err := cli.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("new session: %w", err)
+	}
+	defer sess.Close()
+
+	var stderr strings.Builder
+	sess.Stderr = &stderr
+	if err := sess.RequestSubsystem("sftp"); err != nil {
+		return "", fmt.Errorf("request subsystem: %w", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	_ = sess.Close()
+	return stderr.String(), nil
+}
+
 func sftpRead(c *sftp.Client, p string) error {
 	f, err := c.Open(path.Clean("/" + p))
 	if err != nil {
@@ -550,10 +573,10 @@ func runSystemFileSuite(auth ssh.AuthMethod) *suite {
 }
 
 func runAdminSuite(adminKeyPath string) *suite {
-	s := &suite{name: "Admin SFTP (server host key)"}
+	s := &suite{name: "Admin SFTP (configured key)"}
 
 	adminAuth, adminLabel, err := adminKeyAuth(adminKeyPath)
-	s.check("load admin host key", "ok", err)
+	s.check("load admin key", "ok", err)
 	if err != nil {
 		for i := 0; i < 11; i++ {
 			s.skip("(skipped)", "admin key unavailable")
@@ -594,6 +617,18 @@ func runAdminSuite(adminKeyPath string) *suite {
 	}
 	defer sshCli.Close()
 	defer sftpCli.Close()
+
+	welcome, err := readSFTPWelcome(adminAuth)
+	s.check("admin welcome probe", "ok", err)
+	if err == nil {
+		if strings.Contains(strings.ToLower(welcome), "admin mode active") {
+			s.check("admin welcome banner shown", "ok", nil)
+		} else {
+			s.check("admin welcome banner shown", "ok", fmt.Errorf("missing admin mode marker in welcome"))
+		}
+	} else {
+		s.skip("admin welcome banner shown", "welcome probe failed")
+	}
 
 	_, err = sftpCli.ReadDir("/")
 	s.check("admin list directory /", "ok", err)

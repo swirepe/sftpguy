@@ -53,6 +53,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		BanIP:           d.srv.handleAdminBanIP,
 		UnbanIP:         d.srv.handleAdminUnbanIP,
 		IPLists:         d.srv.handleAdminIPLists,
+		AdminKeys:       d.srv.handleAdminKeys,
 		IPListTest:      d.srv.handleAdminIPListTest,
 		IPList:          d.srv.handleAdminIPList,
 		SelfTest:        d.srv.handleAdminSelfTest,

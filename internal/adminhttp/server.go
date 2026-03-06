@@ -39,6 +39,7 @@ type RouteHandlers struct {
 	BanIP           http.HandlerFunc
 	UnbanIP         http.HandlerFunc
 	IPLists         http.HandlerFunc
+	AdminKeys       http.HandlerFunc
 	IPListTest      http.HandlerFunc
 	IPList          http.HandlerFunc
 	SelfTest        http.HandlerFunc
@@ -90,6 +91,7 @@ func Listen(deps Deps) error {
 	register(mux, "/admin/api/banned/ip", cfg.Token, handlers.BanIP)
 	register(mux, "/admin/api/banned/ip/", cfg.Token, handlers.UnbanIP)
 	register(mux, "/admin/api/ip-lists", cfg.Token, handlers.IPLists)
+	register(mux, "/admin/api/admin-keys", cfg.Token, handlers.AdminKeys)
 	register(mux, "/admin/api/ip-lists/test", cfg.Token, handlers.IPListTest)
 	register(mux, "/admin/api/ip-lists/", cfg.Token, handlers.IPList)
 	register(mux, "/admin/api/self-test", cfg.Token, handlers.SelfTest)

@@ -125,6 +125,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 	suites = append(suites, r.runResumeUploads("second (pubkey "+secondLabel+")", secondAuth))
 	suites = append(suites, r.runSystemFile(secondAuth))
 	suites = append(suites, r.runAdminSFTP())
+	suites = append(suites, r.runAdminSFTPConfiguredKey())
 	suites = append(suites, r.runBanUnban(banVictimAuth, banVictimLabel, banVictimHash, preexisting))
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
@@ -373,6 +374,98 @@ func (r *selfTestRunner) runAdminSFTP() *stSuite {
 	if err != nil {
 		return s
 	}
+	r.runAdminSFTPOperations(s, adminAuth, adminLabel, adminHash)
+	return s
+}
+
+func (r *selfTestRunner) runAdminSFTPConfiguredKey() *stSuite {
+	s := r.startSuite("Admin SFTP (configured key file)")
+	defer r.finishSuite(s)
+
+	if !r.cfg.AdminSFTP {
+		s.skip("admin sftp login", "admin.sftp disabled")
+		return s
+	}
+
+	if r.srv.store == nil || r.srv.store.adminKeys == nil {
+		s.skip("configured admin key login", "admin key list unavailable")
+		return s
+	}
+
+	adminKeysPath := strings.TrimSpace(r.srv.store.adminKeysPath)
+	if adminKeysPath == "" {
+		s.skip("configured admin key login", "admin key path empty")
+		return s
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	s.check("generate configured admin key", err)
+	if err != nil {
+		return s
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	s.check("create configured admin signer", err)
+	if err != nil {
+		return s
+	}
+
+	fp := ssh.FingerprintSHA256(signer.PublicKey())
+	adminLabel := fp
+	if len(adminLabel) > 16 {
+		adminLabel = adminLabel[:16]
+	}
+	adminHash := fmt.Sprintf("%x", sha256.Sum256(signer.PublicKey().Marshal()))
+	r.rememberActivityUser(adminHash, "admin-configured "+adminLabel)
+
+	original, readErr := os.ReadFile(adminKeysPath)
+	hadOriginal := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		s.check("read admin key file", readErr)
+		return s
+	}
+	s.check("read admin key file", nil)
+
+	defer func() {
+		var restoreErr error
+		if hadOriginal {
+			restoreErr = os.WriteFile(adminKeysPath, original, permFile)
+		} else {
+			restoreErr = os.WriteFile(adminKeysPath, []byte(""), permFile)
+		}
+		s.check("restore admin key file", restoreErr)
+		_, reloadErr := r.srv.store.adminKeys.Reload(adminKeysPath)
+		s.check("reload admin key list after restore", reloadErr)
+	}()
+
+	content := strings.TrimRight(string(original), "\n")
+	if content != "" {
+		content += "\n"
+	}
+	content += strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + "\n"
+	s.check("write configured admin key", os.WriteFile(adminKeysPath, []byte(content), permFile))
+	if s.failCount() > 0 {
+		return s
+	}
+
+	entries, err := r.srv.store.adminKeys.Reload(adminKeysPath)
+	s.check("reload configured admin key list", err)
+	s.assert("configured admin key loaded", err == nil && entries > 0 && r.srv.store.adminKeys.ContainsHash(adminHash))
+	if err != nil {
+		return s
+	}
+
+	r.runAdminSFTPOperations(s, ssh.PublicKeys(signer), adminLabel, adminHash)
+	return s
+}
+
+func (r *selfTestRunner) runAdminSFTPOperations(s *stSuite, adminAuth ssh.AuthMethod, adminLabel, adminHash string) {
+	if s == nil {
+		return
+	}
+
+	welcome, welcomeErr := r.readSFTPWelcome(adminAuth)
+	s.check("admin welcome probe", welcomeErr)
+	s.assert("admin welcome banner shown", welcomeErr == nil && strings.Contains(strings.ToLower(welcome), "admin mode active"))
 
 	// Create a normal user file first, then verify admin can fully manage it.
 	victimAuth, victimLabel, _ := r.newPubKeyAuth()
@@ -380,7 +473,7 @@ func (r *selfTestRunner) runAdminSFTP() *stSuite {
 	victimSSH, victimSFTP, err := r.openSFTP(victimAuth)
 	s.check("setup victim connection ("+victimLabel+")", err)
 	if err != nil {
-		return s
+		return
 	}
 	r.checkWrite(s, victimSFTP, victimFile, []byte("victim file contents"), true)
 	_ = victimSFTP.Close()
@@ -389,7 +482,7 @@ func (r *selfTestRunner) runAdminSFTP() *stSuite {
 	adminSSH, adminSFTP, err := r.openSFTP(adminAuth)
 	s.check("connect as admin ("+adminLabel+")", err)
 	if err != nil {
-		return s
+		return
 	}
 	defer adminSFTP.Close()
 	defer adminSSH.Close()
@@ -427,8 +520,6 @@ func (r *selfTestRunner) runAdminSFTP() *stSuite {
 	`, s.logStartID, EventAdminLogin, adminHash).Scan(&loginCount)
 	s.check("admin login event query", err)
 	s.assert("admin login event recorded", err == nil && loginCount > 0)
-
-	return s
 }
 
 func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, victimHash, preexisting string) *stSuite {
@@ -1037,6 +1128,32 @@ func (r *selfTestRunner) tryShell(auth ssh.AuthMethod) error {
 	case <-time.After(3 * time.Second):
 		return fmt.Errorf("shell did not close (timeout)")
 	}
+}
+
+func (r *selfTestRunner) readSFTPWelcome(auth ssh.AuthMethod) (string, error) {
+	cli, err := r.dialSSH(r.sshCfg(auth))
+	if err != nil {
+		return "", fmt.Errorf("dial: %w", err)
+	}
+	defer cli.Close()
+
+	sess, err := cli.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("new session: %w", err)
+	}
+	defer sess.Close()
+
+	var stderr strings.Builder
+	sess.Stderr = &stderr
+	if err := sess.RequestSubsystem("sftp"); err != nil {
+		return "", fmt.Errorf("request subsystem: %w", err)
+	}
+
+	// Give the server a moment to write the welcome banner to stderr.
+	time.Sleep(120 * time.Millisecond)
+	_ = sess.Close()
+
+	return stderr.String(), nil
 }
 
 // ============================================================================
