@@ -121,3 +121,62 @@ func TestAdminKeyList_ReloadFaultTolerance(t *testing.T) {
 		t.Fatal("admin key list was cleared on failed reload")
 	}
 }
+
+func TestEnsureAdminHostKeyInAdminKeysFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	hostKeyPath := filepath.Join(tmpDir, "id_ed25519")
+	adminKeysPath := filepath.Join(tmpDir, "admin_keys.txt")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	srv := &Server{
+		cfg: Config{
+			AdminSFTP:     true,
+			HostKeyFile:   hostKeyPath,
+			AdminKeysPath: adminKeysPath,
+		},
+		logger: logger,
+		store: &Store{
+			logger:        logger,
+			adminKeysPath: adminKeysPath,
+		},
+	}
+
+	if err := os.WriteFile(adminKeysPath, []byte(strings.Repeat("a", 64)), permFile); err != nil {
+		t.Fatalf("write initial admin keys: %v", err)
+	}
+	if err := srv.ensureHostKey(); err != nil {
+		t.Fatalf("ensure host key: %v", err)
+	}
+
+	keyBytes, err := os.ReadFile(hostKeyPath)
+	if err != nil {
+		t.Fatalf("read host key: %v", err)
+	}
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		t.Fatalf("parse host key: %v", err)
+	}
+	hostLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+
+	if err := srv.ensureAdminHostKeyInAdminKeysFile(); err != nil {
+		t.Fatalf("ensure admin key file includes host key: %v", err)
+	}
+	first, err := os.ReadFile(adminKeysPath)
+	if err != nil {
+		t.Fatalf("read admin keys after first ensure: %v", err)
+	}
+	if strings.Count(string(first), hostLine) != 1 {
+		t.Fatalf("expected one host key entry after first ensure, file=%q", string(first))
+	}
+
+	if err := srv.ensureAdminHostKeyInAdminKeysFile(); err != nil {
+		t.Fatalf("ensure admin key file includes host key (second run): %v", err)
+	}
+	second, err := os.ReadFile(adminKeysPath)
+	if err != nil {
+		t.Fatalf("read admin keys after second ensure: %v", err)
+	}
+	if strings.Count(string(second), hostLine) != 1 {
+		t.Fatalf("expected host key entry to remain deduplicated, file=%q", string(second))
+	}
+}

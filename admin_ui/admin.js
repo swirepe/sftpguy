@@ -357,9 +357,10 @@
       const insight = state.insights || {};
       const kpi = insight.kpi || {};
       const win = insight.window || {};
-      setStatus("archive=" + (d.archive || "") + " version=" + (d.version || "") + " ssh=:" + (d.ssh_port || "") + " admin=" + (d.admin_http || "") + " range=" + (win.label || state.timeRange));
+      setStatus("archive=" + (d.archive || "") + " version=" + (d.version || "") + " ssh=:" + (d.ssh_port || "") + " admin=" + (d.admin_http || "") + " uptime=" + (d.uptime || "") + " range=" + (win.label || state.timeRange));
 
       const entries = [
+        ["Uptime", d.uptime || "0s"],
         ["Users", d.users || 0],
         ["Contributors", d.contributors || 0],
         ["Files", d.files || 0],

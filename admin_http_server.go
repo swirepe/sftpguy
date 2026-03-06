@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"sftpguy/internal/adminhttp"
 )
@@ -91,6 +92,10 @@ func (d *adminHTTPDeps) SSHPort() int {
 
 func (d *adminHTTPDeps) AdminHTTPAddr() string {
 	return d.srv.cfg.AdminHTTP
+}
+
+func (d *adminHTTPDeps) Uptime() time.Duration {
+	return d.srv.Uptime()
 }
 
 func (d *adminHTTPDeps) ContributorThreshold() int64 {

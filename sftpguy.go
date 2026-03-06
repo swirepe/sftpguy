@@ -969,6 +969,9 @@ func (s *Server) Listen() error {
 	if err := s.ensureHostKey(); err != nil {
 		return err
 	}
+	if err := s.ensureAdminHostKeyInAdminKeysFile(); err != nil {
+		s.logger.Warn("failed to ensure admin key list contains server host key", "err", err)
+	}
 
 	sshConfig := &ssh.ServerConfig{
 		BannerCallback:              s.bannerCallback,

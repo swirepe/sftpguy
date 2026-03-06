@@ -442,19 +442,27 @@ func (r *selfTestRunner) runAdminSFTPConfiguredKey() *stSuite {
 		content += "\n"
 	}
 	content += strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))) + "\n"
-	s.check("write configured admin key", os.WriteFile(adminKeysPath, []byte(content), permFile))
+	s.check("write new admin key to file", os.WriteFile(adminKeysPath, []byte(content), permFile))
 	if s.failCount() > 0 {
 		return s
 	}
 
 	entries, err := r.srv.store.adminKeys.Reload(adminKeysPath)
-	s.check("reload configured admin key list", err)
-	s.assert("configured admin key loaded", err == nil && entries > 0 && r.srv.store.adminKeys.ContainsHash(adminHash))
+	s.check("reload admin key list from file", err)
+	s.assert("new admin key loaded after reload", err == nil && entries > 0 && r.srv.store.adminKeys.ContainsHash(adminHash))
 	if err != nil {
 		return s
 	}
 
-	r.runAdminSFTPOperations(s, ssh.PublicKeys(signer), adminLabel, adminHash)
+	adminAuth := ssh.PublicKeys(signer)
+	welcome, welcomeErr := r.readSFTPWelcome(adminAuth)
+	s.check("login with newly-added admin key", welcomeErr)
+	s.assert("new admin key gets admin banner", welcomeErr == nil && strings.Contains(strings.ToLower(welcome), "admin mode active"))
+	if welcomeErr != nil {
+		return s
+	}
+
+	r.runAdminSFTPOperations(s, adminAuth, adminLabel, adminHash)
 	return s
 }
 

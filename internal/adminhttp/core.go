@@ -11,6 +11,7 @@ type CoreDeps interface {
 	AppVersion() string
 	SSHPort() int
 	AdminHTTPAddr() string
+	Uptime() time.Duration
 	ContributorThreshold() int64
 	BannerStats(threshold int64) (users, contributors, files, bytes uint64)
 	DirectoryCount() (int, error)
@@ -43,6 +44,8 @@ func SummaryHandler(deps CoreDeps) http.HandlerFunc {
 			"version":               deps.AppVersion(),
 			"ssh_port":              deps.SSHPort(),
 			"admin_http":            deps.AdminHTTPAddr(),
+			"uptime":                deps.Uptime().Round(time.Second).String(),
+			"uptime_seconds":        int64(deps.Uptime().Seconds()),
 			"users":                 u,
 			"contributors":          c,
 			"files":                 f,

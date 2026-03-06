@@ -105,6 +105,68 @@ func (s *Server) checkAdminKey(key ssh.PublicKey) bool {
 	return s.store != nil && s.store.adminKeys != nil && s.store.adminKeys.ContainsHash(hash)
 }
 
+func (s *Server) ensureAdminHostKeyInAdminKeysFile() error {
+	if !s.cfg.AdminSFTP {
+		return nil
+	}
+
+	adminKeysPath := strings.TrimSpace(s.cfg.AdminKeysPath)
+	if s.store != nil {
+		if p := strings.TrimSpace(s.store.adminKeysPath); p != "" {
+			adminKeysPath = p
+		}
+	}
+	if adminKeysPath == "" {
+		adminKeysPath = "admin_keys.txt"
+	}
+
+	keyBytes, err := os.ReadFile(s.cfg.HostKeyFile)
+	if err != nil {
+		return fmt.Errorf("read host key %q: %w", s.cfg.HostKeyFile, err)
+	}
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return fmt.Errorf("parse host key %q: %w", s.cfg.HostKeyFile, err)
+	}
+
+	hostPub := signer.PublicKey()
+	hostHash := publicKeyHash(hostPub)
+	if hostHash == "" {
+		return fmt.Errorf("derive host key hash from %q: empty hash", s.cfg.HostKeyFile)
+	}
+
+	existing, err := os.ReadFile(adminKeysPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read admin key file %q: %w", adminKeysPath, err)
+	}
+	hashes, _ := parseAdminKeysContent(string(existing))
+	if _, ok := hashes[hostHash]; ok {
+		return nil
+	}
+
+	hostKeyLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostPub)))
+	content := strings.TrimRight(string(existing), "\n")
+	if content != "" {
+		content += "\n"
+	}
+	content += hostKeyLine + "\n"
+
+	if err := os.WriteFile(adminKeysPath, []byte(content), permFile); err != nil {
+		return fmt.Errorf("write admin key file %q: %w", adminKeysPath, err)
+	}
+
+	if s.store != nil && s.store.adminKeys != nil {
+		if _, err := s.store.adminKeys.Reload(adminKeysPath); err != nil {
+			return fmt.Errorf("reload admin key list %q: %w", adminKeysPath, err)
+		}
+	}
+
+	s.logger.Info("added server host key to admin key list",
+		"path", adminKeysPath,
+		"host_key_hash", shortID(hostHash))
+	return nil
+}
+
 func (s *Server) adminHostKeyHash() string {
 	if s.adminHash != "" {
 		return s.adminHash
