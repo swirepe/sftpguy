@@ -1143,15 +1143,34 @@ func (r *selfTestRunner) readSFTPWelcome(auth ssh.AuthMethod) (string, error) {
 	}
 	defer sess.Close()
 
-	var stderr strings.Builder
-	sess.Stderr = &stderr
+	stderrPipe, err := sess.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	var stderr bytes.Buffer
+	readDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(&stderr, stderrPipe)
+		readDone <- copyErr
+	}()
+
 	if err := sess.RequestSubsystem("sftp"); err != nil {
 		return "", fmt.Errorf("request subsystem: %w", err)
 	}
 
-	// Give the server a moment to write the welcome banner to stderr.
-	time.Sleep(120 * time.Millisecond)
+	// Allow the server time to emit the welcome banner before closing.
+	time.Sleep(250 * time.Millisecond)
 	_ = sess.Close()
+
+	select {
+	case copyErr := <-readDone:
+		if copyErr != nil {
+			return "", fmt.Errorf("read subsystem stderr: %w", copyErr)
+		}
+	case <-time.After(1 * time.Second):
+		return stderr.String(), fmt.Errorf("timeout reading subsystem stderr")
+	}
 
 	return stderr.String(), nil
 }

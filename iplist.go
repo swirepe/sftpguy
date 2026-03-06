@@ -54,18 +54,17 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 		cancel: cancel,
 	}
 
-	if entries, addresses, err := bl.Reload(filepath); err != nil {
+	entries, addresses, err := bl.Reload(filepath)
+	if err != nil {
 		log.Warn("initial ip list load failed", "error", err)
 	} else {
 		log.Info("initial ip list load complete", "entries", entries, "addresses", addresses)
 	}
-
-	go func() {
+	firstReload := newIPReloadResult(entries, addresses, err)
+	go func(lastReload ipReloadResult) {
 		const period = 30 * time.Second
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
-		var lastLoggedReload ipReloadResult
-		var hasLastLoggedReload bool
 		var lastChanged = time.Now()
 		for {
 			select {
@@ -74,15 +73,14 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 				entries, addresses, err := bl.Reload(filepath)
 				currentReload := newIPReloadResult(entries, addresses, err)
 
-				if !hasLastLoggedReload || !currentReload.equals(lastLoggedReload) {
+				if !currentReload.equals(lastReload) {
 					bl.logger.Info("reloaded ip list file",
 						"entries", entries,
 						"addresses", addresses,
 						"duration", time.Since(start),
 						"last_changed", time.Since(lastChanged),
 						"error", err)
-					lastLoggedReload = currentReload
-					hasLastLoggedReload = true
+					lastReload = currentReload
 					lastChanged = time.Now()
 				}
 			case <-ctx.Done():
@@ -90,7 +88,7 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 				return
 			}
 		}
-	}()
+	}(firstReload)
 
 	return bl
 }

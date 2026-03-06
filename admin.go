@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -18,6 +21,39 @@ const (
 	EventAdminSelf   EventKind = "admin/selftest"
 	EventAdminConfig EventKind = "admin/config"
 )
+
+const adminBanner = `
+┏━┓╺┳┓┏┳┓╻┏┓╻╻┏━┓╺┳╸┏━┓┏━┓╺┳╸┏━┓┏━┓
+┣━┫ ┃┃┃┃┃┃┃┗┫┃┗━┓ ┃ ┣┳┛┣━┫ ┃ ┃ ┃┣┳┛
+╹ ╹╺┻┛╹ ╹╹╹ ╹╹┗━┛ ╹ ╹┗╸╹ ╹ ╹ ┗━┛╹┗╸
+`
+
+func (s *Server) WelcomeAdmin(wUnbuf io.Writer, loginKeyHash string) {
+	w := bufio.NewWriter(wUnbuf)
+	keyID := shortID(loginKeyHash)
+	if keyID == "" {
+		keyID = "unknown"
+	}
+
+	fmt.Fprintf(w, "\r\n%s\r\n", red.Bold(adminBanner))
+	fmt.Fprintln(w, red.Bold("* ADMIN MODE ACTIVE"))
+	fmt.Fprintln(w, "* You are connected as the system owner.")
+	fmt.Fprintln(w, "* Read/write/rename/delete operations are unrestricted.")
+	fmt.Fprintf(w, "* Login key hash: %s\r\n", cyan.Bold(keyID))
+	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
+		fmt.Fprintf(w, "* Max file size still applies: %s\r\n", bold.Fmt(formatBytes(maxSize)))
+	}
+	fmt.Fprintln(w, "* Use caution: actions affect all users immediately.")
+	fmt.Fprintf(w, "\r\n")
+
+	u, c, f, b := s.store.GetBannerStats(s.cfg.ContributorThreshold)
+	fmt.Fprintf(w, "\r\nUptime: %s, Users: %d | Contributors: %d | Files: %d | Size: %s\r\n", s.Uptime(), u, c, f, formatBytes(int64(b)))
+	w.Flush()
+}
+
+func (s *Server) Uptime() time.Duration {
+	return time.Since(s.startedAt)
+}
 
 func (s *Store) IsBanned(pubkeyHash string) bool {
 	var exists bool

@@ -857,6 +857,7 @@ type Server struct {
 	shadowMutateMax  time.Duration
 	shadowListMin    time.Duration
 	shadowListMax    time.Duration
+	startedAt        time.Time
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -887,6 +888,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		shadowMutateMax:  shadowMutateMaxDefault,
 		shadowListMin:    shadowListMinDefault,
 		shadowListMax:    shadowListMaxDefault,
+		startedAt:        time.Now(),
 	}
 
 	if cfg.SelfTest || cfg.SelfTestContinue {
@@ -1368,31 +1370,6 @@ const contributorMessage = `%s
 * Welcome back, %s
 `
 
-const adminBanner = `
-┏━┓┏┳┓┏━┓┳┳┓   ┏┳┓┏━┓┳┓┏━╸
-┣━┫┃┃┃┃┃┃┃┃┃   ┃┃┃┃ ┃┃┗┫╺┓
-╹ ╹╹ ╹┗━┛┻┻┛   ╹ ╹┗━┛┻ ┗━┛`
-
-func (s *Server) WelcomeAdmin(wUnbuf io.Writer, loginKeyHash string) {
-	w := bufio.NewWriter(wUnbuf)
-	keyID := shortID(loginKeyHash)
-	if keyID == "" {
-		keyID = "unknown"
-	}
-
-	fmt.Fprintf(w, "\r\n%s\r\n", red.Bold(adminBanner))
-	fmt.Fprintln(w, red.Bold("* ADMIN MODE ACTIVE"))
-	fmt.Fprintln(w, "* You are connected as the system owner.")
-	fmt.Fprintln(w, "* Read/write/rename/delete operations are unrestricted.")
-	fmt.Fprintf(w, "* Login key hash: %s\r\n", cyan.Bold(keyID))
-	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
-		fmt.Fprintf(w, "* Max file size still applies: %s\r\n", bold.Fmt(formatBytes(maxSize)))
-	}
-	fmt.Fprintln(w, "* Use caution: actions affect all users immediately.")
-	fmt.Fprintf(w, "\r\n")
-	w.Flush()
-}
-
 func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	w := bufio.NewWriter(wUnbuf)
 	uid := hashToUid(hash)
@@ -1537,6 +1514,13 @@ func (s *Server) ensureHostKey() error {
 	return os.WriteFile(s.cfg.HostKeyFile+".pub", pubBytes, permFile)
 }
 
+type FileRecord struct {
+	Path      string
+	OwnerHash string
+	Size      int64
+	IsDir     bool
+}
+
 func (s *Server) reconcileOrphans() {
 	var sysFiles []string
 	for p := range s.cfg.unrestrictedMap {
@@ -1552,19 +1536,79 @@ func (s *Server) reconcileOrphans() {
 	}
 	s.store.RegisterSystemFiles(s.absUploadDir, sysFiles)
 
-	filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
+	var candidates []FileRecord
+
+	err := filepath.WalkDir(s.absUploadDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == s.absUploadDir {
 			return nil
 		}
+
 		rel, _ := filepath.Rel(s.absUploadDir, p)
 		rel = filepath.ToSlash(rel)
-		if !s.store.FileExistsInDB(rel) {
-			fi, _ := d.Info()
-			s.store.RegisterFile(rel, systemOwner, fi.Size(), d.IsDir())
-			s.logger.Info("reconciled orphan file", "path", rel)
+
+		fi, err := d.Info()
+		if err != nil {
+			return nil
 		}
+
+		candidates = append(candidates, FileRecord{
+			Path:      rel,
+			OwnerHash: systemOwner,
+			Size:      fi.Size(),
+			IsDir:     d.IsDir(),
+		})
 		return nil
 	})
+
+	if err != nil {
+		s.logger.Error("error walking upload directory", "error", err)
+	}
+
+	// Single batch operation instead of one call per file
+	if len(candidates) > 0 {
+		inserted, err := s.store.RegisterFilesBatch(candidates)
+		if err != nil {
+			s.logger.Error("failed to batch reconcile files", "error", err)
+		} else if inserted > 0 {
+			s.logger.Info("reconciled orphan files", "new_count", inserted)
+		}
+	}
+}
+
+func (s *Store) RegisterFilesBatch(files []FileRecord) (int64, error) {
+	if len(files) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	// Rollback does nothing if the transaction is already committed
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT OR IGNORE INTO files (path, owner_hash, size, is_dir) 
+		VALUES (?, ?, ?, ?)
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+
+	var insertedCount int64
+	for _, f := range files {
+		res, err := stmt.Exec(f.Path, f.OwnerHash, f.Size, f.IsDir)
+		if err != nil {
+			return 0, err
+		}
+
+		// If the file didn't exist, RowsAffected will be 1
+		count, _ := res.RowsAffected()
+		insertedCount += count
+	}
+
+	return insertedCount, tx.Commit()
 }
 
 // ============================================================================
