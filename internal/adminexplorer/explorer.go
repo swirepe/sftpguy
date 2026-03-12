@@ -638,6 +638,11 @@ func buildFilePreviewPayload(fullPath string, info os.FileInfo, escapedPath stri
 	}
 
 	cat := getCategory(info.Name())
+	likelyText := cat == "text" || strings.HasPrefix(p.MimeType, "text/")
+	if !likelyText && p.Ext == "" {
+		likelyText = isLikelyTextFile(fullPath)
+	}
+
 	switch {
 	case unlocked && cat == "image":
 		p.IsImage = true
@@ -652,7 +657,7 @@ func buildFilePreviewPayload(fullPath string, info os.FileInfo, escapedPath stri
 			generateAndStoreThumb(fullPath, info.ModTime())
 		}
 
-	case cat == "text" || strings.HasPrefix(p.MimeType, "text/plain"):
+	case likelyText:
 		p.IsText = true
 		p.TextLines = readFirstLines(fullPath, 25)
 		lc, wc, cc, ending := textStats(fullPath)
@@ -964,6 +969,13 @@ func handleGet(w http.ResponseWriter, r *http.Request, fullPath, relPath string)
 	if relPath != "" {
 		uploadLabel = relPath
 	}
+	wantedFile := strings.TrimSpace(r.URL.Query().Get("wanted"))
+	if wantedFile != "" {
+		wantedFile = filepath.Base(filepath.ToSlash(wantedFile))
+		if wantedFile == "." || wantedFile == "/" {
+			wantedFile = ""
+		}
+	}
 
 	parent := filepath.ToSlash(filepath.Dir(relPath))
 	if parent == "." || parent == "/" {
@@ -1034,7 +1046,7 @@ func handleGet(w http.ResponseWriter, r *http.Request, fullPath, relPath string)
 		Order:           r.URL.Query().Get("order"),
 		SortSuffix:      sortSuffix,
 		UploadDirLabel:  uploadLabel,
-		WantedFile:      "",
+		WantedFile:      wantedFile,
 		CSRFToken:       csrf,
 		PreviewOpen:     cookieValue(r, cookiePreview, "open") == "open",
 		DirName:         dirName,
@@ -1495,6 +1507,46 @@ func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath 
 }
 
 // ── text / image helpers ──────────────────────────────────────────────────────
+
+const textProbeBytes = 8 << 10
+
+func isLikelyTextFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	buf := make([]byte, textProbeBytes)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return false
+	}
+	return isLikelyText(buf[:n])
+}
+
+func isLikelyText(sample []byte) bool {
+	if len(sample) == 0 {
+		return true
+	}
+	if bytes.IndexByte(sample, 0) >= 0 {
+		return false
+	}
+
+	controls := 0
+	for _, b := range sample {
+		switch b {
+		case '\n', '\r', '\t', '\f':
+			continue
+		}
+		if b < 0x20 {
+			controls++
+		}
+	}
+
+	// Treat payloads with many control bytes as binary.
+	return controls*100 <= len(sample)*5
+}
 
 func readFirstLines(path string, n int) []string {
 	f, err := os.Open(path)

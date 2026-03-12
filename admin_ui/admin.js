@@ -265,6 +265,55 @@
       return "<button class=\"owner-link\" onclick=\"openSessionTimeline(decodeURIComponent('" + enc + "'))\"><code title=\"" + esc(value) + "\">" + esc(shortSession(value)) + "</code></button>" +
         " <button class=\"tiny\" onclick=\"copyText('" + esc(value) + "')\">Copy</button>";
     }
+    function normalizeExplorerPath(path) {
+      let rel = String(path == null ? "" : path).trim();
+      if (!rel || rel === "." || rel === "/") return "";
+      rel = rel.replaceAll("\\", "/");
+      while (rel.startsWith("./")) rel = rel.slice(2);
+      rel = rel.replace(/^\/+/, "");
+      rel = rel.replace(/\/+/g, "/");
+      rel = rel.replace(/\/+$/, "");
+      return rel === "." ? "" : rel;
+    }
+    function encodeExplorerPath(relPath) {
+      if (!relPath) return "";
+      return relPath.split("/").filter(Boolean).map(function(seg) {
+        return encodeURIComponent(seg);
+      }).join("/");
+    }
+    function explorerHref(path, isDirHint) {
+      const raw = String(path == null ? "" : path);
+      const rel = normalizeExplorerPath(raw);
+      if (!rel) return "/admin/explorer/";
+      const hasTrailingSlash = /\/\s*$/.test(raw);
+      const isDir = isDirHint === true || (isDirHint == null && hasTrailingSlash);
+      if (isDir) {
+        return "/admin/explorer/" + encodeExplorerPath(rel);
+      }
+      const parts = rel.split("/");
+      const wanted = parts.pop() || "";
+      const dir = parts.join("/");
+      const base = dir ? ("/admin/explorer/" + encodeExplorerPath(dir)) : "/admin/explorer/";
+      return base + "?wanted=" + encodeURIComponent(wanted);
+    }
+    function explorerLink(path, isDirHint) {
+      const raw = String(path == null ? "" : path).trim();
+      if (!raw) return "";
+      return " <a class=\"tiny nav-link\" href=\"" + esc(explorerHref(raw, isDirHint)) + "\">Explorer</a>";
+    }
+    function pathWithExplorer(path, isDirHint, displayValue) {
+      const raw = String(path == null ? "" : path);
+      if (!raw) return "<code>-</code>";
+      const shown = displayValue == null ? raw : String(displayValue);
+      return "<code>" + esc(shown) + "</code>" + explorerLink(raw, isDirHint);
+    }
+    function openPathButton(path, label) {
+      const raw = String(path == null ? "" : path);
+      const shown = String(label == null ? raw : label);
+      if (!raw) return esc(shown);
+      const enc = encodeURIComponent(raw);
+      return "<button onclick=\"openPath(decodeURIComponent('" + enc + "'))\">" + esc(shown) + "</button>";
+    }
 
     function closeActorDrawer() {
       state.actor = null;
@@ -331,12 +380,14 @@
         const ts = timestampToMs(a.timestamp) || startMs;
         const offset = Math.max(0, ts - startMs);
         const tone = eventTone(a.event);
-        const detail = a.path ? String(a.path) : (a.meta ? String(a.meta) : "");
+        const detail = a.path
+          ? pathWithExplorer(String(a.path))
+          : ("<code>" + esc(a.meta ? String(a.meta) : "") + "</code>");
         return "<div class=\"timeline-item\">" +
           "<code class=\"timeline-offset\">+" + esc(formatMs(offset)) + "</code>" +
           "<code class=\"timeline-time\">" + esc(a.time || "") + "</code>" +
           "<span class=\"evt-chip " + tone + "\">" + esc(String(a.event || "").toUpperCase()) + "</span>" +
-          "<code class=\"timeline-detail\">" + esc(detail) + "</code>" +
+          "<span class=\"timeline-detail\">" + detail + "</span>" +
         "</div>";
       }).join("");
 
@@ -404,7 +455,7 @@
         return [
           "<code>" + esc(x.time || "") + "</code>",
           ownerCell(x.user_id),
-          "<code>" + esc(x.path || "") + "</code>",
+          pathWithExplorer(x.path || "", false),
           esc(formatBytes(x.delta || 0)),
           sessionCell(x.session)
         ];
@@ -494,7 +545,7 @@
 	              is_dir: e.is_dir ? 1 : 0
 	            },
 	            cells: [
-	              e.is_dir ? "<button onclick=\"openPath('" + esc(e.path) + "')\"><code>" + esc(e.path) + "/</code></button>" : "<code>" + esc(e.path) + "</code>",
+	              (e.is_dir ? (openPathButton(e.path, "Open") + " ") : "") + pathWithExplorer(e.path || "", !!e.is_dir, e.is_dir ? ((e.path || "") + "/") : (e.path || "")),
 	              ownerCell(e.owner || "-"),
 	              esc(e.size_human || formatBytes(e.size || 0)),
 	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
@@ -528,14 +579,16 @@
             is_dir: e.is_dir ? 1 : 0
           },
           cells: [
-            e.is_dir ? "<button onclick=\"openPath('" + esc(e.path) + "')\">" + esc(e.name) + "/</button>" : esc(e.name),
+            e.is_dir
+              ? (openPathButton(e.path, (e.name || "") + "/") + explorerLink(e.path || "", true))
+              : (esc(e.name || "") + explorerLink(e.path || "", false)),
             ownerCell(e.owner || "-"),
             esc(e.size_human || formatBytes(e.size || 0)),
             e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
           ]
         };
       });
-	      document.getElementById("files-out").innerHTML = "<div class=\"muted\">path=<code>" + esc(state.files.path) + "</code></div>" +
+	      document.getElementById("files-out").innerHTML = "<div class=\"muted\">path=" + pathWithExplorer(state.files.path || ".", true) + "</div>" +
 	        renderSmartTable(
 	          "files",
 	          [
@@ -625,7 +678,7 @@
             ownerCell(e.user_id),
             ipCell(e.ip),
             sessionCell(e.session),
-            "<code>" + esc(e.path || "") + "</code>",
+            pathWithExplorer(e.path || ""),
             "<code>" + esc(e.meta || "") + "</code>"
           ]
         };
@@ -695,7 +748,7 @@
             ownerCell(e.user_id),
             ipCell(e.ip),
             sessionCell(e.session),
-            "<code>" + esc(e.path || "") + "</code>",
+            pathWithExplorer(e.path || ""),
             "<button class=\"btn-danger tiny\" onclick=\"banIPDirect('" + esc(e.ip || "") + "')\">Ban IP</button>"
           ]
         };
@@ -930,7 +983,7 @@
             "<code>" + esc(u.time || "") + "</code>",
             ownerCell(u.user_id),
             ipCell(u.ip),
-            "<code>" + esc(u.path || "") + "</code>",
+            pathWithExplorer(u.path || "", false),
             esc(formatBytes(u.delta || 0)),
             esc(formatBytes(u.size || 0)),
             sessionCell(u.session)
@@ -1007,9 +1060,9 @@
 	      const test = (state.ipLists || {}).test || null;
 	      const ak = state.adminKeys || {};
 
-	      const wlMeta = "path=<code>" + esc(wl.path || "") + "</code> entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
-	      const blMeta = "path=<code>" + esc(bl.path || "") + "</code> entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
-	      const akMeta = "path=<code>" + esc(ak.path || "") + "</code> entries=" + esc(ak.entries || 0) + " invalid=" + esc(ak.invalid_count || 0);
+	      const wlMeta = "path=" + pathWithExplorer(wl.path || "") + " entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
+	      const blMeta = "path=" + pathWithExplorer(bl.path || "") + " entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
+	      const akMeta = "path=" + pathWithExplorer(ak.path || "") + " entries=" + esc(ak.entries || 0) + " invalid=" + esc(ak.invalid_count || 0);
 	      document.getElementById("iplist-whitelist-meta").innerHTML = wlMeta;
 	      document.getElementById("iplist-blacklist-meta").innerHTML = blMeta;
 	      document.getElementById("admin-keys-meta").innerHTML = akMeta;
@@ -1285,13 +1338,13 @@
       const actorDisplay = isUser ? ownerCell(d.actor) : ipCell(d.actor);
 
       const uploadRows = (d.recent_uploads || []).slice(0, 20).map(function(u) {
-        return ["<code>" + esc(u.time || "") + "</code>", "<code>" + esc(u.path || "") + "</code>", esc(formatBytes(u.delta || 0)), sessionCell(u.session)];
+        return ["<code>" + esc(u.time || "") + "</code>", pathWithExplorer(u.path || "", false), esc(formatBytes(u.delta || 0)), sessionCell(u.session)];
       });
       const sessionRows = (d.sessions || []).slice(0, 20).map(function(x) {
         return [sessionCell(x.session), esc((x.event_count || 0)), esc((x.duration_sec || 0) + "s"), esc(x.denied_count || 0)];
       });
       const eventRows = (d.events || []).slice(0, 30).map(function(e) {
-        return ["<code>" + esc(e.time || "") + "</code>", "<code>" + esc(e.event || "") + "</code>", "<code>" + esc(e.path || "") + "</code>", sessionCell(e.session)];
+        return ["<code>" + esc(e.time || "") + "</code>", "<code>" + esc(e.event || "") + "</code>", pathWithExplorer(e.path || ""), sessionCell(e.session)];
       });
 
       const actionButtons = isUser ?

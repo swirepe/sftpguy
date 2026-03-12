@@ -41,7 +41,7 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 			q := url.Values{}
 			q.Set("tab", "files")
 			q.Set("owner", owner)
-			return "/admin/?" + q.Encode()
+			return "/admin?" + q.Encode()
 		},
 	})
 	if err != nil {
