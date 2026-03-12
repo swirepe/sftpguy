@@ -70,7 +70,8 @@ import (
 //go:embed VERSION
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
-//go:embed fortunes.txt internal cmd
+//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go
+
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"
@@ -668,6 +669,7 @@ type Config struct {
 	ContributorThreshold    int64
 	unrestrictedMap         map[string]bool
 	BootstrapSrc            bool
+	ExportSrcDir            string
 	AdminSFTP               bool
 	SshNoAuth               bool
 	SelfTest                bool
@@ -714,6 +716,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
 
 	EnvFlag(&cfg.BootstrapSrc, "src", "SRC", false, "Copy source code to upload directory on boot")
+	EnvFlag(&cfg.ExportSrcDir, "src.out", "SRC_OUT", "", "Write source snapshot to this directory and exit")
 	v := flag.Bool("version", false, "Show version")
 
 	install := flag.Bool("install", false, "Install as a systemd service (requires root)")
@@ -752,6 +755,16 @@ func LoadConfig() (Config, error) {
 			fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 			os.Exit(1)
 		}
+		os.Exit(0)
+	}
+
+	if strings.TrimSpace(cfg.ExportSrcDir) != "" {
+		exportedDir, err := exportEmbeddedSourceSnapshot(cfg.Name, cfg.ExportSrcDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "source export failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(exportedDir)
 		os.Exit(0)
 	}
 
@@ -924,7 +937,11 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 			logger.Error("failed to bootstrap source", "err", err)
 		}
 
+		if cfg.unrestrictedMap == nil {
+			cfg.unrestrictedMap = make(map[string]bool)
+		}
 		cfg.unrestrictedMap[srcDir] = true
+		srv.cfg.unrestrictedMap = cfg.unrestrictedMap
 	}
 
 	return srv, nil
@@ -933,9 +950,39 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 func bootstrapSource(name, absDir string, logger *slog.Logger) (srcDir string, err error) {
 	logger.Info("bootstrapping embedded files to upload directory")
 
-	srcDir = fmt.Sprintf("%s-%s/", name, appShort())
+	srcDir = sourceSnapshotDirName(name)
+	if err := writeEmbeddedSourceTree(absDir, srcDir); err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(srcDir) + "/", nil
+}
 
-	return srcDir, fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
+func sourceSnapshotDirName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "sftpguy"
+	}
+	return fmt.Sprintf("%s-%s", name, appShort())
+}
+
+func exportEmbeddedSourceSnapshot(name, outDir string) (string, error) {
+	absOutDir, err := filepath.Abs(strings.TrimSpace(outDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve source output directory: %w", err)
+	}
+	if err := os.MkdirAll(absOutDir, permDir); err != nil {
+		return "", fmt.Errorf("create source output directory %q: %w", absOutDir, err)
+	}
+
+	srcDir := sourceSnapshotDirName(name)
+	if err := writeEmbeddedSourceTree(absOutDir, srcDir); err != nil {
+		return "", err
+	}
+	return filepath.Join(absOutDir, srcDir), nil
+}
+
+func writeEmbeddedSourceTree(baseDir, srcDir string) error {
+	return fs.WalkDir(embeddedSource, ".", func(relPath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -950,7 +997,7 @@ func bootstrapSource(name, absDir string, logger *slog.Logger) (srcDir string, e
 
 		//logical path stored in the DB (e.g. "sftpguy-v1.0.0/main.go")
 		destName := filepath.Join(srcDir, relPath)
-		destPath := filepath.Join(absDir, destName) // the actual location on disk
+		destPath := filepath.Join(baseDir, destName) // the actual location on disk
 
 		if err := os.MkdirAll(filepath.Dir(destPath), permDir); err != nil {
 			return fmt.Errorf("failed to create directory for %s: %w", destName, err)
@@ -959,8 +1006,6 @@ func bootstrapSource(name, absDir string, logger *slog.Logger) (srcDir string, e
 		if err := os.WriteFile(destPath, data, permFile); err != nil {
 			return fmt.Errorf("failed to write %s to disk: %w", destName, err)
 		}
-
-		logger.Debug("bootstrapped file", "file", destName)
 		return nil
 	})
 }
