@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,19 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 		BasePath:       adminexplorer.DefaultBasePath,
 		EmbedAssets:    false,
 		MaxUploadBytes: s.cfg.MaxFileSize,
+		LookupOwner: func(relPath string) (string, error) {
+			return s.store.GetFileOwner(relPath)
+		},
+		OwnerFilesURL: func(owner string) string {
+			owner = strings.TrimSpace(owner)
+			if owner == "" || owner == systemOwner {
+				return ""
+			}
+			q := url.Values{}
+			q.Set("tab", "files")
+			q.Set("owner", owner)
+			return "/admin/?" + q.Encode()
+		},
 	})
 	if err != nil {
 		s.adminExplorerErr = err

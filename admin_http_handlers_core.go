@@ -233,9 +233,11 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	qRaw := strings.TrimSpace(r.URL.Query().Get("q"))
-	if qRaw == "" {
+	owner := strings.TrimSpace(r.URL.Query().Get("owner"))
+	if qRaw == "" && owner == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"q":       "",
+			"owner":   "",
 			"results": []any{},
 			"total":   0,
 		})
@@ -244,6 +246,16 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 	limit := parseIntQuery(r, "limit", 200, 10, 2000)
 	offset := parseIntQuery(r, "offset", 0, 0, 1000000)
 	q := "%" + qRaw + "%"
+	where := "(path LIKE ? OR owner_hash LIKE ?)"
+	args := []any{q, q}
+	if owner != "" {
+		where = "owner_hash = ?"
+		args = []any{owner}
+		if qRaw != "" {
+			where += " AND path LIKE ?"
+			args = append(args, q)
+		}
+	}
 
 	type resultRow struct {
 		Path      string `json:"path"`
@@ -255,20 +267,20 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var total int64
-	if err := s.store.db.QueryRow(`
-		SELECT COUNT(*)
-		FROM files
-		WHERE path LIKE ? OR owner_hash LIKE ?`, q, q).Scan(&total); err != nil {
+	countQuery := `SELECT COUNT(*) FROM files WHERE ` + where
+	if err := s.store.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	rows, err := s.store.db.Query(`
+	listQuery := `
 		SELECT path, IFNULL(owner_hash,''), IFNULL(size,0), is_dir
 		FROM files
-		WHERE path LIKE ? OR owner_hash LIKE ?
+		WHERE ` + where + `
 		ORDER BY is_dir DESC, size DESC, path ASC
-		LIMIT ? OFFSET ?`, q, q, limit, offset)
+		LIMIT ? OFFSET ?`
+	listArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.store.db.Query(listQuery, listArgs...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -291,6 +303,7 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"q":       qRaw,
+		"owner":   owner,
 		"results": results,
 		"total":   total,
 		"offset":  offset,

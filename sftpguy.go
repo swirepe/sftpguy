@@ -67,9 +67,10 @@ import (
 )
 
 //go:generate go run . -update-version
+//go:embed VERSION
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
-//go:embed VERSION fortunes.txt internal admin_ui
+//go:embed fortunes.txt internal cmd
 var embeddedSource embed.FS
 
 const versionFile = "VERSION"

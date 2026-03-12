@@ -12,7 +12,7 @@
 	      summaryUploads: [],
 	      users: [],
       files: { path: ".", entries: [] },
-      fileSearch: { q: "", results: [], total: 0, offset: 0, limit: 200 },
+      fileSearch: { q: "", owner: "", results: [], total: 0, offset: 0, limit: 200 },
       audit: [],
       events: [],
       authAttempts: [],
@@ -111,6 +111,14 @@
     function withRange(path) {
       const sep = path.includes("?") ? "&" : "?";
       return path + sep + "range=" + encodeURIComponent(state.timeRange);
+    }
+
+    function bootParams() {
+      const params = new URLSearchParams(window.location.search || "");
+      const tab = String(params.get("tab") || "").toLowerCase();
+      const owner = String(params.get("owner") || "").trim();
+      const q = String(params.get("q") || "").trim();
+      return { tab: tab, owner: owner, q: q };
     }
 
     async function api(path, opts) {
@@ -470,9 +478,11 @@
 	      renderFiles();
 	    }
 	    function renderFiles() {
-	      const searching = !!(state.fileSearch && state.fileSearch.q);
+	      const searching = !!(state.fileSearch && (state.fileSearch.q || state.fileSearch.owner));
 	      if (searching) {
 	        const results = state.fileSearch.results || [];
+          const owner = String((state.fileSearch && state.fileSearch.owner) || "");
+          const ownerPill = owner ? ("<span class=\"pill\">owner=<code>" + esc(owner) + "</code></span>") : "";
 	        const rows = results.map(function(e) {
 	          return {
 	            sort: {
@@ -490,7 +500,7 @@
 	          };
 	        });
 	        document.getElementById("files-out").innerHTML =
-	          "<div class=\"row\"><span class=\"pill\">search=<code>" + esc(state.fileSearch.q) + "</code></span><span class=\"pill\">results " + esc(state.fileSearch.total || results.length) + "</span></div>" +
+	          "<div class=\"row\"><span class=\"pill\">search=<code>" + esc(state.fileSearch.q || "*") + "</code></span>" + ownerPill + "<span class=\"pill\">results " + esc(state.fileSearch.total || results.length) + "</span></div>" +
 	          renderSmartTable(
 	            "file-search",
 	            [
@@ -502,7 +512,7 @@
 	            rows,
 	            "path",
 	            "asc"
-	          );
+	        );
 	        return;
 	      }
 
@@ -537,15 +547,21 @@
 	          "asc"
 	        );
 	    }
-	    async function searchFiles() {
-	      const q = document.getElementById("files-q").value.trim();
-	      if (!q) {
+	    async function runFileSearch(q, owner) {
+	      const qValue = String(q || "").trim();
+        const ownerValue = String(owner || "").trim();
+	      if (!qValue && !ownerValue) {
 	        clearFileSearch();
 	        return;
 	      }
-	      const d = await api("/admin/api/files/search?q=" + encodeURIComponent(q) + "&limit=500");
+        const params = new URLSearchParams();
+        if (qValue) params.set("q", qValue);
+        if (ownerValue) params.set("owner", ownerValue);
+        params.set("limit", "500");
+	      const d = await api("/admin/api/files/search?" + params.toString());
 	      state.fileSearch = {
-	        q: d.q || q,
+	        q: d.q || qValue,
+          owner: d.owner || ownerValue,
 	        results: d.results || [],
 	        total: Number(d.total || 0),
 	        offset: Number(d.offset || 0),
@@ -554,9 +570,18 @@
 	      setTabCount("files", state.fileSearch.results.length);
 	      renderFiles();
 	    }
+	    async function searchFiles() {
+	      const q = document.getElementById("files-q").value.trim();
+        await runFileSearch(q, "");
+	    }
+      async function searchFilesByOwner(owner) {
+        const value = String(owner || "").trim();
+        if (!value) return;
+        await runFileSearch("", value);
+      }
 	    function clearFileSearch() {
 	      document.getElementById("files-q").value = "";
-	      state.fileSearch = { q: "", results: [], total: 0, offset: 0, limit: 200 };
+	      state.fileSearch = { q: "", owner: "", results: [], total: 0, offset: 0, limit: 200 };
 	      setTabCount("files", (state.files.entries || []).length);
 	      renderFiles();
 	    }
@@ -1380,8 +1405,8 @@
         if (state.activeTab === "iplists") {
           await loadIPLists();
         }
-        if (state.fileSearch && state.fileSearch.q) {
-          await searchFiles();
+        if (state.fileSearch && (state.fileSearch.q || state.fileSearch.owner)) {
+          await runFileSearch(state.fileSearch.q, state.fileSearch.owner);
         }
         if (state.actor) {
 	          await openActor(state.actor.actor_type, state.actor.actor);
@@ -1469,10 +1494,23 @@
     });
 
     (async function boot() {
+      const startup = bootParams();
       document.getElementById("time-range").value = state.timeRange;
       document.getElementById("table-page-size").value = String(state.pageSize);
       try {
         await refreshAll();
+        if (startup.owner) {
+          switchTab("files");
+          await searchFilesByOwner(startup.owner);
+          return;
+        }
+        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].includes(startup.tab)) {
+          switchTab(startup.tab);
+          if (startup.tab === "files" && startup.q) {
+            document.getElementById("files-q").value = startup.q;
+            await searchFiles();
+          }
+        }
       } catch (err) {
         setStatus("error: " + err.message);
       }

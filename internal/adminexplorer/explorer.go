@@ -104,11 +104,13 @@ var (
 // ── globals ───────────────────────────────────────────────────────────────────
 
 var (
-	rootDir     string
-	maxFileSize int64
-	basePath    string
-	embedAssets bool
-	tmpl        *template.Template
+	rootDir           string
+	maxFileSize       int64
+	basePath          string
+	embedAssets       bool
+	tmpl              *template.Template
+	ownerLookup       func(relPath string) (string, error)
+	ownerFilesURLFunc func(owner string) string
 )
 
 //go:embed three.min.js video.js video-js.css flv.js videojs-flvjs.min.js
@@ -371,6 +373,9 @@ func isNativeVideo(name string) bool {
 // FileEntry represents one file or directory for any view.
 type FileEntry struct {
 	Name              string
+	Owner             string
+	OwnerShort        string
+	OwnerFilesURL     template.URL
 	Size              int64
 	SizeReadable      string
 	Category          string
@@ -465,6 +470,8 @@ type Config struct {
 	EmbedAssets    bool
 	MaxUploadBytes int64
 	WarmCacheMax   int
+	LookupOwner    func(relPath string) (string, error)
+	OwnerFilesURL  func(owner string) string
 }
 
 type Explorer struct {
@@ -494,6 +501,8 @@ func New(cfg Config) (*Explorer, error) {
 	embedAssets = cfg.EmbedAssets
 	maxFileSize = cfg.MaxUploadBytes
 	basePath = normalizeBasePath(cfg.BasePath)
+	ownerLookup = cfg.LookupOwner
+	ownerFilesURLFunc = cfg.OwnerFilesURL
 
 	go warmCaches(rootDir, cfg.WarmCacheMax)
 	return &Explorer{basePath: basePath}, nil
@@ -1147,7 +1156,9 @@ func treeStats(children []FileEntry) (dirs, files int, _ int64) {
 // ── file entry factory ────────────────────────────────────────────────────────
 
 func createFileEntry(name, relPath string, info os.FileInfo, isDir, isNew, unlocked bool) FileEntry {
-	urlStr := explorerURL(filepath.ToSlash(filepath.Join(relPath, name)))
+	entryRelPath := filepath.ToSlash(filepath.Join(relPath, name))
+	urlStr := explorerURL(entryRelPath)
+	owner, ownerShort, ownerFilesURL := ownerInfoForPath(entryRelPath)
 
 	var thumbURL string
 	if unlocked && imageExts[strings.ToLower(filepath.Ext(name))] {
@@ -1156,18 +1167,21 @@ func createFileEntry(name, relPath string, info os.FileInfo, isDir, isNew, unloc
 
 	absPath := filepath.Join(rootDir, relPath, name)
 	entry := FileEntry{
-		Name:         name,
-		Size:         info.Size(),
-		SizeReadable: formatBytes(info.Size()),
-		IsDir:        isDir,
-		IsEmpty:      checkIsEmpty(absPath, info),
-		URL:          template.URL(urlStr),
-		ThumbURL:     template.URL(thumbURL),
-		ModTimeRaw:   info.ModTime().Unix(),
-		ModTime:      info.ModTime().Format("2006-01-02 15:04"),
-		IsNew:        isNew,
-		IsDanger:     !isDir && dangerExts[strings.ToLower(filepath.Ext(name))],
-		Category:     getCategory(name),
+		Name:          name,
+		Owner:         owner,
+		OwnerShort:    ownerShort,
+		OwnerFilesURL: ownerFilesURL,
+		Size:          info.Size(),
+		SizeReadable:  formatBytes(info.Size()),
+		IsDir:         isDir,
+		IsEmpty:       checkIsEmpty(absPath, info),
+		URL:           template.URL(urlStr),
+		ThumbURL:      template.URL(thumbURL),
+		ModTimeRaw:    info.ModTime().Unix(),
+		ModTime:       info.ModTime().Format("2006-01-02 15:04"),
+		IsNew:         isNew,
+		IsDanger:      !isDir && dangerExts[strings.ToLower(filepath.Ext(name))],
+		Category:      getCategory(name),
 	}
 	if isDir {
 		entry.TotalSize = cachedDirSize(absPath)
@@ -1379,12 +1393,14 @@ type archiveEntry struct {
 }
 
 type previewPayload struct {
-	Name    string `json:"name"`
-	IsDir   bool   `json:"is_dir"`
-	RelPath string `json:"rel_path,omitempty"`
-	Size    string `json:"size"`
-	ModTime string `json:"mod_time"`
-	Ext     string `json:"ext,omitempty"`
+	Name          string `json:"name"`
+	IsDir         bool   `json:"is_dir"`
+	RelPath       string `json:"rel_path,omitempty"`
+	Owner         string `json:"owner,omitempty"`
+	OwnerFilesURL string `json:"owner_files_url,omitempty"`
+	Size          string `json:"size"`
+	ModTime       string `json:"mod_time"`
+	Ext           string `json:"ext,omitempty"`
 
 	ChildDirs  int    `json:"child_dirs"`
 	ChildFiles int    `json:"child_files"`
@@ -1464,6 +1480,11 @@ func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath 
 		p = buildFilePreviewPayload(fullPath, info, escapedPath, unlocked)
 	}
 	p.RelPath = filepath.ToSlash(relPath)
+	owner, _, ownerFilesURL := ownerInfoForPath(relPath)
+	p.Owner = owner
+	if ownerFilesURL != "" {
+		p.OwnerFilesURL = string(ownerFilesURL)
+	}
 
 	var jsonBuf byteBuffer
 	json.NewEncoder(&jsonBuf).Encode(p)
@@ -1774,6 +1795,36 @@ func cookieValue(r *http.Request, name, def string) string {
 		return def
 	}
 	return c.Value
+}
+
+func ownerInfoForPath(relPath string) (owner string, ownerShort string, filesURL template.URL) {
+	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relPath)), "/")
+	if clean == "." {
+		clean = ""
+	}
+	if clean == "" || ownerLookup == nil {
+		return "", "", ""
+	}
+
+	found, err := ownerLookup(clean)
+	if err != nil {
+		return "", "", ""
+	}
+	owner = strings.TrimSpace(found)
+	if owner == "" {
+		return "", "", ""
+	}
+
+	ownerShort = owner
+	if len(ownerShort) > 12 {
+		ownerShort = ownerShort[:12]
+	}
+	if ownerFilesURLFunc != nil {
+		if u := strings.TrimSpace(ownerFilesURLFunc(owner)); u != "" {
+			filesURL = template.URL(u)
+		}
+	}
+	return owner, ownerShort, filesURL
 }
 
 func isUnlocked(r *http.Request) bool {
@@ -2235,11 +2286,15 @@ var htmlTmpl = `
             letter-spacing: .04em; color: var(--text-muted);
             border-bottom: 1px solid var(--border); white-space: nowrap;
         }
-        .file-table th:nth-child(2) { width: 100px; }
-        .file-table th:nth-child(3) { width: 160px; }
-        @media (max-width: 500px) {
+        .file-table th:nth-child(2) { width: 190px; }
+        .file-table th:nth-child(3) { width: 100px; }
+        .file-table th:nth-child(4) { width: 160px; }
+        @media (max-width: 700px) {
             .file-table th:nth-child(2), .file-table td:nth-child(2) { display: none; }
-            .file-table th:nth-child(3) { width: 120px; }
+        }
+        @media (max-width: 500px) {
+            .file-table th:nth-child(3), .file-table td:nth-child(3) { display: none; }
+            .file-table th:nth-child(4) { width: 120px; }
         }
         .file-table th a { color: var(--text-muted); display: block; }
         .file-table th a:hover { color: var(--accent); }
@@ -2265,6 +2320,22 @@ var htmlTmpl = `
         }
         .cell-meta   { color: var(--text-muted); font-size: 13px; }
         .cell-size   { white-space: nowrap; text-align: right; }
+        .owner-chip {
+            display: inline-flex; align-items: center;
+            gap: 4px; max-width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--surface2);
+            padding: 2px 8px;
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+        .owner-chip:hover { color: var(--accent); border-color: var(--accent); text-decoration: none; }
+        .owner-chip code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+            font-size: 11px;
+            white-space: nowrap;
+        }
         .sort-arrow  { font-size: 10px; margin-left: 2px; }
         .locked-text { color: var(--text-muted); }
 
@@ -2296,12 +2367,28 @@ var htmlTmpl = `
         .tile-badge-new   { position: absolute; top: 6px; right: 6px; }
         .tile-info {
             padding: 8px 10px; font-size: 12px;
-            display: flex; align-items: center; gap: 4px;
+            display: flex; flex-direction: column; align-items: stretch; gap: 4px;
             border-top: 1px solid var(--border);
+        }
+        .tile-info-top {
+            display: flex; align-items: center; gap: 4px; min-width: 0;
         }
         .tile-info-name {
             flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
+        .tile-owner-line {
+            min-width: 0;
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .tile-owner-link {
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+        .tile-owner-link:hover { color: var(--accent); text-decoration: none; }
         .tile-dir-hint, .tile-file-hint {
             position: absolute; bottom: 6px; right: 6px;
             opacity: 0; transition: opacity .15s; pointer-events: none;
@@ -2380,7 +2467,7 @@ var htmlTmpl = `
         }
         .preview-actions {
             padding: 10px 12px; border-bottom: 1px solid var(--border);
-            display: flex; gap: 8px;
+            display: flex; flex-direction: column; gap: 8px;
         }
         .preview-actions .btn { flex: 1; justify-content: center; }
         .preview-meta { padding: 10px 12px; }
@@ -2888,14 +2975,26 @@ var htmlTmpl = `
                         {{if .IsNew}}<span class="tile-badge-new badge-new" aria-hidden="true">new</span>{{end}}
                     </div>
                     <div class="tile-info" title="{{.Name}}">
-                        <span class="tile-info-name">{{.Name}}</span>
-                        {{if or .IsDir $unlocked}}
-                        <button class="copy-link-btn" onclick="copyLink(event, '{{.URL}}')" aria-label="Copy link to {{.Name}}" title="Copy link">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                            </svg>
-                        </button>
+                        <div class="tile-info-top">
+                            <span class="tile-info-name">{{.Name}}</span>
+                            {{if or .IsDir $unlocked}}
+                            <button class="copy-link-btn" onclick="copyLink(event, '{{.URL}}')" aria-label="Copy link to {{.Name}}" title="Copy link">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                </svg>
+                            </button>
+                            {{end}}
+                        </div>
+                        {{if .Owner}}
+                        <div class="tile-owner-line">
+                            Uploaded by
+                            {{if .OwnerFilesURL}}
+                            <a class="tile-owner-link" href="{{.OwnerFilesURL}}" title="{{.Owner}}" onclick="event.stopPropagation()"><code>{{.OwnerShort}}</code></a>
+                            {{else}}
+                            <code title="{{.Owner}}">{{.OwnerShort}}</code>
+                            {{end}}
+                        </div>
                         {{end}}
                     </div>
                 </div>
@@ -2980,6 +3079,7 @@ var htmlTmpl = `
             <thead>
                 <tr>
                     <th><a href="?sort=name&order={{if eq .SortBy "name"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}asc{{end}}">Name</a></th>
+                    <th>Uploader</th>
                     <th><a href="?sort=modified&order={{if eq .SortBy "modified"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}desc{{end}}">Last Modified</a></th>
                     <th><a href="?sort=size&order={{if eq .SortBy "size"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}asc{{end}}">Size</a></th>
                     <th>Description</th>
@@ -2989,6 +3089,7 @@ var htmlTmpl = `
                 {{if ne .CurrentPath ""}}
                 <tr>
                     <td><a href="{{.ParentURL}}">Parent Directory</a></td>
+                    <td>-</td>
                     <td>-</td>
                     <td>-</td>
                     <td>-</td>
@@ -3007,13 +3108,22 @@ var htmlTmpl = `
                         {{end}}
                         {{if .IsNew}}&nbsp;<span class="badge-new">new</span>{{end}}
                     </td>
+                    <td class="classic-meta">
+                        {{if .Owner}}
+                            {{if .OwnerFilesURL}}
+                            <a class="owner-chip" href="{{.OwnerFilesURL}}" title="{{.Owner}}"><code>{{.OwnerShort}}</code></a>
+                            {{else}}
+                            <span class="owner-chip" title="{{.Owner}}"><code>{{.OwnerShort}}</code></span>
+                            {{end}}
+                        {{else}}-{{end}}
+                    </td>
                     <td class="classic-meta">{{.ModTime}}</td>
                     <td class="classic-meta classic-size">{{if .IsDir}}{{.TotalSizeReadable}}{{else}}{{.SizeReadable}}{{end}}</td>
                     <td class="classic-meta classic-desc">{{.Category}}</td>
                 </tr>
                 {{end}}
                 {{if not .Files}}
-                <tr><td colspan="4"><em>Empty directory</em></td></tr>
+                <tr><td colspan="5"><em>Empty directory</em></td></tr>
                 {{end}}
             </tbody>
         </table>
@@ -3048,6 +3158,9 @@ var htmlTmpl = `
                     </a>
                 </th>
                 <th scope="col">
+                    Uploader
+                </th>
+                <th scope="col">
                     <a href="?sort=size&order={{if eq .SortBy "size"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}asc{{end}}">
                         Size{{if eq .SortBy "size"}}<span class="sort-arrow" aria-hidden="true">{{if eq .Order "asc"}}▲{{else}}▼{{end}}</span>{{end}}
                     </a>
@@ -3062,7 +3175,7 @@ var htmlTmpl = `
         <tbody>
             {{if ne .CurrentPath ""}}
             <tr class="is-dir parent-row" data-is-parent="true" onclick="window.location='{{.ParentURL}}{{if .SortSuffix}}?{{.SortSuffix}}{{end}}'">
-                <td colspan="3">
+                <td colspan="4">
                     <div class="cell-name">
                         <svg class="icon muted" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                             <polyline points="9 14 4 9 9 4"/>
@@ -3102,6 +3215,17 @@ var htmlTmpl = `
                         </button>
                         {{end}}
                     </div>
+                </td>
+                <td class="cell-meta">
+                    {{if .Owner}}
+                        {{if .OwnerFilesURL}}
+                        <a class="owner-chip" href="{{.OwnerFilesURL}}" title="{{.Owner}}" onclick="event.stopPropagation()"><code>{{.OwnerShort}}</code></a>
+                        {{else}}
+                        <span class="owner-chip" title="{{.Owner}}"><code>{{.OwnerShort}}</code></span>
+                        {{end}}
+                    {{else}}
+                    <span class="locked-text">-</span>
+                    {{end}}
                 </td>
                 <td class="cell-meta cell-size">{{if .IsDir}}{{.TotalSizeReadable}}{{else}}{{.SizeReadable}}{{end}}</td>
                 <td class="cell-meta">{{.ModTime}}</td>
@@ -4126,6 +4250,12 @@ function metaRow(label, value) {
         + '<span class="preview-meta-value">' + esc(String(value)) + '</span>'
         + '</div>';
 }
+function metaRowHTML(label, htmlValue) {
+    return '<div class="preview-meta-row">'
+        + '<span class="preview-meta-label">' + esc(label) + '</span>'
+        + '<span class="preview-meta-value">' + htmlValue + '</span>'
+        + '</div>';
+}
 
 function previewCatIcon(cat, size) {
     size = size || 48;
@@ -4286,6 +4416,12 @@ function renderPreview(d) {
                 + '<circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>'
                 + '<line x1="4" y1="14" x2="10" y2="20"/><line x1="10" y1="14" x2="4" y2="20"/></svg>'
                 + 'Ban owner</button>';
+            if (d.owner_files_url) {
+                html += '<a class="btn btn-ghost" href="' + esc(d.owner_files_url) + '" title="View all files uploaded by this owner">'
+                    + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
+                    + '<path d="M3 7h18"/><path d="M3 12h18"/><path d="M3 17h18"/></svg>'
+                    + 'View owner files</a>';
+            }
         }
         html += '</div>';
     } else if (d.rel_path) {
@@ -4353,6 +4489,13 @@ function renderPreview(d) {
     html += '<div class="preview-meta">';
     html += metaRow('Size', d.size);
     html += metaRow('Modified', d.mod_time);
+    if (d.owner) {
+        if (d.owner_files_url) {
+            html += metaRowHTML('Owner', '<a class="owner-chip" href="' + esc(d.owner_files_url) + '" title="' + esc(d.owner) + '"><code>' + esc(d.owner.length > 12 ? d.owner.slice(0, 12) : d.owner) + '</code></a>');
+        } else {
+            html += metaRow('Owner', d.owner);
+        }
+    }
     if (d.ext)       html += metaRow('Ext', d.ext);
     if (d.mime_type) html += metaRow('MIME', d.mime_type);
     if (d.is_dir) {
