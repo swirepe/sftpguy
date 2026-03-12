@@ -160,6 +160,23 @@
       white-space: pre;
       margin-bottom: 8px;
     }
+    .login-url-item {
+      border: 1px solid rgba(42,62,86,.55);
+      border-radius: 10px;
+      padding: 10px;
+      background: rgba(8,13,20,.55);
+      margin-bottom: 10px;
+    }
+    .login-url-qr { margin-top: 8px; }
+    .login-qr {
+      width: 220px;
+      max-width: 100%;
+      height: auto;
+      border: 1px solid rgba(42,62,86,.65);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+    }
     .toast {
       position: fixed; right: 16px; bottom: 16px;
       background: rgba(15,24,34,.95); border: 1px solid var(--line);

@@ -649,6 +649,7 @@ type Config struct {
 	Port                    int
 	AdminHTTP               string
 	AdminHTTPToken          string
+	AdminHTTPTokenFile      string
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -685,6 +686,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port", "p")
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
+	EnvFlag(&cfg.AdminHTTPTokenFile, "admin.http.token.file", "ADMIN_HTTP_TOKEN_FILE", "", "Optional file to load admin bearer token from; generates one when file is missing or empty")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -751,6 +753,14 @@ func LoadConfig() (Config, error) {
 			os.Exit(1)
 		}
 		os.Exit(0)
+	}
+
+	if tokenFile := strings.TrimSpace(cfg.AdminHTTPTokenFile); tokenFile != "" {
+		token, _, err := loadOrCreateAdminHTTPToken(tokenFile)
+		if err != nil {
+			return cfg, fmt.Errorf("failed to load admin.http token from %q: %w", tokenFile, err)
+		}
+		cfg.AdminHTTPToken = token
 	}
 	// Process unrestricted paths
 	cfg.unrestrictedMap = make(map[string]bool)
@@ -860,6 +870,8 @@ type Server struct {
 	adminExplorerMu  sync.Mutex
 	adminExplorer    http.Handler
 	adminExplorerErr error
+	adminOneTimeMu   sync.Mutex
+	adminOneTime     map[string]time.Time
 	shadowMutateMin  time.Duration
 	shadowMutateMax  time.Duration
 	shadowListMin    time.Duration
@@ -891,6 +903,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		shutdown:         make(chan struct{}),
 		ctx:              ctx,
 		cancel:           cancel,
+		adminOneTime:     make(map[string]time.Time),
 		shadowMutateMin:  shadowMutateMinDefault,
 		shadowMutateMax:  shadowMutateMaxDefault,
 		shadowListMin:    shadowListMinDefault,
@@ -2651,6 +2664,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"admin.keys", cfg.AdminKeysPath,
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
+		"admin.http.token.file", cfg.AdminHTTPTokenFile != "",
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"upload_path", cfg.UploadDir,

@@ -14,7 +14,7 @@
         <a class="nav-link" href="/admin/explorer/">Open Explorer</a>
       </div>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -79,6 +79,7 @@
         <button class="tab" data-tab="uploads">Uploads</button>
         <button class="tab" data-tab="banned">Banned</button>
         <button class="tab" data-tab="selftest">Self Test</button>
+        <button class="tab" data-tab="logins">Login URLs</button>
         <button class="tab" data-tab="iplists">IP Lists</button>
       </div>
     </div>
@@ -172,6 +173,14 @@
         <button onclick="loadSelfTest()">Refresh</button>
       </div>
       <div id="selftest-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-logins">
+      <div class="row">
+        <button class="btn-good" onclick="generateOneTimeLoginURL()">Generate One-Time Login URL</button>
+        <button onclick="renderOneTimeLogins()">Refresh View</button>
+      </div>
+      <div id="logins-out"></div>
     </div>
 
     <div class="card hidden" id="tab-iplists">

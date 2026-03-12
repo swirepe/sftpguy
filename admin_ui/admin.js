@@ -32,7 +32,8 @@
 	        blacklist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
 	        test: null
 	      },
-	      adminKeys: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [], hashes: [] }
+	      adminKeys: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [], hashes: [] },
+	      oneTimeLogins: []
 	    };
 
     function setStatus(msg) { document.getElementById("status").textContent = msg; }
@@ -157,6 +158,7 @@
       const el = document.querySelector(".tab[data-tab='" + name + "']");
       if (!el) return;
       const base = name === "selftest" ? "Self Test" :
+        name === "logins" ? "Login URLs" :
         name === "iplists" ? "IP Lists" :
         (name.charAt(0).toUpperCase() + name.slice(1));
       el.textContent = count == null ? base : (base + " (" + count + ")");
@@ -1226,6 +1228,47 @@
         "<h3>Suites</h3>" + suites;
     }
 
+    function loadOneTimeLogins() {
+      setTabCount("logins", state.oneTimeLogins.length || null);
+      renderOneTimeLogins();
+      return Promise.resolve();
+    }
+    function renderOneTimeLogins() {
+      const entries = state.oneTimeLogins || [];
+      if (!entries.length) {
+        document.getElementById("logins-out").innerHTML = "<div class=\"muted\">Generate a one-time login URL to get a link and QR code that logs in once.</div>";
+        return;
+      }
+      const blocks = entries.map(function(item, idx) {
+        const url = String(item.url || "");
+        const qr = String(item.qr_png_data_url || "");
+        const created = String(item.created_at || "");
+        const encURL = encodeURIComponent(url);
+        return "<div class=\"login-url-item\">" +
+          "<div class=\"row\"><span class=\"pill\">URL " + esc(idx + 1) + "</span><span class=\"pill\">created <code>" + esc(created || "-") + "</code></span></div>" +
+          "<div class=\"row\"><a class=\"nav-link\" href=\"" + esc(url) + "\" target=\"_blank\" rel=\"noopener noreferrer\">Open Link</a>" +
+            "<button class=\"tiny\" onclick=\"copyText(decodeURIComponent('" + encURL + "'))\">Copy Link</button></div>" +
+          "<div class=\"muted\"><code>" + esc(url) + "</code></div>" +
+          (qr ? ("<div class=\"login-url-qr\"><img class=\"login-qr\" src=\"" + esc(qr) + "\" alt=\"one-time login qr code\" /></div>") : "") +
+        "</div>";
+      }).join("");
+      document.getElementById("logins-out").innerHTML = blocks;
+    }
+    async function generateOneTimeLoginURL() {
+      const d = await api("/admin/api/one-time-login", { method: "POST" });
+      const item = {
+        url: d.url || "",
+        qr_png_data_url: d.qr_png_data_url || "",
+        created_at: d.created_at || new Date().toISOString()
+      };
+      state.oneTimeLogins.unshift(item);
+      if (state.oneTimeLogins.length > 30) state.oneTimeLogins = state.oneTimeLogins.slice(0, 30);
+      setTabCount("logins", state.oneTimeLogins.length);
+      renderOneTimeLogins();
+      addHistory("generated one-time login URL");
+      toast("Generated one-time login URL");
+    }
+
     async function openActor(type, value) {
       if (!value) return;
       const d = await api(withRange("/admin/api/actor?type=" + encodeURIComponent(type) + "&value=" + encodeURIComponent(value)));
@@ -1394,6 +1437,7 @@
       if (state.activeTab === "uploads") renderUploads();
       if (state.activeTab === "banned") renderBanned();
       if (state.activeTab === "selftest") renderSelfTest();
+      if (state.activeTab === "logins") renderOneTimeLogins();
       if (state.activeTab === "iplists") renderIPLists();
       renderActorDrawer();
       renderSessionTimeline();
@@ -1402,6 +1446,9 @@
     async function refreshAll() {
       try {
         await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
+        if (state.activeTab === "logins") {
+          await loadOneTimeLogins();
+        }
         if (state.activeTab === "iplists") {
           await loadIPLists();
         }
@@ -1434,9 +1481,10 @@
             state.activeTab === "logs" ? loadLogs :
             state.activeTab === "auth" ? loadAuthAttempts :
             state.activeTab === "sessions" ? loadSessions :
-            state.activeTab === "uploads" ? loadUploads :
-            state.activeTab === "banned" ? loadBanned :
-            state.activeTab === "selftest" ? loadSelfTest : loadIPLists;
+          state.activeTab === "uploads" ? loadUploads :
+          state.activeTab === "banned" ? loadBanned :
+          state.activeTab === "selftest" ? loadSelfTest :
+          state.activeTab === "logins" ? loadOneTimeLogins : loadIPLists;
           fn().catch(function(err) { setStatus("error: " + err.message); });
         }, seconds * 1000);
         addHistory("enabled auto-refresh every " + seconds + "s");
@@ -1450,7 +1498,7 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
@@ -1465,7 +1513,8 @@
         name === "sessions" ? loadSessions :
         name === "uploads" ? loadUploads :
         name === "banned" ? loadBanned :
-        name === "selftest" ? loadSelfTest : loadIPLists;
+        name === "selftest" ? loadSelfTest :
+        name === "logins" ? loadOneTimeLogins : loadIPLists;
       fn().catch(function(err) { setStatus("error: " + err.message); });
     }
 
@@ -1475,8 +1524,8 @@
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-"].includes(e.key)) {
-        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"iplists"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","="].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"logins","=":"iplists"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {
@@ -1504,7 +1553,7 @@
           await searchFilesByOwner(startup.owner);
           return;
         }
-        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","iplists"].includes(startup.tab)) {
+        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists"].includes(startup.tab)) {
           switchTab(startup.tab);
           if (startup.tab === "files" && startup.q) {
             document.getElementById("files-q").value = startup.q;

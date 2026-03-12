@@ -23,8 +23,11 @@ type adminHTTPDeps struct {
 
 func (d *adminHTTPDeps) AdminHTTPConfig() adminhttp.Config {
 	return adminhttp.Config{
-		Addr:  d.srv.cfg.AdminHTTP,
-		Token: d.srv.cfg.AdminHTTPToken,
+		Addr:                d.srv.cfg.AdminHTTP,
+		Token:               d.srv.cfg.AdminHTTPToken,
+		TokenCookieName:     adminhttp.DefaultTokenCookieName,
+		IssueOneTimeToken:   d.srv.issueAdminOneTimeLoginToken,
+		ConsumeOneTimeToken: d.srv.consumeAdminOneTimeLoginToken,
 	}
 }
 
@@ -62,6 +65,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		SelfTestRun:      d.srv.handleAdminSelfTestRun,
 		ExplorerDelete:   d.srv.handleAdminExplorerDelete,
 		ExplorerBanOwner: d.srv.handleAdminExplorerBanOwner,
+		OneTimeLoginURL:  d.srv.handleAdminOneTimeLoginURL,
 	}
 }
 
