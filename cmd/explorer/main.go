@@ -36,18 +36,22 @@ const (
 var (
 	rootDir     string
 	maxFileSize int64
+	headerHTML  template.HTML
+	footerHTML  template.HTML
 )
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	var logPath, port string
+	var logPath, port, headerPath, footerPath string
 	var maxSizeMB int64
 
 	flag.StringVar(&rootDir, "dir", "./shared", "Directory to serve")
 	flag.StringVar(&port, "port", "8080", "Port to listen on")
 	flag.Int64Var(&maxSizeMB, "maxsize", 1000, "Max upload size in MB")
 	flag.StringVar(&logPath, "log", "explorer.log", "Log file path")
+	flag.StringVar(&headerPath, "header", "", "Path to an HTML fragment to inject at the top of every page")
+	flag.StringVar(&footerPath, "footer", "", "Path to an HTML fragment to inject at the bottom of every page")
 	src := flag.Bool("src", false, "Print this program's source and exit")
 
 	flag.Parse()
@@ -58,6 +62,24 @@ func main() {
 	}
 
 	maxFileSize = maxSizeMB << 20
+
+	// Load optional header/footer fragments.
+	if headerPath != "" {
+		b, err := os.ReadFile(headerPath)
+		if err != nil {
+			log.Fatalf("read header file %q: %v", headerPath, err)
+		}
+		headerHTML = template.HTML(b)
+		log.Printf("header fragment loaded from %s (%d bytes)", headerPath, len(b))
+	}
+	if footerPath != "" {
+		b, err := os.ReadFile(footerPath)
+		if err != nil {
+			log.Fatalf("read footer file %q: %v", footerPath, err)
+		}
+		footerHTML = template.HTML(b)
+		log.Printf("footer fragment loaded from %s (%d bytes)", footerPath, len(b))
+	}
 
 	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -308,6 +330,8 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		SortLink   func(string) template.URL
 		Arrow      func(string) string
 		UploadPath string
+		Header     template.HTML
+		Footer     template.HTML
 	}{
 		Title:      "Index of /" + relPath,
 		DirLabel:   dirLabel,
@@ -321,6 +345,8 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		SortLink:   sortLink,
 		Arrow:      arrow,
 		UploadPath: upURL.EscapedPath(),
+		Header:     headerHTML,
+		Footer:     footerHTML,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -863,6 +889,8 @@ footer{
 </head>
 <body>
 
+{{if .Header}}{{.Header}}{{end}}
+
 <nav class="bc" aria-label="Breadcrumb">
 {{- range $i, $c := .Crumbs}}
   {{- if $i}}<span class="sep">/</span>{{end}}
@@ -952,6 +980,8 @@ footer{
   <span class="status-locked">&#8856; Downloads locked &mdash; upload any file to unlock</span>
 {{- end}}
 </footer>
+
+{{if .Footer}}{{.Footer}}{{end}}
 
 <script>
 const form = document.getElementById('upload-form');
