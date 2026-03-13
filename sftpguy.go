@@ -70,8 +70,8 @@ import (
 //go:embed VERSION
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
-//go:embed bad_files.txt bad_files.go
-//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go maintenance_test.go
+//go:embed bad_files.txt bad_files.go  maintenance.go maintenance_test.go
+//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go
 
 var embeddedSource embed.FS
 
