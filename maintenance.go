@@ -20,44 +20,55 @@ type badFileMatch struct {
 	knownAs   string
 }
 
-func (s *Server) runMaintenancePass(ctx context.Context) bool {
+type MaintenanceResult struct {
+	CleanDeletedResult          CleanDeletedResult
+	ReconcileOrphansResult      ReconcileOrphansResult
+	PurgeBlackListedFilesResult PurgeBlackListedFilesResult
+}
+
+func (s *Server) RunMaintenancePass(ctx context.Context) (bool, MaintenanceResult) {
+	var mr MaintenanceResult
 	select {
 	case <-ctx.Done():
-		return false
+		return false, mr
 	default:
 	}
 
-	s.cleanDeleted()
+	mr.CleanDeletedResult = s.cleanDeleted()
 
 	select {
 	case <-ctx.Done():
-		return false
+		return false, mr
 	default:
 	}
 
-	s.reconcileOrphans()
+	mr.ReconcileOrphansResult = s.reconcileOrphans()
 
 	select {
 	case <-ctx.Done():
-		return false
+		return false, mr
 	default:
 	}
 
 	s.purgeBlacklistedFiles()
-	return true
+	return true, mr
 }
 
 func (s *Server) cleanAndReconcile(ctx context.Context, dur time.Duration) {
+	var prev MaintenanceResult
 	ticker := time.NewTicker(dur)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if !s.runMaintenancePass(ctx) {
+			halted, res := s.RunMaintenancePass(ctx)
+			// TODO: compare prev and res. if different, log
+			if !halted {
 				s.logger.Info("Stopping clean and reconcile loop")
 				return
 			}
+			prev = res
 		case <-ctx.Done():
 			s.logger.Info("Stopping clean and reconcile loop")
 			return
@@ -65,16 +76,20 @@ func (s *Server) cleanAndReconcile(ctx context.Context, dur time.Duration) {
 	}
 }
 
-func (s *Server) cleanDeleted() {
+type CleanDeletedResult struct {
+}
+
+func (s *Server) cleanDeleted() CleanDeletedResult {
 	start := time.Now()
+	logger := s.logger.WithGroup("maintenance").With("operation", "clean_deleted")
 	var numDeleted int64
 	defer func() {
-		s.logger.Info("Finished cleaning deleted files", "deleted", numDeleted, "duration", time.Since(start))
+		logger.Info("Finished cleaning deleted files", "deleted", numDeleted, "duration", time.Since(start))
 	}()
 
 	rows, err := s.store.db.Query("SELECT path FROM files ORDER BY LENGTH(path), path")
 	if err != nil {
-		s.logger.Error("failed to query file records for cleanup", "err", err)
+		logger.Error("failed to query file records for cleanup", "err", err)
 		return
 	}
 	defer rows.Close()
@@ -84,7 +99,7 @@ func (s *Server) cleanDeleted() {
 	for rows.Next() {
 		var relPath string
 		if err := rows.Scan(&relPath); err != nil {
-			s.logger.Error("failed to scan file record during cleanup", "err", err)
+			logger.Error("failed to scan file record during cleanup", "err", err)
 			return
 		}
 
@@ -96,7 +111,7 @@ func (s *Server) cleanDeleted() {
 		if _, err := os.Lstat(fullPath); err == nil {
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
-			s.logger.Warn("failed to stat path during cleanup", "path", relPath, "err", err)
+			logger.Warn("failed to stat path during cleanup", "path", relPath, "err", err)
 			continue
 		}
 
@@ -105,7 +120,7 @@ func (s *Server) cleanDeleted() {
 	}
 
 	if err := rows.Err(); err != nil {
-		s.logger.Error("failed to iterate file records during cleanup", "err", err)
+		logger.Error("failed to iterate file records during cleanup", "err", err)
 		return
 	}
 
@@ -114,13 +129,13 @@ func (s *Server) cleanDeleted() {
 	}
 
 	if err := rows.Close(); err != nil {
-		s.logger.Error("failed to close file record cursor during cleanup", "err", err)
+		logger.Error("failed to close file record cursor during cleanup", "err", err)
 		return
 	}
 
 	tx, err := s.store.db.Begin()
 	if err != nil {
-		s.logger.Error("failed to begin cleanup transaction", "err", err)
+		logger.Error("failed to begin cleanup transaction", "err", err)
 		return
 	}
 	defer tx.Rollback()
@@ -132,20 +147,20 @@ func (s *Server) cleanDeleted() {
 			WHERE path = ? OR substr(path, 1, ?) = ?`,
 			relPath, prefixLen, relPath+"/")
 		if err != nil {
-			s.logger.Error("failed to delete stale file record", "path", relPath, "err", err)
+			logger.Error("failed to delete stale file record", "path", relPath, "err", err)
 			return
 		}
 
 		deleted, err := res.RowsAffected()
 		if err != nil {
-			s.logger.Warn("failed to count deleted file records", "path", relPath, "err", err)
+			logger.Warn("failed to count deleted file records", "path", relPath, "err", err)
 			continue
 		}
 		numDeleted += deleted
 	}
 
 	if err := tx.Commit(); err != nil {
-		s.logger.Error("failed to commit cleanup transaction", "err", err)
+		logger.Error("failed to commit cleanup transaction", "err", err)
 		numDeleted = 0
 	}
 }
@@ -159,8 +174,13 @@ func hasDeletedAncestor(relPath string, staleSet map[string]struct{}) bool {
 	return false
 }
 
-func (s *Server) reconcileOrphans() {
+// I bet there's no easy way to see what orphans were added, but we can add other information
+type ReconcileOrphansResult struct {
+}
+
+func (s *Server) reconcileOrphans() ReconcileOrphansResult {
 	start := time.Now()
+	logger := s.logger.WithGroup("maintenance").With("operation", "reconcile_orphans")
 	var sysFiles []string
 	for p := range s.cfg.unrestrictedMap {
 		if strings.HasSuffix(p, "/") {
@@ -200,28 +220,33 @@ func (s *Server) reconcileOrphans() {
 	})
 
 	if err != nil {
-		s.logger.Error("error walking upload directory", "duration", time.Since(start), "error", err)
+		logger.Error("error walking upload directory", "duration", time.Since(start), "error", err)
 	}
 
 	if len(candidates) > 0 {
 		inserted, err := s.store.RegisterFilesBatch(candidates)
 		if err != nil {
-			s.logger.Error("failed to batch reconcile files", "duration", time.Since(start), "error", err)
+			logger.Error("failed to batch reconcile files", "duration", time.Since(start), "error", err)
 		} else if inserted > 0 {
-			s.logger.Info("reconciled orphan files", "new_count", inserted, "duration", time.Since(start))
+			logger.Info("reconciled orphan files", "new_count", inserted, "duration", time.Since(start))
 		}
 	}
+	return ReconcileOrphansResult{}
 }
 
-func (s *Server) purgeBlacklistedFiles() {
+type PurgeBlackListedFilesResult struct {
+}
+
+func (s *Server) purgeBlacklistedFiles() PurgeBlackListedFilesResult {
 	if s.store == nil || s.store.badFileList == nil {
-		return
+		return PurgeBlackListedFilesResult{}
 	}
 
 	start := time.Now()
+	logger := s.logger.WithGroup("maintenance").With("operation", "purge_blacklisted_files")
 	matches := s.findBadFileMatches()
 	if len(matches) == 0 {
-		return
+		return PurgeBlackListedFilesResult{}
 	}
 
 	var purgeCount int
@@ -250,7 +275,7 @@ func (s *Server) purgeBlacklistedFiles() {
 		}
 
 		if _, added, err := s.blacklistLastAddress(match.ownerHash, match.ownerAddr, match.knownAs); err != nil {
-			s.logger.Warn("failed to blacklist owner address for bad file",
+			logger.Warn("failed to blacklist owner address for bad file",
 				"path", match.relPath,
 				"owner", match.ownerHash,
 				"address", match.ownerAddr,
@@ -260,11 +285,12 @@ func (s *Server) purgeBlacklistedFiles() {
 		}
 	}
 
-	s.logger.Warn("bad file maintenance completed",
+	logger.Warn("bad file maintenance completed",
 		"matches", len(matches),
 		"purges", purgeCount,
 		"blacklist_updates", blacklistCount,
 		"duration", time.Since(start))
+	return PurgeBlackListedFilesResult{}
 }
 
 func (s *Server) findBadFileMatches() []badFileMatch {

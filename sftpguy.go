@@ -1165,7 +1165,7 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 	go func() {
 		defer s.wg.Done()
 
-		if !s.runMaintenancePass(s.ctx) {
+		if !s.RunMaintenancePass(s.ctx) {
 			return
 		}
 		s.cleanAndReconcile(s.ctx, interval)
