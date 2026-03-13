@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -56,17 +57,30 @@ func (s *Server) RunMaintenancePass(ctx context.Context) (bool, MaintenanceResul
 }
 
 func (s *Server) cleanAndReconcile(ctx context.Context, dur time.Duration) {
+	logger := s.logger.WithGroup("maintenance").With("operation", "loop")
+	var prev MaintenanceResult
+	havePrev := false
+	if snap := s.maintenanceStatusSnapshot(); snap.LastRun != nil {
+		prev = snap.LastRun.Result
+		havePrev = true
+	}
+
 	ticker := time.NewTicker(dur)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			started, halted, _ := s.runTrackedMaintenancePass(ctx, "loop")
+			started, halted, res := s.runTrackedMaintenancePass(ctx, "loop")
 			if !started {
-				s.logger.WithGroup("maintenance").Warn("skipping scheduled maintenance pass", "reason", "already_running")
+				logger.Warn("skipping scheduled maintenance pass", "reason", "already_running")
 				continue
 			}
+			if havePrev && !reflect.DeepEqual(prev, res) {
+				logger.Info("maintenance pass result changed", "previous_result", prev, "result", res)
+			}
+			prev = res
+			havePrev = true
 			if !halted {
 				s.logger.Info("Stopping clean and reconcile loop")
 				return

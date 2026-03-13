@@ -48,7 +48,7 @@ func (s *Server) handleAdminMaintenanceRun(w http.ResponseWriter, r *http.Reques
 		"trigger", "admin-http",
 		"halted", halted,
 		"clean_deleted", res.CleanDeleted.Deleted,
-		"orphans_inserted", res.ReconcileOrphans.Inserted,
+		"orphans_inserted", len(res.ReconcileOrphans.Unorphaned),
 		"bad_matches", res.PurgeBlacklistedFiles.Matches,
 		"purges", res.PurgeBlacklistedFiles.Purges,
 		"blacklist_updates", res.PurgeBlacklistedFiles.BlacklistUpdates,

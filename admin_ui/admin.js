@@ -1097,6 +1097,7 @@
       if (!last) {
         document.getElementById("maintenance-last-run").innerHTML = "<div class=\"muted\">No maintenance pass has completed yet.</div>";
       } else {
+        const unorphaned = (last.result && last.result.reconcile_orphans && last.result.reconcile_orphans.unorphaned) || [];
         const rows = [
           [
             "<code>clean_deleted</code>",
@@ -1107,7 +1108,7 @@
           [
             "<code>reconcile_orphans</code>",
             esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.candidates || 0 : 0),
-            esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.inserted || 0 : 0),
+            esc(unorphaned.length),
             "<code>" + esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.error || "" : "") + "</code>"
           ],
           [
@@ -1117,6 +1118,19 @@
             "<code>" + esc(last.result && last.result.purge_blacklisted_files ? last.result.purge_blacklisted_files.error || "" : "") + "</code>"
           ]
         ];
+        const unorphanedTable = unorphaned.length
+          ? "<h3>Newly Registered Orphans</h3>" + renderSimpleTable(
+              ["Path", "Owner", "Size", "Type"],
+              unorphaned.map(function(file) {
+                return [
+                  pathWithExplorer(file.path || "", !!file.is_dir, file.path || ""),
+                  ownerCell(file.owner_hash || "-"),
+                  esc(formatBytes(file.size || 0)),
+                  file.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
+                ];
+              })
+            )
+          : "";
         document.getElementById("maintenance-last-run").innerHTML =
           "<div class=\"row\">" +
             "<span class=\"pill\">trigger " + esc(last.trigger || "") + "</span>" +
@@ -1125,7 +1139,8 @@
             "<span class=\"pill\">duration " + esc(last.duration || "") + "</span>" +
             "<span class=\"tag " + (last.halted ? "ok" : "warn") + "\">" + (last.halted ? "COMPLETE" : "INTERRUPTED") + "</span>" +
           "</div>" +
-          renderSimpleTable(["Operation", "Observed", "Changes", "Error"], rows);
+          renderSimpleTable(["Operation", "Observed", "Changes", "Error"], rows) +
+          unorphanedTable;
       }
 
       const logRows = (m.logs || []).map(function(entry) {

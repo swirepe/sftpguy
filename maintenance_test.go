@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -331,8 +332,11 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 	if result.CleanDeleted.StaleRoots != 1 || result.CleanDeleted.Deleted != 1 {
 		t.Fatalf("unexpected cleanDeleted result: %+v", result.CleanDeleted)
 	}
-	if result.ReconcileOrphans.Candidates != 2 || result.ReconcileOrphans.Inserted != 1 {
+	if result.ReconcileOrphans.Candidates != 2 || len(result.ReconcileOrphans.Unorphaned) != 1 {
 		t.Fatalf("unexpected reconcileOrphans result: %+v", result.ReconcileOrphans)
+	}
+	if got := result.ReconcileOrphans.Unorphaned[0].Path; got != "orphan.txt" {
+		t.Fatalf("unexpected unorphaned path: got=%q want=%q", got, "orphan.txt")
 	}
 	if result.PurgeBlacklistedFiles.Matches != 1 || result.PurgeBlacklistedFiles.Purges != 1 || result.PurgeBlacklistedFiles.BlacklistUpdates != 1 {
 		t.Fatalf("unexpected purgeBlacklistedFiles result: %+v", result.PurgeBlacklistedFiles)
@@ -384,5 +388,66 @@ func TestNewServerSeedsWhitelistRanges(t *testing.T) {
 	}
 	if srv.store.whitelist.Matches("8.8.8.8") {
 		t.Fatal("did not expect public address to be whitelisted")
+	}
+}
+
+func TestCleanAndReconcileLogsWhenResultChanges(t *testing.T) {
+	tmpDir := t.TempDir()
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	cfg := Config{
+		Name:          "sftpguy-maintenance-log-test",
+		Port:          2222,
+		HostKeyFile:   filepath.Join(tmpDir, "host_key"),
+		DBPath:        filepath.Join(tmpDir, "sftp.db"),
+		LogFile:       filepath.Join(tmpDir, "sftp.log"),
+		UploadDir:     filepath.Join(tmpDir, "uploads"),
+		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
+		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
+		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
+	}
+
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {
+		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
+			t.Fatalf("write support file %s: %v", p, err)
+		}
+	}
+
+	srv, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	started, halted, _ := srv.runTrackedMaintenancePass(context.Background(), "startup")
+	if !started || !halted {
+		t.Fatalf("expected initial tracked maintenance pass to complete: started=%v halted=%v", started, halted)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		srv.cleanAndReconcile(ctx, 20*time.Millisecond)
+		close(done)
+	}()
+
+	time.Sleep(35 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(srv.absUploadDir, "changed.txt"), []byte("hello"), permFile); err != nil {
+		t.Fatalf("write changed file: %v", err)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		return strings.Contains(logBuf.String(), "maintenance pass result changed")
+	}, "maintenance loop did not log changed result")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanAndReconcile did not stop after cancel")
 	}
 }
