@@ -540,8 +540,15 @@ func (s *Store) Close() error {
 
 func (s *Store) GetUserStats(hash string) (userStats, error) {
 	var u userStats
-	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes, last_address 
-		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes, &u.LastAddress)
+	err := s.db.QueryRow(`SELECT
+			IFNULL(last_login, 'Never'),
+			IFNULL(upload_count, 0),
+			IFNULL(upload_bytes, 0),
+			IFNULL(download_count, 0),
+			IFNULL(download_bytes, 0),
+			IFNULL(last_address, '')
+		FROM users
+		WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes, &u.LastAddress)
 	if err == sql.ErrNoRows {
 		u.FirstTimer = true
 		u.LastLogin = "Never"

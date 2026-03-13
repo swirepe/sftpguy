@@ -154,6 +154,27 @@ func TestUpdateFileWriteOwnerHintOverridesSystemOwnerRow(t *testing.T) {
 	}
 }
 
+func TestGetUserStatsHandlesNullLastAddress(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const userHash = "null-last-address-user"
+	if _, err := srv.store.exec(`INSERT INTO users (pubkey_hash, last_login) VALUES (?, NULL)`, userHash); err != nil {
+		t.Fatalf("insert user with null last_address: %v", err)
+	}
+
+	stats, err := srv.store.GetUserStats(userHash)
+	if err != nil {
+		t.Fatalf("get user stats: %v", err)
+	}
+	if stats.LastAddress != "" {
+		t.Fatalf("expected empty last_address, got %q", stats.LastAddress)
+	}
+	if stats.LastLogin != "" {
+		t.Fatalf("expected empty last_login, got %q", stats.LastLogin)
+	}
+}
+
 func newMaintenanceTestServer(t *testing.T) *Server {
 	t.Helper()
 

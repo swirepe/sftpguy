@@ -215,7 +215,12 @@ func (hl *HashList) AddFile(absPath string) error {
 
 func (hl *HashList) EnsureContent(content string) (int, error) {
 	scanner := bufio.NewScanner(strings.NewReader(content))
-	added := 0
+	type pendingHash struct {
+		hash     string
+		filename string
+	}
+	pending := make([]pendingHash, 0, 16)
+	seen := make(map[string]struct{})
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -230,26 +235,51 @@ func (hl *HashList) EnsureContent(content string) (int, error) {
 			filename = strings.Join(parts[1:], " ")
 		}
 
+		hash, err := normalizeSHA256Hash(hash)
+		if err != nil {
+			return len(pending), err
+		}
 		if _, exists := hl.Lookup(hash); exists {
 			continue
 		}
-		if err := hl.AddHash(hash, filename); err != nil {
-			return added, err
+		if _, exists := seen[hash]; exists {
+			continue
 		}
-		added++
+		seen[hash] = struct{}{}
+		pending = append(pending, pendingHash{hash: hash, filename: filename})
 	}
 
 	if err := scanner.Err(); err != nil {
-		return added, err
+		return len(pending), err
 	}
-	if added == 0 {
+	if len(pending) == 0 {
 		return 0, nil
 	}
 
-	if _, err := hl.Reload(); err != nil {
-		return added, err
+	hl.mu.Lock()
+	f, err := os.OpenFile(hl.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		hl.mu.Unlock()
+		return 0, fmt.Errorf("failed to open file: %w", err)
 	}
-	return added, nil
+	for _, entry := range pending {
+		line := fmt.Sprintf("%s  %s\n", entry.hash, entry.filename)
+		if _, err := f.WriteString(line); err != nil {
+			f.Close()
+			hl.mu.Unlock()
+			return 0, fmt.Errorf("failed to write to file: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		hl.mu.Unlock()
+		return 0, fmt.Errorf("failed to close file: %w", err)
+	}
+	hl.mu.Unlock()
+
+	if _, err := hl.Reload(); err != nil {
+		return len(pending), err
+	}
+	return len(pending), nil
 }
 
 // calculateSHA256 performs a streaming hash of a file to handle large files efficiently.
