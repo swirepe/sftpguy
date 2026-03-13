@@ -83,6 +83,17 @@ var AppVersion string
 //go:embed bad_files.txt
 var defaultBadFileHashes string
 
+const defaultWhitelistRanges = `# Localhost and private network ranges are always trusted.
+127.0.0.0/8 # IPv4 loopback
+10.0.0.0/8 # RFC1918 private network
+172.16.0.0/12 # RFC1918 private network
+192.168.0.0/16 # RFC1918 private network
+169.254.0.0/16 # IPv4 link-local
+::1/128 # IPv6 loopback
+fc00::/7 # IPv6 unique local
+fe80::/10 # IPv6 link-local
+`
+
 // Default files that are always downloadable
 var defaultUnrestrictedPaths = []string{
 	"README.txt",
@@ -423,7 +434,11 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	ctx := context.Background()
 	black := NewIPList(ctx, blackPath, logger)
 	white := NewIPList(ctx, whitePath, logger)
-	// todo: white.AddRange(our local addresses)
+	if added, err := white.EnsureContent(defaultWhitelistRanges); err != nil {
+		logger.Warn("failed to seed default whitelist ranges", "err", err)
+	} else if added > 0 {
+		logger.Info("seeded default whitelist ranges", "entries", added)
+	}
 	adminKeys := NewAdminKeyList(ctx, adminKeysPath, logger)
 
 	badFiles := NewHashList(ctx, badFilesPath, logger)
@@ -994,22 +1009,30 @@ func (f *FortuneGenerator) Random() string {
 }
 
 type Server struct {
-	store            *Store
-	logger           *slog.Logger
-	mkdirLimiter     *rate.Limiter
-	fortuneGenerator *FortuneGenerator
-	cfg              Config
-	adminHash        string
-	absUploadDir     string
-	listener         net.Listener
-	wg               sync.WaitGroup
-	shutdown         chan struct{}
-	ctx              context.Context
-	cancel           context.CancelFunc
-	adminShutdownMu  sync.Mutex
-	adminShutdown    func(context.Context) error
-	selfTestMu       sync.Mutex
-	selfTestState    adminSelfTestState
+	store              *Store
+	logger             *slog.Logger
+	mkdirLimiter       *rate.Limiter
+	fortuneGenerator   *FortuneGenerator
+	cfg                Config
+	adminHash          string
+	absUploadDir       string
+	listener           net.Listener
+	wg                 sync.WaitGroup
+	shutdown           chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
+	adminShutdownMu    sync.Mutex
+	adminShutdown      func(context.Context) error
+	selfTestMu         sync.Mutex
+	selfTestState      adminSelfTestState
+	maintenanceRunMu   sync.Mutex
+	maintenanceStateMu sync.Mutex
+	maintenanceState   struct {
+		running          bool
+		currentTrigger   string
+		currentStartedAt time.Time
+		lastRun          *MaintenanceRunSnapshot
+	}
 	adminExplorerMu  sync.Mutex
 	adminExplorer    http.Handler
 	adminExplorerErr error
@@ -1165,7 +1188,8 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 	go func() {
 		defer s.wg.Done()
 
-		if !s.RunMaintenancePass(s.ctx) {
+		started, halted, _ := s.runTrackedMaintenancePass(s.ctx, "startup")
+		if !started || !halted {
 			return
 		}
 		s.cleanAndReconcile(s.ctx, interval)

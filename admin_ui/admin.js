@@ -27,6 +27,15 @@
       lastEventID: 0,
 	      selfTest: { running: false, run_id: 0, started_at: "", running_for: "", last_report: null },
 	      selfTestPollTimer: 0,
+	      maintenance: {
+	        running: false,
+	        current_trigger: "",
+	        current_started_at: "",
+	        current_running_for: "",
+	        last_run: null,
+	        logs: [],
+	        badFiles: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] }
+	      },
 	      ipLists: {
 	        whitelist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
 	        blacklist: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
@@ -159,6 +168,7 @@
       if (!el) return;
       const base = name === "selftest" ? "Self Test" :
         name === "logins" ? "Login URLs" :
+        name === "maintenance" ? "Maintenance" :
         name === "iplists" ? "IP Lists" :
         (name.charAt(0).toUpperCase() + name.slice(1));
       el.textContent = count == null ? base : (base + " (" + count + ")");
@@ -313,6 +323,12 @@
       if (!raw) return esc(shown);
       const enc = encodeURIComponent(raw);
       return "<button onclick=\"openPath(decodeURIComponent('" + enc + "'))\">" + esc(shown) + "</button>";
+    }
+    function markBadButton(path, isDir) {
+      const raw = String(path == null ? "" : path);
+      if (!raw || isDir) return "";
+      const enc = encodeURIComponent(raw);
+      return "<button class=\"btn-danger tiny\" onclick=\"markBadFile(decodeURIComponent('" + enc + "'))\">Mark Bad</button>";
     }
 
     function closeActorDrawer() {
@@ -548,7 +564,8 @@
 	              (e.is_dir ? (openPathButton(e.path, "Open") + " ") : "") + pathWithExplorer(e.path || "", !!e.is_dir, e.is_dir ? ((e.path || "") + "/") : (e.path || "")),
 	              ownerCell(e.owner || "-"),
 	              esc(e.size_human || formatBytes(e.size || 0)),
-	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
+	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
+	              markBadButton(e.path || "", !!e.is_dir)
 	            ]
 	          };
 	        });
@@ -560,7 +577,8 @@
 	              {label:"Path", key:"path"},
 	              {label:"Owner", key:"owner"},
 	              {label:"Size", key:"size"},
-	              {label:"Type", key:"is_dir"}
+	              {label:"Type", key:"is_dir"},
+	              {label:"Actions", key:"path"}
 	            ],
 	            rows,
 	            "path",
@@ -584,7 +602,8 @@
               : (esc(e.name || "") + explorerLink(e.path || "", false)),
             ownerCell(e.owner || "-"),
             esc(e.size_human || formatBytes(e.size || 0)),
-            e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>"
+            e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
+            markBadButton(e.path || "", !!e.is_dir)
           ]
         };
       });
@@ -595,7 +614,8 @@
 	            {label:"Name", key:"name"},
             {label:"Owner", key:"owner"},
             {label:"Size", key:"size"},
-            {label:"Type", key:"is_dir"}
+            {label:"Type", key:"is_dir"},
+            {label:"Actions", key:"name"}
           ],
           rows,
           "name",
@@ -1023,6 +1043,199 @@
       document.getElementById("banned-out").innerHTML =
         "<h3>Pubkey bans</h3>" + renderSimpleTable(["Hash", "Banned At", "Action"], hashRows) +
         "<h3>IP bans</h3>" + renderSimpleTable(["IP", "Banned At", "Action"], ipRows);
+    }
+
+    async function loadMaintenance() {
+      const qEl = document.getElementById("maintenance-log-q");
+      const q = qEl ? qEl.value.trim() : "";
+      const out = await Promise.all([
+        api("/admin/api/maintenance"),
+        api("/admin/api/maintenance/logs?limit=250&q=" + encodeURIComponent(q)),
+        api("/admin/api/maintenance/bad-files")
+      ]);
+      const status = out[0] || {};
+      const logs = (out[1] || {}).entries || [];
+      const bad = out[2] || {};
+      state.maintenance = {
+        running: !!status.running,
+        current_trigger: status.current_trigger || "",
+        current_started_at: status.current_started_at || "",
+        current_running_for: status.current_running_for || "",
+        last_run: status.last_run || null,
+        logs: logs,
+        badFiles: {
+          path: bad.path || "",
+          content: bad.content || "",
+          entries: Number(bad.entries || 0),
+          invalid_count: Number(bad.invalid_count || 0),
+          invalid_lines: bad.invalid_lines || []
+        }
+      };
+
+      const editor = document.getElementById("maintenance-bad-files-content");
+      if (editor && document.activeElement !== editor) editor.value = state.maintenance.badFiles.content || "";
+
+      setTabCount("maintenance", null);
+      renderMaintenance();
+    }
+
+    function renderMaintenance() {
+      const m = state.maintenance || {};
+      const bad = m.badFiles || {};
+      const last = m.last_run || null;
+      const runButton = document.getElementById("maintenance-run");
+      if (runButton) runButton.disabled = !!m.running;
+
+      const statusBits = [
+        "<span class=\"tag " + (m.running ? "warn" : "ok") + "\">" + (m.running ? "RUNNING" : "IDLE") + "</span>"
+      ];
+      if (m.current_trigger) statusBits.push("<span class=\"pill\">trigger " + esc(m.current_trigger) + "</span>");
+      if (m.current_started_at) statusBits.push("<span class=\"pill\">started <code>" + esc(m.current_started_at) + "</code></span>");
+      if (m.current_running_for) statusBits.push("<span class=\"pill\">running_for " + esc(m.current_running_for) + "</span>");
+      document.getElementById("maintenance-status").innerHTML = "<div class=\"row\">" + statusBits.join("") + "</div>";
+
+      if (!last) {
+        document.getElementById("maintenance-last-run").innerHTML = "<div class=\"muted\">No maintenance pass has completed yet.</div>";
+      } else {
+        const rows = [
+          [
+            "<code>clean_deleted</code>",
+            esc(last.result && last.result.clean_deleted ? last.result.clean_deleted.stale_roots || 0 : 0),
+            esc(last.result && last.result.clean_deleted ? last.result.clean_deleted.deleted || 0 : 0),
+            "<code>" + esc(last.result && last.result.clean_deleted ? last.result.clean_deleted.error || "" : "") + "</code>"
+          ],
+          [
+            "<code>reconcile_orphans</code>",
+            esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.candidates || 0 : 0),
+            esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.inserted || 0 : 0),
+            "<code>" + esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.error || "" : "") + "</code>"
+          ],
+          [
+            "<code>purge_blacklisted_files</code>",
+            esc(last.result && last.result.purge_blacklisted_files ? last.result.purge_blacklisted_files.matches || 0 : 0),
+            esc(last.result && last.result.purge_blacklisted_files ? last.result.purge_blacklisted_files.purges || 0 : 0),
+            "<code>" + esc(last.result && last.result.purge_blacklisted_files ? last.result.purge_blacklisted_files.error || "" : "") + "</code>"
+          ]
+        ];
+        document.getElementById("maintenance-last-run").innerHTML =
+          "<div class=\"row\">" +
+            "<span class=\"pill\">trigger " + esc(last.trigger || "") + "</span>" +
+            "<span class=\"pill\">started <code>" + esc(last.started_at || "") + "</code></span>" +
+            "<span class=\"pill\">finished <code>" + esc(last.finished_at || "") + "</code></span>" +
+            "<span class=\"pill\">duration " + esc(last.duration || "") + "</span>" +
+            "<span class=\"tag " + (last.halted ? "ok" : "warn") + "\">" + (last.halted ? "COMPLETE" : "INTERRUPTED") + "</span>" +
+          "</div>" +
+          renderSimpleTable(["Operation", "Observed", "Changes", "Error"], rows);
+      }
+
+      const logRows = (m.logs || []).map(function(entry) {
+        const fieldKeys = Object.keys(entry.fields || {}).filter(function(k) { return k !== "operation"; }).sort();
+        const details = fieldKeys.length
+          ? fieldKeys.map(function(k) {
+              return "<span class=\"pill\"><code>" + esc(k) + "=" + esc((entry.fields || {})[k]) + "</code></span>";
+            }).join(" ")
+          : "<span class=\"muted\">-</span>";
+        return {
+          sort: {
+            time: entry.time || "",
+            level: entry.level || "",
+            operation: entry.operation || "",
+            message: entry.message || ""
+          },
+          cells: [
+            "<code>" + esc(entry.time || "") + "</code>",
+            "<code>" + esc(entry.level || "") + "</code>",
+            "<code>" + esc(entry.operation || "") + "</code>",
+            esc(entry.message || ""),
+            details
+          ]
+        };
+      });
+      document.getElementById("maintenance-logs-out").innerHTML = renderSmartTable(
+        "maintenance-logs",
+        [
+          {label:"Time", key:"time"},
+          {label:"Level", key:"level"},
+          {label:"Operation", key:"operation"},
+          {label:"Message", key:"message"},
+          {label:"Details", key:"operation"}
+        ],
+        logRows,
+        "time",
+        "desc"
+      );
+
+      const badMeta = "path=" + pathWithExplorer(bad.path || "") + " entries=" + esc(bad.entries || 0) + " invalid=" + esc(bad.invalid_count || 0);
+      document.getElementById("maintenance-bad-files-meta").innerHTML = badMeta;
+      document.getElementById("maintenance-bad-files-invalid").innerHTML = (bad.invalid_lines || []).length
+        ? ("Invalid lines: <code>" + esc((bad.invalid_lines || []).join(", ")) + "</code>")
+        : "";
+    }
+
+    async function runMaintenancePass() {
+      try {
+        await api("/admin/api/maintenance/run", { method: "POST" });
+        addHistory("ran maintenance pass");
+        toast("Maintenance pass complete");
+      } catch (err) {
+        if (Number(err.status || 0) === 409) {
+          addHistory("maintenance already running");
+          toast("Maintenance already running");
+        } else {
+          throw err;
+        }
+      }
+      await loadMaintenance();
+    }
+
+    async function saveBadFiles() {
+      const editor = document.getElementById("maintenance-bad-files-content");
+      if (!editor) return;
+      const content = editor.value || "";
+      const d = await api("/admin/api/maintenance/bad-files", {
+        method: "POST",
+        body: JSON.stringify({ content: content })
+      });
+      const info = (d && d.bad_files) || {};
+      state.maintenance.badFiles = {
+        path: info.path || "",
+        content: info.content || content,
+        entries: Number(info.entries || 0),
+        invalid_count: Number(info.invalid_count || 0),
+        invalid_lines: info.invalid_lines || []
+      };
+      editor.value = state.maintenance.badFiles.content || "";
+      addHistory("saved bad file list");
+      toast("Saved bad files");
+      renderMaintenance();
+    }
+
+    async function markBadFile(path) {
+      const value = String(path || "").trim();
+      if (!value) return;
+      if (!confirm("Mark \"" + value + "\" as bad? This adds its hash to bad_files.txt.")) return;
+      const d = await api("/admin/api/maintenance/mark-bad", {
+        method: "POST",
+        body: JSON.stringify({ path: value })
+      });
+      const hash = (d && d.hash) ? d.hash : "";
+      const already = !!(d && d.already_present);
+      if (d && d.bad_files) {
+        state.maintenance.badFiles = {
+          path: d.bad_files.path || "",
+          content: d.bad_files.content || "",
+          entries: Number(d.bad_files.entries || 0),
+          invalid_count: Number(d.bad_files.invalid_count || 0),
+          invalid_lines: d.bad_files.invalid_lines || []
+        };
+        const editor = document.getElementById("maintenance-bad-files-content");
+        if (editor && document.activeElement !== editor) editor.value = state.maintenance.badFiles.content || "";
+      }
+      addHistory("marked bad file " + value);
+      toast(already ? "Bad file already listed" : ("Marked bad " + shortHash(hash)));
+      if (state.activeTab === "maintenance") {
+        renderMaintenance();
+      }
     }
 
 	    async function loadIPLists() {
@@ -1491,6 +1704,7 @@
       if (state.activeTab === "banned") renderBanned();
       if (state.activeTab === "selftest") renderSelfTest();
       if (state.activeTab === "logins") renderOneTimeLogins();
+      if (state.activeTab === "maintenance") renderMaintenance();
       if (state.activeTab === "iplists") renderIPLists();
       renderActorDrawer();
       renderSessionTimeline();
@@ -1501,6 +1715,9 @@
         await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
         if (state.activeTab === "logins") {
           await loadOneTimeLogins();
+        }
+        if (state.activeTab === "maintenance") {
+          await loadMaintenance();
         }
         if (state.activeTab === "iplists") {
           await loadIPLists();
@@ -1537,7 +1754,8 @@
           state.activeTab === "uploads" ? loadUploads :
           state.activeTab === "banned" ? loadBanned :
           state.activeTab === "selftest" ? loadSelfTest :
-          state.activeTab === "logins" ? loadOneTimeLogins : loadIPLists;
+          state.activeTab === "logins" ? loadOneTimeLogins :
+          state.activeTab === "maintenance" ? loadMaintenance : loadIPLists;
           fn().catch(function(err) { setStatus("error: " + err.message); });
         }, seconds * 1000);
         addHistory("enabled auto-refresh every " + seconds + "s");
@@ -1551,7 +1769,7 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
@@ -1567,7 +1785,8 @@
         name === "uploads" ? loadUploads :
         name === "banned" ? loadBanned :
         name === "selftest" ? loadSelfTest :
-        name === "logins" ? loadOneTimeLogins : loadIPLists;
+        name === "logins" ? loadOneTimeLogins :
+        name === "maintenance" ? loadMaintenance : loadIPLists;
       fn().catch(function(err) { setStatus("error: " + err.message); });
     }
 
@@ -1577,8 +1796,8 @@
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","="].includes(e.key)) {
-        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"logins","=":"iplists"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","=","]"].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"logins","=":"iplists","]":"maintenance"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {
@@ -1606,7 +1825,7 @@
           await searchFilesByOwner(startup.owner);
           return;
         }
-        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists"].includes(startup.tab)) {
+        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
           switchTab(startup.tab);
           if (startup.tab === "files" && startup.q) {
             document.getElementById("files-q").value = startup.q;

@@ -227,6 +227,73 @@ func (bl *IPList) Reload() (entries int, addresses uint64, err error) {
 	return entries, addresses, nil
 }
 
+func (bl *IPList) EnsureContent(content string) (int, error) {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	linesToAppend := make([]string, 0, 8)
+
+	for scanner.Scan() {
+		rawLine := strings.TrimSpace(scanner.Text())
+		if rawLine == "" || strings.HasPrefix(rawLine, "#") {
+			continue
+		}
+
+		line := rawLine
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		cidrStr := normalizeIPPattern(line)
+		_, network, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			ip := net.ParseIP(cidrStr)
+			if ip == nil {
+				return len(linesToAppend), fmt.Errorf("invalid IP or CIDR: %s", line)
+			}
+			maskLen := 32
+			if ip.To4() == nil {
+				maskLen = 128
+			}
+			network = &net.IPNet{IP: ip, Mask: net.CIDRMask(maskLen, maskLen)}
+		}
+
+		if bl.Matches(network.IP.String()) {
+			continue
+		}
+		linesToAppend = append(linesToAppend, rawLine)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return len(linesToAppend), err
+	}
+	if len(linesToAppend) == 0 {
+		return 0, nil
+	}
+
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	f, err := os.OpenFile(bl.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open file for writing: %w", err)
+	}
+	defer f.Close()
+
+	for _, line := range linesToAppend {
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			return 0, fmt.Errorf("failed to write to file: %w", err)
+		}
+	}
+
+	if _, _, err := bl.Reload(); err != nil {
+		return len(linesToAppend), err
+	}
+	return len(linesToAppend), nil
+}
+
 func normalizeIPPattern(input string) string {
 	if !strings.Contains(input, "*") {
 		return input

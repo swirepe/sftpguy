@@ -1,0 +1,192 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestHandleAdminBadFilesGetSaveAndMark(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	getReq := httptest.NewRequest(http.MethodGet, "/admin/api/maintenance/bad-files", nil)
+	getW := httptest.NewRecorder()
+	srv.handleAdminBadFiles(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/maintenance/bad-files status = %d, body=%s", getW.Code, getW.Body.String())
+	}
+
+	var getResp struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(getW.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("decode bad files GET response: %v", err)
+	}
+	if getResp.Path != srv.store.badFilesPath {
+		t.Fatalf("unexpected bad files path: got=%q want=%q", getResp.Path, srv.store.badFilesPath)
+	}
+
+	saveBody, _ := json.Marshal(map[string]any{"content": "not-a-hash\n"})
+	saveReq := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/bad-files", bytes.NewReader(saveBody))
+	saveW := httptest.NewRecorder()
+	srv.handleAdminBadFiles(saveW, saveReq)
+	if saveW.Code != http.StatusOK {
+		t.Fatalf("POST /admin/api/maintenance/bad-files status = %d, body=%s", saveW.Code, saveW.Body.String())
+	}
+
+	var saveResp struct {
+		BadFiles struct {
+			InvalidCount int `json:"invalid_count"`
+		} `json:"bad_files"`
+	}
+	if err := json.Unmarshal(saveW.Body.Bytes(), &saveResp); err != nil {
+		t.Fatalf("decode bad files save response: %v", err)
+	}
+	if saveResp.BadFiles.InvalidCount != 1 {
+		t.Fatalf("expected invalid_count=1, got %d", saveResp.BadFiles.InvalidCount)
+	}
+
+	relPath := "badme.bin"
+	fullPath := filepath.Join(srv.absUploadDir, relPath)
+	if err := os.WriteFile(fullPath, []byte("definitely bad"), permFile); err != nil {
+		t.Fatalf("write upload file: %v", err)
+	}
+
+	markBody, _ := json.Marshal(map[string]any{"path": relPath})
+	markReq := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/mark-bad", bytes.NewReader(markBody))
+	markW := httptest.NewRecorder()
+	srv.handleAdminMarkBadFile(markW, markReq)
+	if markW.Code != http.StatusOK {
+		t.Fatalf("POST /admin/api/maintenance/mark-bad status = %d, body=%s", markW.Code, markW.Body.String())
+	}
+
+	var markResp struct {
+		Hash           string `json:"hash"`
+		AlreadyPresent bool   `json:"already_present"`
+	}
+	if err := json.Unmarshal(markW.Body.Bytes(), &markResp); err != nil {
+		t.Fatalf("decode mark-bad response: %v", err)
+	}
+	if markResp.Hash == "" {
+		t.Fatal("expected mark-bad response to include hash")
+	}
+	if markResp.AlreadyPresent {
+		t.Fatal("expected first mark-bad call to add a new hash")
+	}
+	if matchedName, matched, err := srv.store.badFileList.MatchFile(fullPath); err != nil {
+		t.Fatalf("match marked file: %v", err)
+	} else if !matched {
+		t.Fatal("expected marked file to be present in bad file list")
+	} else if matchedName != filepath.Base(relPath) {
+		t.Fatalf("unexpected bad-file name: got=%q want=%q", matchedName, filepath.Base(relPath))
+	}
+
+	markAgainReq := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/mark-bad", bytes.NewReader(markBody))
+	markAgainW := httptest.NewRecorder()
+	srv.handleAdminMarkBadFile(markAgainW, markAgainReq)
+	if markAgainW.Code != http.StatusOK {
+		t.Fatalf("second POST /admin/api/maintenance/mark-bad status = %d, body=%s", markAgainW.Code, markAgainW.Body.String())
+	}
+
+	var markAgainResp struct {
+		AlreadyPresent bool `json:"already_present"`
+	}
+	if err := json.Unmarshal(markAgainW.Body.Bytes(), &markAgainResp); err != nil {
+		t.Fatalf("decode second mark-bad response: %v", err)
+	}
+	if !markAgainResp.AlreadyPresent {
+		t.Fatal("expected second mark-bad call to report already_present=true")
+	}
+}
+
+func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+
+	runReq := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/run", nil)
+	runW := httptest.NewRecorder()
+	srv.handleAdminMaintenanceRun(runW, runReq)
+	if runW.Code != http.StatusOK {
+		t.Fatalf("POST /admin/api/maintenance/run status = %d, body=%s", runW.Code, runW.Body.String())
+	}
+
+	var runResp struct {
+		OK     bool                     `json:"ok"`
+		Status MaintenanceStateSnapshot `json:"status"`
+	}
+	if err := json.Unmarshal(runW.Body.Bytes(), &runResp); err != nil {
+		t.Fatalf("decode maintenance run response: %v", err)
+	}
+	if !runResp.OK {
+		t.Fatal("expected maintenance run response ok=true")
+	}
+	if runResp.Status.LastRun == nil {
+		t.Fatal("expected maintenance status to include last_run")
+	}
+	if runResp.Status.LastRun.Result.CleanDeleted.Deleted != 1 {
+		t.Fatalf("unexpected deleted count in maintenance result: %+v", runResp.Status.LastRun.Result.CleanDeleted)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/admin/api/maintenance", nil)
+	statusW := httptest.NewRecorder()
+	srv.handleAdminMaintenance(statusW, statusReq)
+	if statusW.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/maintenance status = %d, body=%s", statusW.Code, statusW.Body.String())
+	}
+
+	var statusResp MaintenanceStateSnapshot
+	if err := json.Unmarshal(statusW.Body.Bytes(), &statusResp); err != nil {
+		t.Fatalf("decode maintenance status response: %v", err)
+	}
+	if statusResp.Running {
+		t.Fatal("expected maintenance status to be idle after synchronous run")
+	}
+	if statusResp.LastRun == nil || statusResp.LastRun.Trigger != "admin-http" {
+		t.Fatalf("unexpected maintenance status last_run: %+v", statusResp.LastRun)
+	}
+}
+
+func TestHandleAdminMaintenanceLogsFiltersMaintenanceGroup(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	logContent := strings.Join([]string{
+		`time=2026-03-13T10:00:00-04:00 level=INFO msg="maintenance pass completed" maintenance.operation=pass maintenance.trigger=admin-http`,
+		`time=2026-03-13T10:00:01-04:00 level=INFO msg="Finished cleaning deleted files" maintenance.operation=clean_deleted maintenance.deleted=2`,
+		`time=2026-03-13T10:00:02-04:00 level=INFO msg="regular log line" component=web`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(srv.cfg.LogFile, []byte(logContent), permFile); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/maintenance/logs?q=clean_deleted", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminMaintenanceLogs(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/maintenance/logs status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Entries []adminMaintenanceLogEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode maintenance logs response: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("expected 1 maintenance log entry, got %d", len(resp.Entries))
+	}
+	if resp.Entries[0].Operation != "clean_deleted" {
+		t.Fatalf("unexpected maintenance log operation: got=%q want=%q", resp.Entries[0].Operation, "clean_deleted")
+	}
+	if resp.Entries[0].Fields["deleted"] != "2" {
+		t.Fatalf("unexpected maintenance log fields: %+v", resp.Entries[0].Fields)
+	}
+}

@@ -50,6 +50,11 @@ type RouteHandlers struct {
 	Banned           http.HandlerFunc
 	BanIP            http.HandlerFunc
 	UnbanIP          http.HandlerFunc
+	Maintenance      http.HandlerFunc
+	MaintenanceRun   http.HandlerFunc
+	MaintenanceLogs  http.HandlerFunc
+	BadFiles         http.HandlerFunc
+	MarkBadFile      http.HandlerFunc
 	IPLists          http.HandlerFunc
 	AdminKeys        http.HandlerFunc
 	IPListTest       http.HandlerFunc
@@ -108,6 +113,11 @@ func Listen(deps Deps) error {
 	register(mux, "/admin/api/banned", cfg, handlers.Banned)
 	register(mux, "/admin/api/banned/ip", cfg, handlers.BanIP)
 	register(mux, "/admin/api/banned/ip/", cfg, handlers.UnbanIP)
+	register(mux, "/admin/api/maintenance", cfg, handlers.Maintenance)
+	register(mux, "/admin/api/maintenance/run", cfg, handlers.MaintenanceRun)
+	register(mux, "/admin/api/maintenance/logs", cfg, handlers.MaintenanceLogs)
+	register(mux, "/admin/api/maintenance/bad-files", cfg, handlers.BadFiles)
+	register(mux, "/admin/api/maintenance/mark-bad", cfg, handlers.MarkBadFile)
 	register(mux, "/admin/api/ip-lists", cfg, handlers.IPLists)
 	register(mux, "/admin/api/admin-keys", cfg, handlers.AdminKeys)
 	register(mux, "/admin/api/ip-lists/test", cfg, handlers.IPListTest)

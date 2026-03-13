@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -28,7 +29,7 @@ func TestCleanDeletedRemovesMissingPaths(t *testing.T) {
 	}
 	srv.store.RegisterFile("gone-dir/child.txt", systemOwner, 0, false)
 
-	srv.cleanDeleted()
+	result := srv.cleanDeleted()
 
 	if !srv.store.FileExistsInDB("present.txt") {
 		t.Fatal("present file was removed from the database")
@@ -41,6 +42,15 @@ func TestCleanDeletedRemovesMissingPaths(t *testing.T) {
 	}
 	if srv.store.FileExistsInDB("gone-dir/child.txt") {
 		t.Fatal("stale child record was not removed with its parent")
+	}
+	if result.StaleRoots != 2 {
+		t.Fatalf("unexpected stale roots: got=%d want=%d", result.StaleRoots, 2)
+	}
+	if result.Deleted != 3 {
+		t.Fatalf("unexpected deleted rows: got=%d want=%d", result.Deleted, 3)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected cleanDeleted error: %s", result.Error)
 	}
 }
 
@@ -154,6 +164,7 @@ func newMaintenanceTestServer(t *testing.T) *Server {
 		Port:          2222,
 		HostKeyFile:   filepath.Join(tmpDir, "host_key"),
 		DBPath:        filepath.Join(tmpDir, "sftp.db"),
+		LogFile:       filepath.Join(tmpDir, "sftp.log"),
 		UploadDir:     filepath.Join(tmpDir, "uploads"),
 		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
 		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
@@ -161,7 +172,7 @@ func newMaintenanceTestServer(t *testing.T) *Server {
 		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
 	}
 
-	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath} {
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {
 		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
 			t.Fatalf("write support file %s: %v", p, err)
 		}
@@ -232,7 +243,7 @@ func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
 		t.Fatalf("reload bad file hashes: %v", err)
 	}
 
-	srv.purgeBlacklistedFiles()
+	result := srv.purgeBlacklistedFiles()
 
 	for _, p := range []string{badPath, otherPath} {
 		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
@@ -263,5 +274,115 @@ func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
 	}
 	if !strings.Contains(string(blacklistContent), "203.0.113.0/24") {
 		t.Fatalf("expected /24 network to be persisted, got %q", string(blacklistContent))
+	}
+	if result.Matches != 1 {
+		t.Fatalf("unexpected match count: got=%d want=%d", result.Matches, 1)
+	}
+	if result.Purges != 1 {
+		t.Fatalf("unexpected purge count: got=%d want=%d", result.Purges, 1)
+	}
+	if result.OwnersPurged != 1 {
+		t.Fatalf("unexpected owner purge count: got=%d want=%d", result.OwnersPurged, 1)
+	}
+	if result.BlacklistUpdates != 1 {
+		t.Fatalf("unexpected blacklist update count: got=%d want=%d", result.BlacklistUpdates, 1)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected purgeBlacklistedFiles error: %s", result.Error)
+	}
+}
+
+func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "maintenance-run-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.44"), Port: 2022}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(srv.absUploadDir, "orphan.txt"), []byte("orphan"), permFile); err != nil {
+		t.Fatalf("write orphan file: %v", err)
+	}
+
+	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+
+	const badRel = "bad.bin"
+	badPath := filepath.Join(srv.absUploadDir, badRel)
+	if err := os.WriteFile(badPath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
+		t.Fatalf("register bad file: %v", err)
+	}
+	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+
+	halted, result := srv.RunMaintenancePass(context.Background())
+	if !halted {
+		t.Fatal("expected maintenance pass to complete")
+	}
+
+	if result.CleanDeleted.StaleRoots != 1 || result.CleanDeleted.Deleted != 1 {
+		t.Fatalf("unexpected cleanDeleted result: %+v", result.CleanDeleted)
+	}
+	if result.ReconcileOrphans.Candidates != 2 || result.ReconcileOrphans.Inserted != 1 {
+		t.Fatalf("unexpected reconcileOrphans result: %+v", result.ReconcileOrphans)
+	}
+	if result.PurgeBlacklistedFiles.Matches != 1 || result.PurgeBlacklistedFiles.Purges != 1 || result.PurgeBlacklistedFiles.BlacklistUpdates != 1 {
+		t.Fatalf("unexpected purgeBlacklistedFiles result: %+v", result.PurgeBlacklistedFiles)
+	}
+}
+
+func TestNewServerSeedsWhitelistRanges(t *testing.T) {
+	tmpDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := Config{
+		Name:          "sftpguy-whitelist-seed-test",
+		Port:          2222,
+		HostKeyFile:   filepath.Join(tmpDir, "host_key"),
+		DBPath:        filepath.Join(tmpDir, "sftp.db"),
+		LogFile:       filepath.Join(tmpDir, "sftp.log"),
+		UploadDir:     filepath.Join(tmpDir, "uploads"),
+		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
+		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
+		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
+	}
+
+	for _, p := range []string{cfg.BlacklistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {
+		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
+			t.Fatalf("write support file %s: %v", p, err)
+		}
+	}
+
+	srv, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	content, err := os.ReadFile(cfg.WhitelistPath)
+	if err != nil {
+		t.Fatalf("read whitelist file: %v", err)
+	}
+	for _, want := range []string{"127.0.0.0/8", "192.168.0.0/16", "::1/128"} {
+		if !strings.Contains(string(content), want) {
+			t.Fatalf("expected seeded whitelist to contain %q, got %q", want, string(content))
+		}
+	}
+	if !srv.store.whitelist.Matches("192.168.1.2") {
+		t.Fatal("expected private IPv4 address to be whitelisted")
+	}
+	if !srv.store.whitelist.Matches("::1") {
+		t.Fatal("expected IPv6 loopback to be whitelisted")
+	}
+	if srv.store.whitelist.Matches("8.8.8.8") {
+		t.Fatal("did not expect public address to be whitelisted")
 	}
 }

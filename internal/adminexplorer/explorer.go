@@ -55,6 +55,7 @@ const (
 	defaultWarmCacheMax    = 20_000
 	defaultDeleteAPIPath   = "/admin/api/explorer/delete"
 	defaultBanOwnerAPIPath = "/admin/api/explorer/ban-owner"
+	defaultMarkBadAPIPath  = "/admin/api/maintenance/mark-bad"
 
 	thumbCacheCapacity   = 5_000
 	dirSizeCacheCapacity = 10_000
@@ -403,6 +404,7 @@ type PageData struct {
 	BasePath        template.URL
 	DeleteAPIURL    template.URL
 	BanOwnerAPIURL  template.URL
+	MarkBadAPIURL   template.URL
 	Breadcrumbs     []Breadcrumb
 	Files           []FileEntry
 	Tree            []FileEntry
@@ -1035,6 +1037,7 @@ func handleGet(w http.ResponseWriter, r *http.Request, fullPath, relPath string)
 		BasePath:        template.URL(basePath),
 		DeleteAPIURL:    template.URL(defaultDeleteAPIPath),
 		BanOwnerAPIURL:  template.URL(defaultBanOwnerAPIPath),
+		MarkBadAPIURL:   template.URL(defaultMarkBadAPIPath),
 		Breadcrumbs:     buildBreadcrumbs(relPath),
 		Files:           files,
 		Tree:            tree,
@@ -3320,6 +3323,7 @@ var VJS_FLV_CDN = {{.VideoJsFlvJsCDN | js}};
 var EXPLORER_BASE = {{.BasePath | js}};
 var EXPLORER_DELETE_API = {{.DeleteAPIURL | js}};
 var EXPLORER_BAN_API = {{.BanOwnerAPIURL | js}};
+var EXPLORER_MARK_BAD_API = {{.MarkBadAPIURL | js}};
 var _previewData = null;
 
 function ensureVideoJs(cb) {
@@ -4187,6 +4191,19 @@ function explorerBanOwner(event) {
         .catch(function(err) { alert('Ban failed: ' + err.message); });
 }
 
+function explorerMarkBad(event) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    if (!_previewData || !_previewData.rel_path) return;
+    if (!confirm('Mark "' + _previewData.rel_path + '" as bad? This adds its hash to bad_files.txt.')) return;
+    explorerApiPost(EXPLORER_MARK_BAD_API, { path: _previewData.rel_path })
+        .then(function(data) {
+            var hash = (data && data.hash) ? data.hash : '(unknown)';
+            var suffix = data && data.already_present ? ' (already present)' : '';
+            alert('Marked bad: ' + hash + suffix);
+        })
+        .catch(function(err) { alert('Mark bad failed: ' + err.message); });
+}
+
 function loadPreview(url) {
     var pane    = document.getElementById('preview-pane');
     var prompt  = document.getElementById('preview-prompt');
@@ -4463,6 +4480,11 @@ function renderPreview(d) {
                 + '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
                 + '<line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>'
                 + 'Delete</button>';
+            html += '<button class="btn btn-ghost" onclick="explorerMarkBad(event)" title="Add this file to bad_files.txt">'
+                + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
+                + '<path d="M12 3l9 4.5v6c0 5-3.8 8.8-9 10.5C6.8 22.3 3 18.5 3 13.5v-6L12 3z"/>'
+                + '<line x1="8" y1="12" x2="16" y2="12"/></svg>'
+                + 'Mark bad</button>';
             html += '<button class="btn btn-ghost" onclick="explorerBanOwner(event)" title="Ban this file owner">'
                 + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
                 + '<circle cx="12" cy="7" r="4"/><path d="M5.5 21a6.5 6.5 0 0 1 13 0"/>'

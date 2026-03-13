@@ -14,7 +14,7 @@
         <a class="nav-link" href="/admin/explorer/">Open Explorer</a>
       </div>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=,]</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -81,6 +81,7 @@
         <button class="tab" data-tab="selftest">Self Test</button>
         <button class="tab" data-tab="logins">Login URLs</button>
         <button class="tab" data-tab="iplists">IP Lists</button>
+        <button class="tab" data-tab="maintenance">Maintenance</button>
       </div>
     </div>
 
@@ -181,6 +182,28 @@
         <button onclick="renderOneTimeLogins()">Refresh View</button>
       </div>
       <div id="logins-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-maintenance">
+      <div class="row">
+        <button id="maintenance-run" class="btn-warn" onclick="runMaintenancePass()">Run Maintenance Pass</button>
+        <button onclick="loadMaintenance()">Refresh</button>
+      </div>
+      <div id="maintenance-status"></div>
+      <div id="maintenance-last-run"></div>
+      <h3>Maintenance Logs</h3>
+      <div class="row">
+        <input id="maintenance-log-q" placeholder="filter maintenance logs..." />
+        <button onclick="loadMaintenance()">Refresh Logs</button>
+      </div>
+      <div id="maintenance-logs-out"></div>
+      <h3>Bad Files</h3>
+      <div class="muted" id="maintenance-bad-files-meta"></div>
+      <textarea id="maintenance-bad-files-content" spellcheck="false" class="editor"></textarea>
+      <div class="row">
+        <button class="btn-danger" onclick="saveBadFiles()">Save Bad Files</button>
+      </div>
+      <div class="muted" id="maintenance-bad-files-invalid"></div>
     </div>
 
     <div class="card hidden" id="tab-iplists">

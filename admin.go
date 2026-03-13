@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	EventAdminLogin  EventKind = "admin/login"
-	EventAdminBan    EventKind = "admin/ban"
-	EventAdminUnban  EventKind = "admin/unban"
-	EventAdminPurge  EventKind = "admin/purge"
-	EventAdminSelf   EventKind = "admin/selftest"
-	EventAdminConfig EventKind = "admin/config"
+	EventAdminLogin       EventKind = "admin/login"
+	EventAdminBan         EventKind = "admin/ban"
+	EventAdminUnban       EventKind = "admin/unban"
+	EventAdminPurge       EventKind = "admin/purge"
+	EventAdminSelf        EventKind = "admin/selftest"
+	EventAdminConfig      EventKind = "admin/config"
+	EventAdminMaintenance EventKind = "admin/maintenance"
 )
 
 const adminBanner = `

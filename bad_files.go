@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,8 @@ type hashReloadResult struct {
 	entries int
 	err     string
 }
+
+var sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func newHashReloadResult(entries int, err error) hashReloadResult {
 	result := hashReloadResult{entries: entries}
@@ -101,9 +104,9 @@ func (hl *HashList) performReload(lastReload hashReloadResult, lastChanged *time
 	return lastReload, *lastChanged
 }
 func (hl *HashList) AddHash(hash, filename string) error {
-	hash = strings.ToLower(strings.TrimSpace(hash))
-	if len(hash) == 0 {
-		return fmt.Errorf("empty hash")
+	hash, err := normalizeSHA256Hash(hash)
+	if err != nil {
+		return err
 	}
 
 	if _, exists := hl.Lookup(hash); exists {
@@ -156,7 +159,11 @@ func (hl *HashList) Reload() (entries int, err error) {
 			continue
 		}
 
-		hash := strings.ToLower(parts[0])
+		hash, err := normalizeSHA256Hash(parts[0])
+		if err != nil {
+			hl.logger.Warn("skipping invalid bad file hash", "hash", parts[0])
+			continue
+		}
 		name := ""
 		if len(parts) > 1 {
 			name = strings.Join(parts[1:], " ")
@@ -265,4 +272,20 @@ func (hl *HashList) Stop() {
 	if hl.cancel != nil {
 		hl.cancel()
 	}
+}
+
+func isValidSHA256Hash(hash string) bool {
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	return sha256HexPattern.MatchString(hash)
+}
+
+func normalizeSHA256Hash(hash string) (string, error) {
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if hash == "" {
+		return "", fmt.Errorf("empty hash")
+	}
+	if !isValidSHA256Hash(hash) {
+		return "", fmt.Errorf("invalid sha256 hash %q", hash)
+	}
+	return hash, nil
 }
