@@ -190,13 +190,12 @@ func hasDeletedAncestor(relPath string, staleSet map[string]struct{}) bool {
 	return false
 }
 
-// I bet there's no easy way to see what orphans were added, but we can add other information
 type ReconcileOrphansResult struct {
-	SystemDirectories int64  `json:"system_directories"`
-	SystemFiles       int64  `json:"system_files"`
-	Candidates        int64  `json:"candidates"`
-	Inserted          int64  `json:"inserted"`
-	Error             string `json:"error,omitempty"`
+	SystemDirectories int64        `json:"system_directories"`
+	SystemFiles       int64        `json:"system_files"`
+	Candidates        int64        `json:"candidates"`
+	Unorphaned        []FileRecord `json:"unorphaned"`
+	Error             string       `json:"error,omitempty"`
 }
 
 func (s *Server) reconcileOrphans() ReconcileOrphansResult {
@@ -250,13 +249,13 @@ func (s *Server) reconcileOrphans() ReconcileOrphansResult {
 
 	result.Candidates = int64(len(candidates))
 	if len(candidates) > 0 {
-		inserted, err := s.store.RegisterFilesBatch(candidates)
+		newFiles, err := s.store.RegisterFilesBatch(candidates)
 		if err != nil {
 			logger.Error("failed to batch reconcile files", "duration", time.Since(start), "error", err)
 			result.Error = err.Error()
-		} else if inserted > 0 {
-			result.Inserted = int64(inserted)
-			logger.Info("reconciled orphan files", "new_count", inserted, "duration", time.Since(start))
+		} else if len(newFiles) > 0 {
+			result.Unorphaned = newFiles
+			logger.Info("reconciled orphan files", "new_count", len(newFiles), "duration", time.Since(start))
 		}
 	}
 	return result
@@ -428,7 +427,7 @@ func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string) 
 		"halted", halted,
 		"clean_deleted.deleted", res.CleanDeleted.Deleted,
 		"clean_deleted.stale_roots", res.CleanDeleted.StaleRoots,
-		"reconcile_orphans.inserted", res.ReconcileOrphans.Inserted,
+		"reconcile_orphans.inserted", len(res.ReconcileOrphans.Unorphaned),
 		"reconcile_orphans.candidates", res.ReconcileOrphans.Candidates,
 		"purge_blacklisted_files.matches", res.PurgeBlacklistedFiles.Matches,
 		"purge_blacklisted_files.purges", res.PurgeBlacklistedFiles.Purges,

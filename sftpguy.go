@@ -1749,20 +1749,20 @@ func (s *Server) ensureHostKey() error {
 }
 
 type FileRecord struct {
-	Path      string
-	OwnerHash string
-	Size      int64
-	IsDir     bool
+	Path      string `json:"path"`
+	OwnerHash string `json:"owner_hash"`
+	Size      int64  `json:"size"`
+	IsDir     bool   `json:"is_dir"`
 }
 
-func (s *Store) RegisterFilesBatch(files []FileRecord) (int64, error) {
+func (s *Store) RegisterFilesBatch(files []FileRecord) ([]FileRecord, error) {
 	if len(files) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	// Rollback does nothing if the transaction is already committed
 	defer tx.Rollback()
@@ -1772,23 +1772,24 @@ func (s *Store) RegisterFilesBatch(files []FileRecord) (int64, error) {
 		VALUES (?, ?, ?, ?)
 	`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer stmt.Close()
 
-	var insertedCount int64
+	var newFiles []FileRecord
 	for _, f := range files {
 		res, err := stmt.Exec(f.Path, f.OwnerHash, f.Size, f.IsDir)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 
-		// If the file didn't exist, RowsAffected will be 1
 		count, _ := res.RowsAffected()
-		insertedCount += count
+		if count > 0 {
+			newFiles = append(newFiles, f)
+		}
 	}
 
-	return insertedCount, tx.Commit()
+	return newFiles, tx.Commit()
 }
 
 // ============================================================================
