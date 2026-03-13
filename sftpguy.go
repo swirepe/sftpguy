@@ -70,7 +70,8 @@ import (
 //go:embed VERSION
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
-//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go
+//go:embed bad_files.txt bad_files.go
+//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go maintenance_test.go
 
 var embeddedSource embed.FS
 
@@ -78,6 +79,9 @@ const versionFile = "VERSION"
 
 //go:embed VERSION
 var AppVersion string
+
+//go:embed bad_files.txt
+var defaultBadFileHashes string
 
 // Default files that are always downloadable
 var defaultUnrestrictedPaths = []string{
@@ -179,6 +183,15 @@ const (
 `
 )
 
+// all because sqlite doesn't support "add column x if not exists"
+var migrations = []Migration{
+	AddColumn{
+		Table:     "users",
+		Column:    "last_address",
+		ColumnDef: "TEXT DEFAULT NULL",
+	},
+}
+
 // ============================================================================
 // User Permission Errors
 // ============================================================================
@@ -273,6 +286,7 @@ var (
 type userStats struct {
 	UploadCount   int64
 	LastLogin     string
+	LastAddress   string
 	UploadBytes   int64
 	DownloadCount int64
 	DownloadBytes int64
@@ -288,15 +302,85 @@ func (u userStats) IsContributor(threshold int64) (bool, int64) {
 	return false, remaining
 }
 
+type Migration interface {
+	Apply(db *sql.DB, logger *slog.Logger) error
+}
+
+type AddColumn struct {
+	Table     string
+	Column    string
+	ColumnDef string
+}
+
+func (m AddColumn) Apply(db *sql.DB, logger *slog.Logger) error {
+	// 1. Check if column exists using PRAGMA
+	// Note: identifiers like table names should be escaped/trusted
+	query := fmt.Sprintf("PRAGMA table_info(%s)", m.Table)
+	rows, err := db.Query(query)
+	if err != nil {
+		return fmt.Errorf("failed to query table info: %w", err)
+	}
+	defer rows.Close()
+
+	l := logger.With("column", m.Column, "table", m.Table)
+	columnExists := false
+
+	for rows.Next() {
+		var cid int
+		var name, dtype string
+		var notnull, pk int
+		var dfltValue interface{}
+
+		// SQLite PRAGMA table_info returns 6 columns
+		if err := rows.Scan(&cid, &name, &dtype, &notnull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("failed to scan table info: %w", err)
+		}
+		if name == m.Column {
+			columnExists = true
+			break
+		}
+	}
+
+	// 2. Add column if it doesn't exist
+	if !columnExists {
+		// We use double quotes for identifiers to handle reserved words safely
+		alterStmt := fmt.Sprintf("ALTER TABLE %q ADD COLUMN %q %s", m.Table, m.Column, m.ColumnDef)
+		if _, err := db.Exec(alterStmt); err != nil {
+			return fmt.Errorf("failed to add column: %w", err)
+		}
+		l.Info("migration applied: column added")
+	} else {
+		l.Debug("migration skipped: column already exists")
+	}
+
+	return nil
+}
+
+// RawSQL is useful for CREATE TABLE or INSERT statements
+type RawSQL struct {
+	Name string
+	SQL  string
+}
+
+func (m RawSQL) Apply(db *sql.DB, logger *slog.Logger) error {
+	if _, err := db.Exec(m.SQL); err != nil {
+		return fmt.Errorf("failed to execute raw sql (%s): %w", m.Name, err)
+	}
+	logger.Debug("migration applied: raw sql executed", "name", m.Name)
+	return nil
+}
+
 type Store struct {
 	db            *sql.DB
 	logger        *slog.Logger
 	blacklist     *IPList
 	whitelist     *IPList
+	badFileList   *HashList
 	adminKeys     *AdminKeyList
 	blacklistPath string
 	whitelistPath string
 	adminKeysPath string
+	badFilesPath  string
 }
 
 func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
@@ -313,6 +397,12 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		return nil, err
 	}
 
+	for _, m := range migrations {
+		if err := m.Apply(db, logger); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	blackPath := strings.TrimSpace(cfg.BlacklistPath)
 	if blackPath == "" {
 		blackPath = "blacklist.txt"
@@ -325,19 +415,30 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	if adminKeysPath == "" {
 		adminKeysPath = "admin_keys.txt"
 	}
+	badFilesPath := strings.TrimSpace(cfg.BadFilesPath)
+	if badFilesPath == "" {
+		badFilesPath = "bad_files.txt"
+	}
 
 	ctx := context.Background()
 	black := NewIPList(ctx, blackPath, logger)
 	white := NewIPList(ctx, whitePath, logger)
+	// todo: white.AddRange(our local addresses)
 	adminKeys := NewAdminKeyList(ctx, adminKeysPath, logger)
+
+	badFiles := NewHashList(ctx, badFilesPath, logger)
+	// add each line in embedded bad_files.txt
+
 	return &Store{db: db,
 		logger:        logger,
 		blacklist:     black,
 		whitelist:     white,
+		badFileList:   badFiles,
 		adminKeys:     adminKeys,
 		blacklistPath: blackPath,
 		whitelistPath: whitePath,
-		adminKeysPath: adminKeysPath}, nil
+		adminKeysPath: adminKeysPath,
+		badFilesPath:  badFilesPath}, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
@@ -416,8 +517,8 @@ func (s *Store) Close() error {
 
 func (s *Store) GetUserStats(hash string) (userStats, error) {
 	var u userStats
-	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes 
-		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes)
+	err := s.db.QueryRow(`SELECT last_login, upload_count, upload_bytes, download_count, download_bytes, last_address 
+		FROM users WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes, &u.LastAddress)
 	if err == sql.ErrNoRows {
 		u.FirstTimer = true
 		u.LastLogin = "Never"
@@ -426,18 +527,26 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 	return u, err
 }
 
-func (s *Store) UpsertUserSession(hash string) (userStats, error) {
+func (s *Store) UpsertUserSession(hash string, remoteAddr net.Addr) (userStats, error) {
 	stats, err := s.GetUserStats(hash)
 	if err != nil {
 		s.logger.Debug("Error upserting user session", "err", err)
 		return userStats{}, err
 	}
+	var host string
+	if remoteAddr != nil {
+		host, _, err = net.SplitHostPort(remoteAddr.String())
+	}
 
 	now := time.Now().Format("2006-01-02 15:04:05")
+
 	_, err = s.exec(`
-		INSERT INTO users (pubkey_hash, last_login) VALUES (?, ?)
-		ON CONFLICT(pubkey_hash) DO UPDATE SET last_login = excluded.last_login
-	`, hash, now)
+		INSERT INTO users (pubkey_hash, last_login, last_address) 
+		VALUES (?, ?, ?)
+		ON CONFLICT(pubkey_hash) DO UPDATE SET 
+			last_login = excluded.last_login,
+			last_address = excluded.last_address
+	`, hash, now, host)
 
 	if err != nil {
 		return stats, err
@@ -503,9 +612,20 @@ func (s *Store) GetDirectoryCount() (int, error) {
 	return count, err
 }
 
-func (s *Store) UpdateFileWrite(hash, relPath string, newSize, delta int64) error {
+func (s *Store) UpdateFileWrite(hash, ownerHint, relPath string, newSize, delta int64) error {
+	if strings.TrimSpace(ownerHint) == "" {
+		ownerHint = hash
+	}
+
 	return s.transact(func(tx *sql.Tx) error {
-		if _, err := tx.Exec("UPDATE files SET size = ? WHERE path = ?", newSize, relPath); err != nil {
+		if _, err := tx.Exec(`
+			INSERT INTO files (path, owner_hash, size, is_dir)
+			VALUES (?, ?, ?, 0)
+			ON CONFLICT(path) DO UPDATE SET
+				owner_hash = excluded.owner_hash,
+				size = excluded.size,
+				is_dir = excluded.is_dir
+		`, relPath, ownerHint, newSize); err != nil {
 			return err
 		}
 		if delta > 0 {
@@ -677,6 +797,7 @@ type Config struct {
 	BlacklistPath           string
 	WhitelistPath           string
 	AdminKeysPath           string
+	BadFilesPath            string
 }
 
 func LoadConfig() (Config, error) {
@@ -714,6 +835,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.BlacklistPath, "blacklist", "BLACKLIST", "blacklist.txt", "Text file of IP addresses to blacklist, one per line")
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
+	EnvFlag(&cfg.BadFilesPath, "bad", "BAD_FILE", "bad_files.txt", "Text file of sha256 hashes and filenames that will trigger an automatic ban and purge.")
 
 	EnvFlag(&cfg.BootstrapSrc, "src", "SRC", false, "Copy source code to upload directory on boot")
 	EnvFlag(&cfg.ExportSrcDir, "src.out", "SRC_OUT", "", "Write source snapshot to this directory and exit")
@@ -1030,6 +1152,30 @@ func (s *Server) Shutdown() error {
 	return s.store.Close()
 }
 
+func (s *Server) startMaintenanceLoop(interval time.Duration) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		s.cleanDeleted()
+
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		s.reconcileOrphans()
+		s.cleanAndReconcile(s.ctx, interval)
+	}()
+}
+
 func (s *Server) Listen() error {
 	if err := s.ensureHostKey(); err != nil {
 		return err
@@ -1268,7 +1414,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 
 	logger := s.logger.With(s.userGroup(effectivePubHash, sessionID, sConn.RemoteAddr()))
 
-	stats, _ := s.store.UpsertUserSession(effectivePubHash)
+	stats, _ := s.store.UpsertUserSession(effectivePubHash, nConn.RemoteAddr())
 
 	isBanned := false
 	if !isAdminSFTP {
@@ -1405,7 +1551,7 @@ func (s *Server) logExec(pubHash, sessionID string, remoteAddr net.Addr, payload
 	var cmd struct{ Value string }
 	ssh.Unmarshal(payload, &cmd)
 	s.logger.Warn("exec", "cmd", cmd.Value, s.userGroup(pubHash, sessionID, remoteAddr))
-	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr)
+	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr, "path", cmd.Value)
 }
 
 func (s *Server) logShell(pubHash, sessionID string, remoteAddr net.Addr) {
@@ -1589,7 +1735,126 @@ type FileRecord struct {
 	IsDir     bool
 }
 
+func (s *Server) cleanAndReconcile(ctx context.Context, dur time.Duration) {
+	ticker := time.NewTicker(dur)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanDeleted()
+
+			select {
+			case <-ctx.Done():
+				s.logger.Info("Stopping clean and reconcile loop")
+				return
+			default:
+			}
+
+			s.reconcileOrphans()
+		case <-ctx.Done():
+			s.logger.Info("Stopping clean and reconcile loop")
+			return
+		}
+	}
+}
+
+func (s *Server) cleanDeleted() {
+	start := time.Now()
+	var numDeleted int64
+	defer func() {
+		s.logger.Info("Finished cleaning deleted files", "deleted", numDeleted, "duration", time.Since(start))
+	}()
+
+	rows, err := s.store.db.Query("SELECT path FROM files ORDER BY LENGTH(path), path")
+	if err != nil {
+		s.logger.Error("failed to query file records for cleanup", "err", err)
+		return
+	}
+	defer rows.Close()
+
+	var staleRoots []string
+	staleSet := make(map[string]struct{})
+	for rows.Next() {
+		var relPath string
+		if err := rows.Scan(&relPath); err != nil {
+			s.logger.Error("failed to scan file record during cleanup", "err", err)
+			return
+		}
+
+		if hasDeletedAncestor(relPath, staleSet) {
+			continue
+		}
+
+		fullPath := filepath.Join(s.absUploadDir, filepath.FromSlash(relPath))
+		if _, err := os.Lstat(fullPath); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			s.logger.Warn("failed to stat path during cleanup", "path", relPath, "err", err)
+			continue
+		}
+
+		staleRoots = append(staleRoots, relPath)
+		staleSet[relPath] = struct{}{}
+	}
+
+	if err := rows.Err(); err != nil {
+		s.logger.Error("failed to iterate file records during cleanup", "err", err)
+		return
+	}
+
+	if len(staleRoots) == 0 {
+		return
+	}
+
+	if err := rows.Close(); err != nil {
+		s.logger.Error("failed to close file record cursor during cleanup", "err", err)
+		return
+	}
+
+	tx, err := s.store.db.Begin()
+	if err != nil {
+		s.logger.Error("failed to begin cleanup transaction", "err", err)
+		return
+	}
+	defer tx.Rollback()
+
+	for _, relPath := range staleRoots {
+		prefixLen := len(relPath) + 1
+		res, err := tx.Exec(`
+			DELETE FROM files
+			WHERE path = ? OR substr(path, 1, ?) = ?`,
+			relPath, prefixLen, relPath+"/")
+		if err != nil {
+			s.logger.Error("failed to delete stale file record", "path", relPath, "err", err)
+			return
+		}
+
+		deleted, err := res.RowsAffected()
+		if err != nil {
+			s.logger.Warn("failed to count deleted file records", "path", relPath, "err", err)
+			continue
+		}
+		numDeleted += deleted
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.logger.Error("failed to commit cleanup transaction", "err", err)
+		numDeleted = 0
+	}
+}
+
+func hasDeletedAncestor(relPath string, staleSet map[string]struct{}) bool {
+	for parent := path.Dir(relPath); parent != "." && parent != "/"; parent = path.Dir(parent) {
+		if _, ok := staleSet[parent]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) reconcileOrphans() {
+	start := time.Now()
 	var sysFiles []string
 	for p := range s.cfg.unrestrictedMap {
 		if strings.HasSuffix(p, "/") {
@@ -1629,16 +1894,16 @@ func (s *Server) reconcileOrphans() {
 	})
 
 	if err != nil {
-		s.logger.Error("error walking upload directory", "error", err)
+		s.logger.Error("error walking upload directory", "duration", time.Since(start), "error", err)
 	}
 
 	// Single batch operation instead of one call per file
 	if len(candidates) > 0 {
 		inserted, err := s.store.RegisterFilesBatch(candidates)
 		if err != nil {
-			s.logger.Error("failed to batch reconcile files", "error", err)
+			s.logger.Error("failed to batch reconcile files", "duration", time.Since(start), "error", err)
 		} else if inserted > 0 {
-			s.logger.Info("reconciled orphan files", "new_count", inserted)
+			s.logger.Info("reconciled orphan files", "new_count", inserted, "duration", time.Since(start))
 		}
 	}
 }
@@ -2014,10 +2279,16 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		oldSize = fi.Size()
 	}
 
+	ownerHint := meta.owner
+	if ownerHint == "" {
+		ownerHint = h.pubHash
+	}
+
 	return &statWriter{
 		File:       f,
 		h:          h,
 		rel:        meta.rel,
+		ownerHint:  ownerHint,
 		oldSize:    oldSize,
 		appendMode: appendMode,
 	}, nil
@@ -2264,6 +2535,7 @@ type statWriter struct {
 	*os.File
 	h          *fsHandler
 	rel        string
+	ownerHint  string
 	oldSize    int64
 	appendMode bool
 }
@@ -2306,10 +2578,22 @@ func (sw *statWriter) Close() error {
 	fi, _ := sw.File.Stat()
 	size := fi.Size()
 	delta := size - sw.oldSize
-	sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.rel, size, delta)
-	sw.h.logUpload(sw.rel, size, delta)
-	sw.reportUserStatus(sw.h.pubHash)
-	return sw.File.Close()
+	dbErr := sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.ownerHint, sw.rel, size, delta)
+	if dbErr != nil {
+		sw.h.logger.Error("failed to persist upload metadata", "path", sw.rel, "err", dbErr)
+	} else {
+		sw.h.logUpload(sw.rel, size, delta)
+		sw.reportUserStatus(sw.h.pubHash)
+	}
+
+	closeErr := sw.File.Close()
+	if dbErr != nil {
+		if closeErr != nil {
+			return errors.Join(dbErr, closeErr)
+		}
+		return dbErr
+	}
+	return closeErr
 }
 
 type sftpFile struct {
@@ -2834,7 +3118,7 @@ func main() {
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	go srv.reconcileOrphans()
+	srv.startMaintenanceLoop(time.Hour)
 	go func() {
 		if err := srv.Listen(); err != nil {
 			logger.Error("ssh listener failed", "err", err)

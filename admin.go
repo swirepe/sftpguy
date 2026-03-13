@@ -218,6 +218,15 @@ func (s *Server) PurgeUser(pubHash string) error {
 	return err
 }
 
+func (s *Server) PurgeByFile(relPath string) error {
+	// TODO:
+	// get file owner
+	// purgeuser(fileowner)
+	// delete file (in the event that maybe a file was an orphan but we still don't want it around)
+
+	return nil
+}
+
 func tailFile(filename string, n int, filter string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
