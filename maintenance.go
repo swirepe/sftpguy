@@ -29,6 +29,10 @@ type MaintenanceResult struct {
 }
 
 func (s *Server) RunMaintenancePass(ctx context.Context) (bool, MaintenanceResult) {
+	return s.runMaintenancePass(ctx, true)
+}
+
+func (s *Server) runMaintenancePass(ctx context.Context, includeBadFilePurge bool) (bool, MaintenanceResult) {
 	var mr MaintenanceResult
 	select {
 	case <-ctx.Done():
@@ -52,7 +56,9 @@ func (s *Server) RunMaintenancePass(ctx context.Context) (bool, MaintenanceResul
 	default:
 	}
 
-	mr.PurgeBlacklistedFiles = s.purgeBlacklistedFiles()
+	if includeBadFilePurge {
+		mr.PurgeBlacklistedFiles = s.purgeBlacklistedFiles()
+	}
 	return true, mr
 }
 
@@ -71,7 +77,7 @@ func (s *Server) cleanAndReconcile(ctx context.Context, dur time.Duration) {
 	for {
 		select {
 		case <-ticker.C:
-			started, halted, res := s.runTrackedMaintenancePass(ctx, "loop")
+			started, halted, res := s.runTrackedMaintenancePass(ctx, "loop", false)
 			if !started {
 				logger.Warn("skipping scheduled maintenance pass", "reason", "already_running")
 				continue
@@ -308,33 +314,20 @@ func (s *Server) purgeBlacklistedFiles() PurgeBlackListedFilesResult {
 			}
 		}
 
-		if err := s.PurgeByFile(match.relPath); err != nil {
-			logger.Error("failed to purge blacklisted file",
-				"path", match.relPath,
-				"owner", match.ownerHash,
-				"match", match.knownAs,
-				"err", err)
+		purged, added, err := s.purgeMatchedBadFile(logger, "maintenance", match)
+		if purged {
+			purgeCount++
+			if match.ownerHash != "" && match.ownerHash != systemOwner {
+				purgedOwners[match.ownerHash] = struct{}{}
+			}
+		}
+		if err != nil {
 			if result.Error == "" {
 				result.Error = err.Error()
 			}
 			continue
 		}
-		purgeCount++
-
-		if match.ownerHash != "" && match.ownerHash != systemOwner {
-			purgedOwners[match.ownerHash] = struct{}{}
-		}
-
-		if _, added, err := s.blacklistLastAddress(match.ownerHash, match.ownerAddr, match.knownAs); err != nil {
-			logger.Warn("failed to blacklist owner address for bad file",
-				"path", match.relPath,
-				"owner", match.ownerHash,
-				"address", match.ownerAddr,
-				"err", err)
-			if result.Error == "" {
-				result.Error = err.Error()
-			}
-		} else if added {
+		if added {
 			blacklistCount++
 		}
 	}
@@ -405,6 +398,39 @@ func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 	return matches
 }
 
+func (s *Server) purgeMatchedBadFile(logger *slog.Logger, trigger string, match badFileMatch) (purged bool, blacklisted bool, err error) {
+	if err := s.PurgeByFile(match.relPath); err != nil {
+		logger.Error("failed to purge bad file",
+			"trigger", trigger,
+			"path", match.relPath,
+			"owner", match.ownerHash,
+			"match", match.knownAs,
+			"err", err)
+		return false, false, err
+	}
+
+	cidr, added, err := s.blacklistLastAddress(match.ownerHash, match.ownerAddr, match.knownAs)
+	if err != nil {
+		logger.Warn("failed to blacklist owner address for bad file",
+			"trigger", trigger,
+			"path", match.relPath,
+			"owner", match.ownerHash,
+			"address", match.ownerAddr,
+			"err", err)
+		return true, false, err
+	}
+
+	logger.Warn("bad file purged",
+		"trigger", trigger,
+		"path", match.relPath,
+		"owner", match.ownerHash,
+		"owner_address", match.ownerAddr,
+		"match", match.knownAs,
+		"blacklisted", added,
+		"cidr", cidr)
+	return true, added, nil
+}
+
 type MaintenanceRunSnapshot struct {
 	Trigger    string            `json:"trigger"`
 	StartedAt  string            `json:"started_at"`
@@ -422,7 +448,7 @@ type MaintenanceStateSnapshot struct {
 	LastRun           *MaintenanceRunSnapshot `json:"last_run,omitempty"`
 }
 
-func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string) (started bool, halted bool, res MaintenanceResult) {
+func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string, includeBadFilePurge bool) (started bool, halted bool, res MaintenanceResult) {
 	if !s.maintenanceRunMu.TryLock() {
 		return false, false, res
 	}
@@ -435,9 +461,10 @@ func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string) 
 		s.maintenanceRunMu.Unlock()
 	}()
 
-	halted, res = s.RunMaintenancePass(ctx)
+	halted, res = s.runMaintenancePass(ctx, includeBadFilePurge)
 	s.logger.WithGroup("maintenance").With("operation", "pass").Info("maintenance pass completed",
 		"trigger", trigger,
+		"include_bad_file_purge", includeBadFilePurge,
 		"halted", halted,
 		"clean_deleted.deleted", res.CleanDeleted.Deleted,
 		"clean_deleted.stale_roots", res.CleanDeleted.StaleRoots,

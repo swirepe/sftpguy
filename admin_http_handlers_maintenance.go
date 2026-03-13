@@ -33,7 +33,7 @@ func (s *Server) handleAdminMaintenanceRun(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	started, halted, res := s.runTrackedMaintenancePass(r.Context(), "admin-http")
+	started, halted, res := s.runTrackedMaintenancePass(r.Context(), "admin-http", true)
 	if !started {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"ok":     false,

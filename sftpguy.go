@@ -1195,7 +1195,7 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 	go func() {
 		defer s.wg.Done()
 
-		started, halted, _ := s.runTrackedMaintenancePass(s.ctx, "startup")
+		started, halted, _ := s.runTrackedMaintenancePass(s.ctx, "startup", false)
 		if !started || !halted {
 			return
 		}
@@ -1283,6 +1283,20 @@ func remoteToPubhash(remoteAddr net.Addr) string {
 	data := fmt.Sprintf("anon-auth:%s", ip)
 	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
 	return hash
+}
+
+func remoteAddrHost(remoteAddr net.Addr) string {
+	if remoteAddr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(remoteAddr.String())
+	if err == nil {
+		return host
+	}
+	if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
+		return tcpAddr.IP.String()
+	}
+	return strings.TrimSpace(remoteAddr.String())
 }
 
 // func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
@@ -2429,16 +2443,52 @@ func (sw *statWriter) reportUserStatus(pubHash string) {
 	}
 }
 
+func (sw *statWriter) purgeBadUploadIfMatched() (bool, error) {
+	if sw.h.pubHash == "" || sw.h.pubHash == systemOwner || sw.h.srv.store == nil || sw.h.srv.store.badFileList == nil {
+		return false, nil
+	}
+
+	fullPath := filepath.Join(sw.h.srv.absUploadDir, filepath.FromSlash(sw.rel))
+	matchName, matched, err := sw.h.srv.store.badFileList.MatchFile(fullPath)
+	if err != nil {
+		return false, err
+	}
+	if !matched {
+		return false, nil
+	}
+
+	ownerAddr := remoteAddrHost(sw.h.remoteAddr)
+	if ownerAddr == "" {
+		stats, statsErr := sw.h.srv.store.GetUserStats(sw.h.pubHash)
+		if statsErr != nil {
+			sw.h.logger.Warn("failed to resolve owner address for uploaded bad file",
+				"path", sw.rel,
+				"owner", sw.h.pubHash,
+				"err", statsErr)
+		} else {
+			ownerAddr = strings.TrimSpace(stats.LastAddress)
+		}
+	}
+
+	logger := sw.h.srv.logger.WithGroup("maintenance").With("operation", "upload_bad_file")
+	purged, _, err := sw.h.srv.purgeMatchedBadFile(logger, "upload", badFileMatch{
+		relPath:   sw.rel,
+		ownerHash: sw.h.pubHash,
+		ownerAddr: ownerAddr,
+		knownAs:   matchName,
+	})
+	return purged, err
+}
+
 func (sw *statWriter) Close() error {
-	fi, _ := sw.File.Stat()
-	size := fi.Size()
+	size := sw.oldSize
+	if fi, err := sw.File.Stat(); err == nil {
+		size = fi.Size()
+	}
 	delta := size - sw.oldSize
 	dbErr := sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.ownerHint, sw.rel, size, delta)
 	if dbErr != nil {
 		sw.h.logger.Error("failed to persist upload metadata", "path", sw.rel, "err", dbErr)
-	} else {
-		sw.h.logUpload(sw.rel, size, delta)
-		sw.reportUserStatus(sw.h.pubHash)
 	}
 
 	closeErr := sw.File.Close()
@@ -2448,7 +2498,22 @@ func (sw *statWriter) Close() error {
 		}
 		return dbErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+
+	sw.h.logUpload(sw.rel, size, delta)
+	purgedBadFile, err := sw.purgeBadUploadIfMatched()
+	if err != nil {
+		sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
+			"path", sw.rel,
+			"owner", sw.h.pubHash,
+			"err", err)
+	}
+	if !purgedBadFile {
+		sw.reportUserStatus(sw.h.pubHash)
+	}
+	return nil
 }
 
 type sftpFile struct {

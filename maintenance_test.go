@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pkg/sftp"
 )
 
 func TestCleanDeletedRemovesMissingPaths(t *testing.T) {
@@ -77,6 +79,66 @@ func TestMaintenanceLoopRunsAndStopsOnShutdown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("shutdown did not stop maintenance loop")
+	}
+}
+
+func TestMaintenanceLoopSkipsBadFilePurge(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "scheduled-bad-file-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.19"), Port: 2222}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	const badRel = "scheduled/bad.bin"
+	badPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(badRel))
+	if err := os.MkdirAll(filepath.Dir(badPath), permDir); err != nil {
+		t.Fatalf("mkdir scheduled dir: %v", err)
+	}
+	if err := os.WriteFile(badPath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+
+	if err := srv.store.EnsureDirectory(ownerHash, "scheduled"); err != nil {
+		t.Fatalf("ensure scheduled dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
+		t.Fatalf("register bad file: %v", err)
+	}
+	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+
+	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+	srv.startMaintenanceLoop(20 * time.Millisecond)
+
+	waitForCondition(t, time.Second, func() bool {
+		return !srv.store.FileExistsInDB("gone.txt")
+	}, "maintenance loop did not remove stale row")
+
+	time.Sleep(60 * time.Millisecond)
+
+	if _, err := os.Stat(badPath); err != nil {
+		t.Fatalf("expected scheduled maintenance to leave bad file in place, got err=%v", err)
+	}
+	if !srv.store.FileExistsInDB(badRel) {
+		t.Fatal("expected scheduled maintenance to leave bad file record in place")
+	}
+	if srv.store.blacklist.Matches(ownerAddr.IP.String()) {
+		t.Fatal("expected scheduled maintenance to skip blacklisting bad file owner")
+	}
+
+	snap := srv.maintenanceStatusSnapshot()
+	if snap.LastRun == nil {
+		t.Fatal("expected maintenance loop to record a last run")
+	}
+	if snap.LastRun.Result.PurgeBlacklistedFiles.Matches != 0 || snap.LastRun.Result.PurgeBlacklistedFiles.Purges != 0 {
+		t.Fatalf("expected scheduled maintenance to skip purge result, got %+v", snap.LastRun.Result.PurgeBlacklistedFiles)
 	}
 }
 
@@ -170,8 +232,8 @@ func TestGetUserStatsHandlesNullLastAddress(t *testing.T) {
 	if stats.LastAddress != "" {
 		t.Fatalf("expected empty last_address, got %q", stats.LastAddress)
 	}
-	if stats.LastLogin != "" {
-		t.Fatalf("expected empty last_login, got %q", stats.LastLogin)
+	if stats.LastLogin != "Never" {
+		t.Fatalf("expected normalized last_login %q, got %q", "Never", stats.LastLogin)
 	}
 }
 
@@ -314,6 +376,73 @@ func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
 	}
 }
 
+func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "live-bad-file-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.33"), Port: 2022}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	samplePath := filepath.Join(t.TempDir(), "sample-bad.bin")
+	if err := os.WriteFile(samplePath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad sample: %v", err)
+	}
+	if err := srv.store.badFileList.AddFile(samplePath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(srv.absUploadDir, "live"), permDir); err != nil {
+		t.Fatalf("mkdir live dir: %v", err)
+	}
+	if err := srv.store.EnsureDirectory(ownerHash, "live"); err != nil {
+		t.Fatalf("ensure live dir: %v", err)
+	}
+
+	handler := &fsHandler{
+		srv:        srv,
+		pubHash:    ownerHash,
+		stderr:     io.Discard,
+		logger:     *slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		remoteAddr: ownerAddr,
+		sessionID:  "sess-bad-upload",
+	}
+
+	writer, err := handler.Filewrite(sftp.NewRequest("Put", "/live/bad.bin"))
+	if err != nil {
+		t.Fatalf("open upload writer: %v", err)
+	}
+	if _, err := writer.WriteAt([]byte("malware payload"), 0); err != nil {
+		t.Fatalf("write upload payload: %v", err)
+	}
+	if err := writer.(io.Closer).Close(); err != nil {
+		t.Fatalf("close upload writer: %v", err)
+	}
+
+	badPath := filepath.Join(srv.absUploadDir, "live", "bad.bin")
+	if _, err := os.Stat(badPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected uploaded bad file to be purged, got err=%v", err)
+	}
+	if srv.store.FileExistsInDB("live/bad.bin") {
+		t.Fatal("expected uploaded bad file record to be removed")
+	}
+	if !srv.store.blacklist.Matches(ownerAddr.IP.String()) {
+		t.Fatal("expected uploaded bad file owner IP to be blacklisted")
+	}
+
+	stats, err := srv.store.GetUserStats(ownerHash)
+	if err != nil {
+		t.Fatalf("get user stats after purge: %v", err)
+	}
+	if !stats.FirstTimer {
+		t.Fatalf("expected purged uploader %q to be removed from users table", ownerHash)
+	}
+}
+
 func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
@@ -442,7 +571,7 @@ func TestCleanAndReconcileLogsWhenResultChanges(t *testing.T) {
 	}
 	defer srv.Shutdown()
 
-	started, halted, _ := srv.runTrackedMaintenancePass(context.Background(), "startup")
+	started, halted, _ := srv.runTrackedMaintenancePass(context.Background(), "startup", false)
 	if !started || !halted {
 		t.Fatalf("expected initial tracked maintenance pass to complete: started=%v halted=%v", started, halted)
 	}
