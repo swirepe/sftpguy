@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -219,11 +220,29 @@ func (s *Server) PurgeUser(pubHash string) error {
 }
 
 func (s *Server) PurgeByFile(relPath string) error {
-	// TODO:
-	// get file owner
-	// purgeuser(fileowner)
-	// delete file (in the event that maybe a file was an orphan but we still don't want it around)
+	relPath = strings.TrimPrefix(path.Clean("/"+strings.TrimSpace(relPath)), "/")
+	if relPath == "" || relPath == "." {
+		return nil
+	}
 
+	owner, err := s.store.GetFileOwner(relPath)
+	if err != nil {
+		return err
+	}
+
+	if owner != "" && owner != systemOwner {
+		if err := s.PurgeUser(owner); err != nil {
+			return err
+		}
+	}
+
+	full := filepath.Join(s.absUploadDir, filepath.FromSlash(relPath))
+	if err := os.RemoveAll(full); err != nil {
+		return err
+	}
+	if err := s.store.DeletePath(relPath); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,7 +74,7 @@ func TestUpdateFileWriteUpsertsMissingRow(t *testing.T) {
 	defer srv.Shutdown()
 
 	const userHash = "user-upsert-hash"
-	if _, err := srv.store.UpsertUserSession(userHash); err != nil {
+	if _, err := srv.store.UpsertUserSession(userHash, nil); err != nil {
 		t.Fatalf("upsert user session: %v", err)
 	}
 
@@ -107,7 +110,7 @@ func TestUpdateFileWriteOwnerHintOverridesSystemOwnerRow(t *testing.T) {
 	defer srv.Shutdown()
 
 	const victimHash = "victim-owner-hash"
-	if _, err := srv.store.UpsertUserSession(victimHash); err != nil {
+	if _, err := srv.store.UpsertUserSession(victimHash, nil); err != nil {
 		t.Fatalf("upsert victim session: %v", err)
 	}
 
@@ -155,9 +158,10 @@ func newMaintenanceTestServer(t *testing.T) *Server {
 		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
 		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
 		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
 	}
 
-	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath} {
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath} {
 		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
 			t.Fatalf("write support file %s: %v", p, err)
 		}
@@ -183,4 +187,81 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, messa
 	}
 
 	t.Fatal(message)
+}
+
+func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "bad-file-owner-hash"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 2222}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	const badRel = "nested/bad.bin"
+	const otherRel = "nested/other.txt"
+
+	if err := os.MkdirAll(filepath.Join(srv.absUploadDir, "nested"), permDir); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	badPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(badRel))
+	otherPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(otherRel))
+	if err := os.WriteFile(badPath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+	if err := os.WriteFile(otherPath, []byte("innocent bystander"), permFile); err != nil {
+		t.Fatalf("write other file: %v", err)
+	}
+
+	if err := srv.store.EnsureDirectory(ownerHash, "nested"); err != nil {
+		t.Fatalf("ensure nested dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
+		t.Fatalf("register bad file: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, otherRel, int64(len("innocent bystander")), int64(len("innocent bystander"))); err != nil {
+		t.Fatalf("register other file: %v", err)
+	}
+
+	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+
+	srv.purgeBlacklistedFiles()
+
+	for _, p := range []string{badPath, otherPath} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected %s to be removed, got err=%v", p, err)
+		}
+	}
+	for _, rel := range []string{badRel, otherRel, "nested"} {
+		if srv.store.FileExistsInDB(rel) {
+			t.Fatalf("expected %s to be removed from the database", rel)
+		}
+	}
+
+	stats, err := srv.store.GetUserStats(ownerHash)
+	if err != nil {
+		t.Fatalf("get user stats after purge: %v", err)
+	}
+	if !stats.FirstTimer {
+		t.Fatalf("expected purged user %q to be removed from users table", ownerHash)
+	}
+
+	if !srv.store.blacklist.Matches("203.0.113.9") {
+		t.Fatal("expected uploader IP to be blacklisted")
+	}
+
+	blacklistContent, err := os.ReadFile(srv.store.blacklistPath)
+	if err != nil {
+		t.Fatalf("read blacklist file: %v", err)
+	}
+	if !strings.Contains(string(blacklistContent), "203.0.113.0/24") {
+		t.Fatalf("expected /24 network to be persisted, got %q", string(blacklistContent))
+	}
 }

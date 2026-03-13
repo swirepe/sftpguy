@@ -127,6 +127,8 @@ func (bl *IPList) AddRange(host string, mask int, comment string) error {
 		}
 		network = &net.IPNet{IP: ip, Mask: net.CIDRMask(maskLen, maskLen)}
 		cidrStr = network.String()
+	} else {
+		cidrStr = network.String()
 	}
 
 	// Prevent duplicates by checking existing ranger

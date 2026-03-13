@@ -206,6 +206,45 @@ func (hl *HashList) AddFile(absPath string) error {
 	return hl.AddHash(hash, filename)
 }
 
+func (hl *HashList) EnsureContent(content string) (int, error) {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	added := 0
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		hash := parts[0]
+		filename := ""
+		if len(parts) > 1 {
+			filename = strings.Join(parts[1:], " ")
+		}
+
+		if _, exists := hl.Lookup(hash); exists {
+			continue
+		}
+		if err := hl.AddHash(hash, filename); err != nil {
+			return added, err
+		}
+		added++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return added, err
+	}
+	if added == 0 {
+		return 0, nil
+	}
+
+	if _, err := hl.Reload(); err != nil {
+		return added, err
+	}
+	return added, nil
+}
+
 // calculateSHA256 performs a streaming hash of a file to handle large files efficiently.
 func (hl *HashList) calculateSHA256(absPath string) (string, error) {
 	f, err := os.Open(absPath)

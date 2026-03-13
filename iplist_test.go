@@ -98,9 +98,8 @@ func TestIPList_ReloadFaultTolerance(t *testing.T) {
 	}
 
 	// 3. Manually trigger reload (simulating the ticker)
-	_, _, err := list.Reload(tmpFile)
-	if err == nil {
-		t.Error("Reload should have failed because file is missing")
+	if _, _, err := list.Reload(); err != nil {
+		t.Errorf("Reload should treat a missing file as an empty update, got error: %v", err)
 	}
 
 	// 4. Verify original list is still active (fault tolerance)
@@ -125,7 +124,7 @@ func TestIPList_DynamicUpdate(t *testing.T) {
 	os.WriteFile(tmpFile, []byte("2.2.2.2"), 0644)
 
 	// Manually trigger reload
-	entries, _, err := list.Reload(tmpFile)
+	entries, _, err := list.Reload()
 	if err != nil {
 		t.Fatalf("Reload failed: %v", err)
 	}
@@ -151,7 +150,8 @@ func TestIPList_IPv6AddressCalculation(t *testing.T) {
 	os.WriteFile(tmpFile, []byte(content), 0644)
 
 	list := &IPList{logger: slog.Default()}
-	entries, addresses, err := list.Reload(tmpFile)
+	list.filepath = tmpFile
+	entries, addresses, err := list.Reload()
 
 	if err != nil {
 		t.Fatalf("Failed to load large IPv6 range: %v", err)

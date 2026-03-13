@@ -70,7 +70,7 @@ func (s *Server) handleAdminIPList(w http.ResponseWriter, r *http.Request) {
 	reloadEntries := 0
 	reloadAddresses := uint64(0)
 	if targetList != nil {
-		entries, addresses, reloadErr := targetList.Reload(targetPath)
+		entries, addresses, reloadErr := targetList.Reload()
 		if reloadErr != nil {
 			http.Error(w, reloadErr.Error(), http.StatusInternalServerError)
 			return
