@@ -909,7 +909,7 @@ footer{
 
 {{if .Header}}{{.Header}}{{end}}
 
-<nav class="bc" aria-label="Breadcrumb">
+<nav class="bc" aria-label="Breadcrumb" id="top">
 {{- range $i, $c := .Crumbs}}
   {{- if $i}}<span class="sep">/</span>{{end}}
   {{- if $c.IsCurrent}}<span class="cur">{{$c.Name}}</span>
@@ -1003,8 +1003,8 @@ footer{
 </footer>
 
 {{if .Footer}}{{.Footer}}{{end}}
-<p style="color:#222222ab">Rendered in {{.RenderTime}}</p>
-
+<p style="color:#222222ab; font-size: 12px;">Rendered in {{.RenderTime}}</p>
+<p><a href="#top">[return to top]</a></p>
 <script>
 const form = document.getElementById('upload-form');
 const fileInput = document.getElementById('pick-files');
