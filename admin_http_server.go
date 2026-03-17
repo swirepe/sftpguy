@@ -22,13 +22,19 @@ type adminHTTPDeps struct {
 }
 
 func (d *adminHTTPDeps) AdminHTTPConfig() adminhttp.Config {
-	return adminhttp.Config{
+	cfg := adminhttp.Config{
 		Addr:                d.srv.cfg.AdminHTTP,
 		Token:               d.srv.cfg.AdminHTTPToken,
 		TokenCookieName:     adminhttp.DefaultTokenCookieName,
 		IssueOneTimeToken:   d.srv.issueAdminOneTimeLoginToken,
 		ConsumeOneTimeToken: d.srv.consumeAdminOneTimeLoginToken,
 	}
+	if d.srv.cfg.EnablePrometheus && d.srv.metrics != nil {
+		cfg.MetricsPath = d.srv.cfg.PrometheusRoot
+		cfg.MetricsHandler = d.srv.metrics.Handler()
+		cfg.WrapHandler = d.srv.metrics.WrapAdminHandler
+	}
+	return cfg
 }
 
 func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {

@@ -87,3 +87,33 @@ func TestBuildOneTimeLoginURL(t *testing.T) {
 		t.Fatalf("unexpected login url: got=%q want=%q", u, want)
 	}
 }
+
+func TestHandlerRegistersMetricsRoute(t *testing.T) {
+	mux := Handler(Config{
+		Token:           "topsecret",
+		TokenCookieName: "admin_cookie",
+		MetricsPath:     "/metrics",
+		MetricsHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("metrics ok"))
+		}),
+	}, RouteHandlers{})
+
+	unauthReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	unauthW := httptest.NewRecorder()
+	mux.ServeHTTP(unauthW, unauthReq)
+	if unauthW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated metrics request, got %d", unauthW.Code)
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	authReq.Header.Set("Authorization", "Bearer topsecret")
+	authW := httptest.NewRecorder()
+	mux.ServeHTTP(authW, authReq)
+	if authW.Code != http.StatusOK {
+		t.Fatalf("expected authenticated metrics request to pass, got %d", authW.Code)
+	}
+	if strings.TrimSpace(authW.Body.String()) != "metrics ok" {
+		t.Fatalf("unexpected metrics body: %q", authW.Body.String())
+	}
+}

@@ -23,6 +23,9 @@ type Config struct {
 	TokenCookieName     string
 	IssueOneTimeToken   func() (string, error)
 	ConsumeOneTimeToken func(string) bool
+	MetricsPath         string
+	MetricsHandler      http.Handler
+	WrapHandler         func(string, http.Handler) http.Handler
 }
 
 type RouteHandlers struct {
@@ -80,7 +83,34 @@ func Listen(deps Deps) error {
 		return nil
 	}
 
-	handlers := deps.AdminHTTPHandlers()
+	httpServer := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           Handler(cfg, deps.AdminHTTPHandlers()),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	deps.SetAdminShutdown(httpServer.Shutdown)
+	defer deps.ClearAdminShutdown()
+
+	deps.Logger().Info("admin http console online", "addr", cfg.Addr, "token_required", cfg.Token != "")
+	if strings.TrimSpace(cfg.MetricsPath) != "" && cfg.MetricsHandler != nil {
+		deps.Logger().Info("prometheus metrics online", "path", cfg.MetricsPath, "token_required", cfg.Token != "")
+	}
+	if startupURL, err := startupOneTimeLoginURL(cfg); err != nil {
+		deps.Logger().Warn("failed to generate one-time admin login URL", "err", err)
+	} else if startupURL != "" {
+		deps.Logger().Info("admin one-time login URL (single-use)", "url", startupURL)
+	}
+	if err := httpServer.ListenAndServe(); err != nil {
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -128,46 +158,44 @@ func Listen(deps Deps) error {
 	register(mux, "/admin/api/explorer/ban-owner", cfg, handlers.ExplorerBanOwner)
 	register(mux, "/admin/api/one-time-login", cfg, handlers.OneTimeLoginURL)
 
-	httpServer := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	if path := strings.TrimSpace(cfg.MetricsPath); path != "" {
+		registerHandler(mux, path, cfg, cfg.MetricsHandler)
 	}
 
-	deps.SetAdminShutdown(httpServer.Shutdown)
-	defer deps.ClearAdminShutdown()
-
-	deps.Logger().Info("admin http console online", "addr", cfg.Addr, "token_required", cfg.Token != "")
-	if startupURL, err := startupOneTimeLoginURL(cfg); err != nil {
-		deps.Logger().Warn("failed to generate one-time admin login URL", "err", err)
-	} else if startupURL != "" {
-		deps.Logger().Info("admin one-time login URL (single-use)", "url", startupURL)
-	}
-	if err := httpServer.ListenAndServe(); err != nil {
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return mux
 }
 
 func register(mux *http.ServeMux, path string, cfg Config, next http.HandlerFunc) {
+	registerHandler(mux, path, cfg, next)
+}
+
+func registerHandler(mux *http.ServeMux, path string, cfg Config, next http.Handler) {
 	if next == nil {
 		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "admin handler not configured", http.StatusNotImplemented)
 		})
 		return
 	}
-	mux.HandleFunc(path, auth(cfg, next))
+
+	handler := authHandler(cfg, next)
+	if cfg.WrapHandler != nil {
+		handler = cfg.WrapHandler(path, handler)
+	}
+	mux.Handle(path, handler)
 }
 
 func auth(cfg Config, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHandler(cfg, next).ServeHTTP(w, r)
+	}
+}
+
+func authHandler(cfg Config, next http.Handler) http.Handler {
 	token := strings.TrimSpace(cfg.Token)
 	cookieName := tokenCookieName(cfg.TokenCookieName)
-	return func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token == "" {
-			next(w, r)
+			next.ServeHTTP(w, r)
 			return
 		}
 
@@ -178,8 +206,8 @@ func auth(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "admin token required", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func oneTimeLogin(cfg Config) http.HandlerFunc {

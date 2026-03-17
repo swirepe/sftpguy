@@ -938,6 +938,7 @@ func LoadConfig() (Config, error) {
 		}
 		cfg.AdminHTTPToken = token
 	}
+	cfg.PrometheusRoot = normalizeServeMuxPath(cfg.PrometheusRoot, "/metrics")
 	// Process unrestricted paths
 	cfg.unrestrictedMap = make(map[string]bool)
 	for _, p := range strings.Split(cfg.Unrestricted, ",") {
@@ -976,6 +977,17 @@ func stripInstallFlags(argv []string) []string {
 		out = append(out, a)
 	}
 	return out
+}
+
+func normalizeServeMuxPath(raw, fallback string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = fallback
+	}
+	if raw == "" {
+		return ""
+	}
+	return path.Clean("/" + strings.TrimLeft(raw, "/"))
 }
 
 func (c Config) Validate() error {
@@ -1029,6 +1041,7 @@ func (f *FortuneGenerator) Random() string {
 type Server struct {
 	store              *Store
 	logger             *slog.Logger
+	metrics            *serverMetrics
 	mkdirLimiter       *rate.Limiter
 	fortuneGenerator   *FortuneGenerator
 	cfg                Config
@@ -1094,6 +1107,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		shadowListMax:    shadowListMaxDefault,
 		startedAt:        time.Now(),
 	}
+	srv.metrics = newServerMetrics(srv)
 
 	if cfg.SelfTest || cfg.SelfTestContinue {
 		srv.shadowMutateMin = shadowMutateMinSelfTest
@@ -1256,13 +1270,16 @@ func (s *Server) Listen() error {
 
 		addr := conn.RemoteAddr()
 		log.Info("new connection", "remote_addr", addr)
-		if s.store.IsBannedByIp(addr) {
+		throttled := s.store.IsBannedByIp(addr)
+		s.observeAcceptedConnection(throttled)
+		if throttled {
 			s.logger.Info("Throttling new connection", "remote_addr", addr)
 			conn = newThrottledConn(conn, shadowBanBytesPerSec)
 		}
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer s.closeObservedConnection()
 			s.handleSSH(c, sshConfig)
 		}(conn)
 	}
@@ -1270,9 +1287,11 @@ func (s *Server) Listen() error {
 
 func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+	isAdmin := s.cfg.AdminSFTP && s.checkAdminKey(key)
+	s.observeAuthAttempt("publickey", isAdmin)
 
 	ext := map[string]string{"pubkey-hash": hash}
-	if s.cfg.AdminSFTP && s.checkAdminKey(key) {
+	if isAdmin {
 		ext["admin"] = "1"
 	}
 	return &ssh.Permissions{Extensions: ext}, nil
@@ -1280,6 +1299,7 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 
 func (s *Server) noClientAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
 	ip := getHostIp(conn)
+	s.observeAuthAttempt("none", false)
 
 	data := fmt.Sprintf("anon-auth:%s", ip)
 	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
@@ -1377,6 +1397,7 @@ func (s *Server) keyboardInteractiveCallback(conn ssh.ConnMetadata, client ssh.K
 
 	user := conn.User()
 	password := answers[0]
+	s.observeAuthAttempt("keyboard_interactive", false)
 	data := fmt.Sprintf("pwd-auth:%s:%s", user, password)
 	hash := fmt.Sprintf("pwd-auth:%x", sha256.Sum256([]byte(data)))
 	attemptSessionID := fmt.Sprintf("%x", conn.SessionID())
@@ -1426,9 +1447,11 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
+		s.observeHandshake(false)
 		nConn.Close()
 		return
 	}
+	s.observeHandshake(true)
 	nConn.SetDeadline(time.Time{})
 	defer sConn.Close()
 
@@ -1442,15 +1465,21 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	if isAdminSFTP {
 		loginType = "admin-sftp"
 	}
+	isBanned := false
+	if !isAdminSFTP {
+		isBanned = s.store.IsBanned(effectivePubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
+	}
 	sessionID := fmt.Sprintf("%x", sConn.SessionID())
 	sessionStarted := time.Now()
 	sessionCounts := &sessionCounters{}
+	observeSession := s.observeSession(loginType, isAdminSFTP, isBanned)
 	if isAdminSFTP {
 		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
 	}
 
 	defer func() {
 		duration := time.Since(sessionStarted)
+		observeSession(duration)
 		s.store.LogEvent(EventSessionEnd, effectivePubHash, sessionID, sConn.RemoteAddr(),
 			"duration_ms", duration.Milliseconds(),
 			"login_type", loginType,
@@ -1467,11 +1496,6 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	logger := s.logger.With(s.userGroup(effectivePubHash, sessionID, sConn.RemoteAddr()))
 
 	stats, _ := s.store.UpsertUserSession(effectivePubHash, nConn.RemoteAddr())
-
-	isBanned := false
-	if !isAdminSFTP {
-		isBanned = s.store.IsBanned(effectivePubHash) || s.store.IsBannedByIp(nConn.RemoteAddr())
-	}
 
 	s.store.LogEvent(EventSessionStart, effectivePubHash, sessionID, sConn.RemoteAddr(),
 		"login_type", loginType,
@@ -1959,6 +1983,7 @@ func (h *fsHandler) prepareDirectory(rel string) error {
 func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	h.bumpOps()
 	h.bumpDenied()
+	h.observeDenied(err.Kind)
 	h.logger.Info("permission denied", append([]any{"reason", err.LogString()}, args...)...)
 
 	h.srv.store.LogEvent(err.Kind, h.pubHash, h.sessionID, h.remoteAddr, args...)
@@ -2060,8 +2085,10 @@ func (h *fsHandler) logRename(src, dst *pathMeta) {
 	)
 }
 
-func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	defer h.Trace("fileread", "method", r.Method, "path", r.Filepath)()
+	observe := h.observeSFTPRequest("read")
+	defer func() { observe(err) }()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -2080,18 +2107,20 @@ func (h *fsHandler) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 		return nil, sftp.ErrSSHFxNoSuchFile
 	}
 
-	h.logDownload(meta)
-	h.srv.store.RecordDownload(h.pubHash, meta.fi.Size())
 	f, err := os.Open(meta.full)
 	if err != nil {
 		return nil, err
 	}
+	h.logDownload(meta)
+	h.srv.store.RecordDownload(h.pubHash, meta.fi.Size())
+
+	reader = newMetricsReaderAt(f, h, "download")
 
 	// SHADOW BAN: throttle reads
 	if h.isBanned && h.readLimiter != nil {
-		return &throttledReaderAt{r: f, lim: h.readLimiter}, nil
+		reader = &throttledReaderAt{r: reader, lim: h.readLimiter}
 	}
-	return f, nil
+	return reader, nil
 }
 
 func (h *fsHandler) canRead(meta *pathMeta) error {
@@ -2116,8 +2145,10 @@ func (h *fsHandler) canRead(meta *pathMeta) error {
 	return nil
 }
 
-func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+func (h *fsHandler) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 	defer h.Trace("Filewrite", "method", r.Method, "path", r.Filepath)()
+	observe := h.observeSFTPRequest("write")
+	defer func() { observe(err) }()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -2164,14 +2195,15 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 		ownerHint = h.pubHash
 	}
 
-	return &statWriter{
+	writer = &statWriter{
 		File:       f,
 		h:          h,
 		rel:        meta.rel,
 		ownerHint:  ownerHint,
 		oldSize:    oldSize,
 		appendMode: appendMode,
-	}, nil
+	}
+	return writer, nil
 }
 
 func (h *fsHandler) canModify(meta *pathMeta) error {
@@ -2192,8 +2224,10 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 	return nil
 }
 
-func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
 	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
+	observe := h.observeSFTPRequest(r.Method)
+	defer func() { observe(err) }()
 
 	if h.isBanned && r.Method == "List" {
 		delay := h.srv.randomShadowDelay(h.srv.shadowListMin, h.srv.shadowListMax)
@@ -2261,8 +2295,10 @@ func (h *fsHandler) Trace(msg string, args ...any) func() {
 	}
 }
 
-func (h *fsHandler) Filecmd(r *sftp.Request) error {
+func (h *fsHandler) Filecmd(r *sftp.Request) (err error) {
 	defer h.Trace("Filecmd", "method", r.Method, "path", r.Filepath)()
+	observe := h.observeSFTPRequest(r.Method)
+	defer func() { observe(err) }()
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return h.deny(errMsgPathTraversal, r.Filepath)
@@ -2420,6 +2456,7 @@ type statWriter struct {
 	ownerHint  string
 	oldSize    int64
 	appendMode bool
+	written    atomic.Int64
 }
 
 func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
@@ -2435,14 +2472,24 @@ func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 			return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
 				"path", sw.rel, "offset", effectiveOff, "size", len(p))
 		}
-		return sw.File.Write(p)
+		n, err := sw.File.Write(p)
+		if n > 0 {
+			sw.written.Add(int64(n))
+			sw.h.observeTransferBytes("upload", int64(n))
+		}
+		return n, err
 	}
 
 	if sw.h.srv.cfg.MaxFileSize > 0 && off+int64(len(p)) > sw.h.srv.cfg.MaxFileSize {
 		return 0, sw.h.deny(errMsgFileSizeExceeded.Args(sw.h.srv.cfg.MaxFileSize),
 			"path", sw.rel, "offset", off, "size", len(p))
 	}
-	return sw.File.WriteAt(p, off)
+	n, err := sw.File.WriteAt(p, off)
+	if n > 0 {
+		sw.written.Add(int64(n))
+		sw.h.observeTransferBytes("upload", int64(n))
+	}
+	return n, err
 }
 
 func (sw *statWriter) reportUserStatus(pubHash string) {
@@ -2499,12 +2546,14 @@ func (sw *statWriter) Close() error {
 		size = fi.Size()
 	}
 	delta := size - sw.oldSize
+	bytesWritten := sw.written.Load()
 	dbErr := sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.ownerHint, sw.rel, size, delta)
 	if dbErr != nil {
 		sw.h.logger.Error("failed to persist upload metadata", "path", sw.rel, "err", dbErr)
 	}
 
 	closeErr := sw.File.Close()
+	sw.h.observeTransferComplete("upload", bytesWritten)
 	if dbErr != nil {
 		if closeErr != nil {
 			return errors.Join(dbErr, closeErr)
