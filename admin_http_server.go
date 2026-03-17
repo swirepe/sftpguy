@@ -28,11 +28,14 @@ func (d *adminHTTPDeps) AdminHTTPConfig() adminhttp.Config {
 		TokenCookieName:     adminhttp.DefaultTokenCookieName,
 		IssueOneTimeToken:   d.srv.issueAdminOneTimeLoginToken,
 		ConsumeOneTimeToken: d.srv.consumeAdminOneTimeLoginToken,
+		StatsSource:         d,
+	}
+	if d.srv.metrics != nil {
+		cfg.WrapHandler = d.srv.metrics.WrapAdminHandler
 	}
 	if d.srv.cfg.EnablePrometheus && d.srv.metrics != nil {
 		cfg.MetricsPath = d.srv.cfg.PrometheusRoot
 		cfg.MetricsHandler = d.srv.metrics.Handler()
-		cfg.WrapHandler = d.srv.metrics.WrapAdminHandler
 	}
 	return cfg
 }
@@ -130,6 +133,31 @@ func (d *adminHTTPDeps) DirectoryCount() (int, error) {
 
 func (d *adminHTTPDeps) FormatBytes(n int64) string {
 	return formatBytes(n)
+}
+
+func (d *adminHTTPDeps) StatsSnapshot() adminhttp.StatsSnapshot {
+	if d == nil || d.srv == nil {
+		return adminhttp.StatsSnapshot{}
+	}
+	if d.srv.metrics != nil {
+		snap := d.srv.metrics.StatsSnapshot()
+		if snap.UptimeSeconds == 0 {
+			snap.UptimeSeconds = d.srv.Uptime().Seconds()
+		}
+		return snap
+	}
+
+	u, c, f, b := d.srv.store.GetBannerStats(d.srv.cfg.ContributorThreshold)
+	dirCount, _ := d.srv.store.GetDirectoryCount()
+
+	return adminhttp.StatsSnapshot{
+		UptimeSeconds:     d.srv.Uptime().Seconds(),
+		UsersTotal:        float64(u),
+		ContributorsTotal: float64(c),
+		FilesTotal:        float64(f),
+		DirectoriesTotal:  float64(dirCount),
+		StoredBytes:       float64(b),
+	}
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {

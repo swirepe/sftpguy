@@ -37,6 +37,17 @@ func TestSourceSnapshotBuildAndSelfTest(t *testing.T) {
 
 	runCommand(t, moduleDir, 2*time.Minute, "go", "build", "-o", rebuiltBinary, ".")
 
+	rebuiltVersionOutput := runCommand(t, rebuiltDir, 2*time.Minute, rebuiltBinary, "-version")
+	rebuiltVersion := normalizeVersion(reportedVersion(rebuiltVersionOutput))
+	currentVersion := normalizeVersion(AppVersion)
+	if rebuiltVersion == "" || rebuiltVersion != currentVersion {
+		t.Logf(
+			"warning: rebuilt binary reported version %q; current program version is %q",
+			strings.TrimSpace(rebuiltVersionOutput),
+			AppVersion,
+		)
+	}
+
 	runtimeDir := filepath.Join(tmpDir, "runtime")
 	if err := os.MkdirAll(runtimeDir, permDir); err != nil {
 		t.Fatalf("create runtime directory: %v", err)
@@ -111,4 +122,17 @@ func runCommand(t *testing.T, dir string, timeout time.Duration, name string, ar
 	}
 
 	return output
+}
+
+func reportedVersion(output string) string {
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) == 0 {
+		return ""
+	}
+
+	return fields[len(fields)-1]
+}
+
+func normalizeVersion(version string) string {
+	return strings.TrimLeft(strings.TrimSpace(version), "v")
 }

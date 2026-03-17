@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sftpguy/internal/adminhttp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 )
 
 type serverMetrics struct {
@@ -307,6 +309,170 @@ func (m *serverMetrics) Handler() http.Handler {
 		return http.NotFoundHandler()
 	}
 	return m.handler
+}
+
+func (m *serverMetrics) StatsSnapshot() adminhttp.StatsSnapshot {
+	var snap adminhttp.StatsSnapshot
+	if m == nil || m.registry == nil {
+		return snap
+	}
+
+	families, _ := m.registry.Gather()
+	if len(families) == 0 {
+		return snap
+	}
+
+	index := metricFamiliesByName(families)
+
+	snap.UptimeSeconds = sumGaugeFamily(index["sftpguy_uptime_seconds"], nil)
+
+	snap.UsersTotal = sumGaugeFamily(index["sftpguy_users_total"], nil)
+	snap.ContributorsTotal = sumGaugeFamily(index["sftpguy_contributors_total"], nil)
+	snap.FilesTotal = sumGaugeFamily(index["sftpguy_files_total"], nil)
+	snap.DirectoriesTotal = sumGaugeFamily(index["sftpguy_directories_total"], nil)
+	snap.StoredBytes = sumGaugeFamily(index["sftpguy_stored_bytes"], nil)
+	snap.ShadowBannedUsersTotal = sumGaugeFamily(index["sftpguy_shadow_banned_users_total"], nil)
+	snap.BannedIPsTotal = sumGaugeFamily(index["sftpguy_banned_ips_total"], nil)
+
+	snap.SSHConnectionsActive = sumGaugeFamily(index["sftpguy_ssh_connections_active"], nil)
+	snap.SSHConnectionAcceptsTotal = sumCounterFamily(index["sftpguy_ssh_connection_accepts_total"], nil)
+	snap.SSHConnectionAcceptsThrottledTotal = sumCounterFamily(index["sftpguy_ssh_connection_accepts_total"], map[string]string{"throttled": "true"})
+	snap.SSHHandshakesSuccessTotal = sumCounterFamily(index["sftpguy_ssh_handshakes_total"], map[string]string{"result": "success"})
+	snap.SSHHandshakesFailureTotal = sumCounterFamily(index["sftpguy_ssh_handshakes_total"], map[string]string{"result": "failure"})
+
+	snap.AuthAttemptsNoneTotal = sumCounterFamily(index["sftpguy_auth_attempts_total"], map[string]string{"method": "none", "admin": "false"})
+	snap.AuthAttemptsPublicKeyTotal = sumCounterFamily(index["sftpguy_auth_attempts_total"], map[string]string{"method": "publickey", "admin": "false"})
+	snap.AuthAttemptsKeyboardInteractiveTotal = sumCounterFamily(index["sftpguy_auth_attempts_total"], map[string]string{"method": "keyboard_interactive", "admin": "false"})
+	snap.AuthAttemptsAdminPublicKeyTotal = sumCounterFamily(index["sftpguy_auth_attempts_total"], map[string]string{"method": "publickey", "admin": "true"})
+
+	snap.SessionsActive = sumGaugeFamily(index["sftpguy_sessions_active"], nil)
+	snap.SessionsPubKeyTotal = sumCounterFamily(index["sftpguy_sessions_total"], map[string]string{"login_type": "pubkey_hash"})
+	snap.SessionsPasswordTotal = sumCounterFamily(index["sftpguy_sessions_total"], map[string]string{"login_type": "pwd_auth"})
+	snap.SessionsAdminSFTPTotal = sumCounterFamily(index["sftpguy_sessions_total"], map[string]string{"login_type": "admin_sftp"})
+	snap.SessionsBannedTotal = sumCounterFamily(index["sftpguy_sessions_total"], map[string]string{"banned": "true"})
+	snap.SessionDurationAverageSeconds = averageHistogramFamily(index["sftpguy_session_duration_seconds"], nil)
+
+	snap.SFTPRequestsInFlight = sumGaugeFamily(index["sftpguy_sftp_requests_in_flight"], nil)
+	snap.SFTPReadSuccessTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"operation": "read", "outcome": "success"})
+	snap.SFTPReadFailureTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"operation": "read"}) - snap.SFTPReadSuccessTotal
+	if snap.SFTPReadFailureTotal < 0 {
+		snap.SFTPReadFailureTotal = 0
+	}
+	snap.SFTPWriteSuccessTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"operation": "write", "outcome": "success"})
+	snap.SFTPWriteFailureTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"operation": "write"}) - snap.SFTPWriteSuccessTotal
+	if snap.SFTPWriteFailureTotal < 0 {
+		snap.SFTPWriteFailureTotal = 0
+	}
+	snap.SFTPPermissionDeniedTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"outcome": "permission_denied"})
+	snap.SFTPNotFoundTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"outcome": "not_found"})
+	snap.SFTPUnsupportedTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"outcome": "unsupported"})
+	snap.SFTPFailureTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"outcome": "failure"})
+	snap.SFTPErrorTotal = sumCounterFamily(index["sftpguy_sftp_requests_total"], map[string]string{"outcome": "error"})
+
+	snap.SFTPUploadTransfersTotal = sumCounterFamily(index["sftpguy_sftp_transfers_total"], map[string]string{"direction": "upload"})
+	snap.SFTPDownloadTransfersTotal = sumCounterFamily(index["sftpguy_sftp_transfers_total"], map[string]string{"direction": "download"})
+	snap.SFTPUploadBytesTotal = sumCounterFamily(index["sftpguy_sftp_transfer_bytes_total"], map[string]string{"direction": "upload"})
+	snap.SFTPDownloadBytesTotal = sumCounterFamily(index["sftpguy_sftp_transfer_bytes_total"], map[string]string{"direction": "download"})
+	snap.SFTPTransferAverageBytes = averageHistogramFamily(index["sftpguy_sftp_transfer_size_bytes"], nil)
+
+	snap.PermissionDenialsTotal = sumCounterFamily(index["sftpguy_permission_denials_total"], nil)
+	snap.PermissionDeniedContributorLockTotal = sumCounterFamily(index["sftpguy_permission_denials_total"], map[string]string{"reason": "denied_contributor_lock"})
+	snap.PermissionDeniedNotOwnerTotal = sumCounterFamily(index["sftpguy_permission_denials_total"], map[string]string{"reason": "denied_not_owner"})
+	snap.PermissionDeniedQuotaTotal = sumCounterFamily(index["sftpguy_permission_denials_total"], map[string]string{"reason": "denied_quota"})
+	snap.PermissionDeniedPathTraversalTotal = sumCounterFamily(index["sftpguy_permission_denials_total"], map[string]string{"reason": "denied_path_traversal"})
+
+	snap.AdminHTTPInFlight = sumGaugeFamily(index["sftpguy_admin_http_requests_in_flight"], nil)
+	snap.AdminHTTPRequestTotal = sumCounterFamily(index["sftpguy_admin_http_requests_total"], nil)
+	snap.AdminHTTPDurationAverageSeconds = averageHistogramFamily(index["sftpguy_admin_http_request_duration_seconds"], nil)
+
+	return snap
+}
+
+func metricFamiliesByName(families []*dto.MetricFamily) map[string]*dto.MetricFamily {
+	index := make(map[string]*dto.MetricFamily, len(families))
+	for _, family := range families {
+		if family == nil {
+			continue
+		}
+		index[family.GetName()] = family
+	}
+	return index
+}
+
+func sumGaugeFamily(family *dto.MetricFamily, labels map[string]string) float64 {
+	if family == nil {
+		return 0
+	}
+
+	var total float64
+	for _, metric := range family.GetMetric() {
+		if !metricMatchesLabels(metric, labels) {
+			continue
+		}
+		total += metric.GetGauge().GetValue()
+	}
+	return total
+}
+
+func sumCounterFamily(family *dto.MetricFamily, labels map[string]string) float64 {
+	if family == nil {
+		return 0
+	}
+
+	var total float64
+	for _, metric := range family.GetMetric() {
+		if !metricMatchesLabels(metric, labels) {
+			continue
+		}
+		total += metric.GetCounter().GetValue()
+	}
+	return total
+}
+
+func averageHistogramFamily(family *dto.MetricFamily, labels map[string]string) float64 {
+	if family == nil {
+		return 0
+	}
+
+	var (
+		sum   float64
+		count uint64
+	)
+	for _, metric := range family.GetMetric() {
+		if !metricMatchesLabels(metric, labels) {
+			continue
+		}
+		hist := metric.GetHistogram()
+		sum += hist.GetSampleSum()
+		count += hist.GetSampleCount()
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+func metricMatchesLabels(metric *dto.Metric, labels map[string]string) bool {
+	if len(labels) == 0 {
+		return true
+	}
+	if metric == nil {
+		return false
+	}
+
+	for key, want := range labels {
+		matched := false
+		for _, pair := range metric.GetLabel() {
+			if pair.GetName() == key && pair.GetValue() == want {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *serverMetrics) WrapAdminHandler(route string, next http.Handler) http.Handler {

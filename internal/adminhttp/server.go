@@ -25,6 +25,7 @@ type Config struct {
 	ConsumeOneTimeToken func(string) bool
 	MetricsPath         string
 	MetricsHandler      http.Handler
+	StatsSource         StatsSource
 	WrapHandler         func(string, http.Handler) http.Handler
 }
 
@@ -161,6 +162,8 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	if path := strings.TrimSpace(cfg.MetricsPath); path != "" {
 		registerHandler(mux, path, cfg, cfg.MetricsHandler)
 	}
+
+	RegisterStatsViz(mux, cfg)
 
 	return mux
 }
