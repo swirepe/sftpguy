@@ -126,6 +126,9 @@ const (
 	unrestrictedUID = 1337
 	unrestrictedGID = 1337
 
+	// Database defaults
+	sqliteBusyTimeoutMS = 1000
+
 	// Port limits
 	minPort = 1
 	maxPort = 65535
@@ -401,6 +404,9 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err = db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, err
+	}
+	if _, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d;", sqliteBusyTimeoutMS)); err != nil {
 		return nil, err
 	}
 
@@ -691,7 +697,7 @@ func (s *Store) RenamePath(oldRel, newRel string) error {
 func (s *Store) DeletePath(relPath string) error {
 	prefixLen := len(relPath) + 1 // "relPath" + "/"
 
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 		DELETE FROM files 
 		WHERE path = ? OR substr(path, 1, ?) = ?`,
 		relPath, prefixLen, relPath+"/")
@@ -2168,7 +2174,9 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 		return nil
 	}
 
-	if meta.owner == systemOwner || meta.isUnrestricted {
+	// Files inside unrestricted folders like /public are still mutable by the
+	// user who created them; only system-owned entries stay protected.
+	if meta.owner == systemOwner {
 		return h.deny(errMsgFileProtected.Args(meta.rel))
 	}
 
