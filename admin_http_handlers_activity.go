@@ -752,8 +752,9 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 
 	if actorType == "user" {
 		stats, _ := s.store.GetUserStats(value)
-		summary["user_stats"] = stats
-		summary["is_banned"] = s.store.IsBanned(value)
+		stats.IsBanned = s.store.IsBanned(value)
+		summary["user_stats"] = adminUserStatsPayload(stats)
+		summary["is_banned"] = stats.IsBanned
 	} else {
 		summary["is_banned"] = s.store.IsIPBanned(value)
 	}

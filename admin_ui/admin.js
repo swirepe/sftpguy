@@ -1591,7 +1591,8 @@
         "</div>" +
         (isUser ? "<div class=\"muted\">upload_count=" + esc(stats.upload_count || 0) + " upload_bytes=" + esc(formatBytes(stats.upload_bytes || 0)) +
           " download_count=" + esc(stats.download_count || 0) + " download_bytes=" + esc(formatBytes(stats.download_bytes || 0)) +
-          " last_login=<code>" + esc(stats.last_login || "") + "</code></div>" : "") +
+          " last_login=<code>" + esc(stats.last_login || "") + "</code>" +
+          " last_address=<code>" + esc(stats.last_address || "") + "</code></div>" : "") +
         "<h3>Recent Uploads</h3>" + renderSimpleTable(["Time", "Path", "Delta", "Session"], uploadRows) +
         "<h3>Sessions</h3>" + renderSimpleTable(["Session", "Events", "Duration", "Denied"], sessionRows) +
         "<h3>Recent Events</h3>" + renderSimpleTable(["Time", "Event", "Path", "Session"], eventRows);

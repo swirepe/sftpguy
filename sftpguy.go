@@ -70,7 +70,7 @@ import (
 //go:embed VERSION
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
-//go:embed bad_files.txt bad_files.go  maintenance.go maintenance_test.go
+//go:embed bad_files.txt bad_files.go  maintenance.go maintenance_test.go metrics.go
 //go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go
 
 var embeddedSource embed.FS
@@ -834,6 +834,8 @@ type Config struct {
 	WhitelistPath           string
 	AdminKeysPath           string
 	BadFilesPath            string
+	EnablePrometheus        bool
+	PrometheusRoot          string
 }
 
 func LoadConfig() (Config, error) {
@@ -872,6 +874,9 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
 	EnvFlag(&cfg.BadFilesPath, "bad", "BAD_FILE", "bad_files.txt", "Text file of sha256 hashes and filenames that will trigger an automatic ban and purge.")
+
+	EnvFlag(&cfg.EnablePrometheus, "prometheus.enable", "ENABLE_PROMETHEUS", true, "Enable metric endpoint using promethus", "prom")
+	EnvFlag(&cfg.PrometheusRoot, "prometheus.root", "PROMETHEUS_ROOT", "/metrics", "Root path for the metrics endpoint", "prom.root")
 
 	EnvFlag(&cfg.BootstrapSrc, "src", "SRC", false, "Copy source code to upload directory on boot")
 	EnvFlag(&cfg.ExportSrcDir, "src.out", "SRC_OUT", "", "Write source snapshot to this directory and exit")

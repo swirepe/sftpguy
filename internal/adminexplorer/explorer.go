@@ -112,6 +112,7 @@ var (
 	tmpl              *template.Template
 	ownerLookup       func(relPath string) (string, error)
 	ownerFilesURLFunc func(owner string) string
+	ownerDetailsURLFn func(owner string) string
 )
 
 //go:embed three.min.js video.js video-js.css flv.js videojs-flvjs.min.js
@@ -467,13 +468,14 @@ func templateDict(values ...interface{}) (map[string]interface{}, error) {
 }
 
 type Config struct {
-	RootDir        string
-	BasePath       string
-	EmbedAssets    bool
-	MaxUploadBytes int64
-	WarmCacheMax   int
-	LookupOwner    func(relPath string) (string, error)
-	OwnerFilesURL  func(owner string) string
+	RootDir         string
+	BasePath        string
+	EmbedAssets     bool
+	MaxUploadBytes  int64
+	WarmCacheMax    int
+	LookupOwner     func(relPath string) (string, error)
+	OwnerFilesURL   func(owner string) string
+	OwnerDetailsURL func(owner string) string
 }
 
 type Explorer struct {
@@ -505,6 +507,7 @@ func New(cfg Config) (*Explorer, error) {
 	basePath = normalizeBasePath(cfg.BasePath)
 	ownerLookup = cfg.LookupOwner
 	ownerFilesURLFunc = cfg.OwnerFilesURL
+	ownerDetailsURLFn = cfg.OwnerDetailsURL
 
 	go warmCaches(rootDir, cfg.WarmCacheMax)
 	return &Explorer{basePath: basePath}, nil
@@ -1173,7 +1176,7 @@ func treeStats(children []FileEntry) (dirs, files int, _ int64) {
 func createFileEntry(name, relPath string, info os.FileInfo, isDir, isNew, unlocked bool) FileEntry {
 	entryRelPath := filepath.ToSlash(filepath.Join(relPath, name))
 	urlStr := explorerURL(entryRelPath)
-	owner, ownerShort, ownerFilesURL := ownerInfoForPath(entryRelPath)
+	owner, ownerShort, ownerFilesURL, _ := ownerInfoForPath(entryRelPath)
 
 	var thumbURL string
 	if unlocked && imageExts[strings.ToLower(filepath.Ext(name))] {
@@ -1408,14 +1411,15 @@ type archiveEntry struct {
 }
 
 type previewPayload struct {
-	Name          string `json:"name"`
-	IsDir         bool   `json:"is_dir"`
-	RelPath       string `json:"rel_path,omitempty"`
-	Owner         string `json:"owner,omitempty"`
-	OwnerFilesURL string `json:"owner_files_url,omitempty"`
-	Size          string `json:"size"`
-	ModTime       string `json:"mod_time"`
-	Ext           string `json:"ext,omitempty"`
+	Name            string `json:"name"`
+	IsDir           bool   `json:"is_dir"`
+	RelPath         string `json:"rel_path,omitempty"`
+	Owner           string `json:"owner,omitempty"`
+	OwnerFilesURL   string `json:"owner_files_url,omitempty"`
+	OwnerDetailsURL string `json:"owner_details_url,omitempty"`
+	Size            string `json:"size"`
+	ModTime         string `json:"mod_time"`
+	Ext             string `json:"ext,omitempty"`
 
 	ChildDirs  int    `json:"child_dirs"`
 	ChildFiles int    `json:"child_files"`
@@ -1495,10 +1499,13 @@ func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath 
 		p = buildFilePreviewPayload(fullPath, info, escapedPath, unlocked)
 	}
 	p.RelPath = filepath.ToSlash(relPath)
-	owner, _, ownerFilesURL := ownerInfoForPath(relPath)
+	owner, _, ownerFilesURL, ownerDetailsURL := ownerInfoForPath(relPath)
 	p.Owner = owner
 	if ownerFilesURL != "" {
 		p.OwnerFilesURL = string(ownerFilesURL)
+	}
+	if ownerDetailsURL != "" {
+		p.OwnerDetailsURL = string(ownerDetailsURL)
 	}
 
 	var jsonBuf byteBuffer
@@ -1852,22 +1859,22 @@ func cookieValue(r *http.Request, name, def string) string {
 	return c.Value
 }
 
-func ownerInfoForPath(relPath string) (owner string, ownerShort string, filesURL template.URL) {
+func ownerInfoForPath(relPath string) (owner string, ownerShort string, filesURL template.URL, detailsURL template.URL) {
 	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relPath)), "/")
 	if clean == "." {
 		clean = ""
 	}
 	if clean == "" || ownerLookup == nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
 
 	found, err := ownerLookup(clean)
 	if err != nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	owner = strings.TrimSpace(found)
 	if owner == "" {
-		return "", "", ""
+		return "", "", "", ""
 	}
 
 	ownerShort = owner
@@ -1879,7 +1886,12 @@ func ownerInfoForPath(relPath string) (owner string, ownerShort string, filesURL
 			filesURL = template.URL(u)
 		}
 	}
-	return owner, ownerShort, filesURL
+	if ownerDetailsURLFn != nil {
+		if u := strings.TrimSpace(ownerDetailsURLFn(owner)); u != "" {
+			detailsURL = template.URL(u)
+		}
+	}
+	return owner, ownerShort, filesURL, detailsURL
 }
 
 func isUnlocked(r *http.Request) bool {
@@ -2533,6 +2545,218 @@ var htmlTmpl = `
         .preview-meta-row:last-child { border-bottom: none; }
         .preview-meta-label { color: var(--text-muted); }
         .preview-meta-value { font-weight: 500; text-align: right; }
+        .owner-details-block {
+            border-top: 1px solid var(--border);
+            padding: 10px 12px;
+        }
+        .owner-details-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .owner-details-heading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+        .owner-details-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: var(--text-muted);
+        }
+        .owner-details-hash {
+            display: inline-flex;
+            align-items: center;
+            max-width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--surface2);
+            padding: 2px 8px;
+            color: var(--text);
+        }
+        .owner-details-hash code {
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 11px;
+        }
+        .owner-status {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 58px;
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: .04em;
+            text-transform: uppercase;
+        }
+        .owner-status.active {
+            color: #0e6245;
+            background: color-mix(in srgb, #4ade80 18%, transparent);
+            border: 1px solid color-mix(in srgb, #22c55e 28%, var(--border));
+        }
+        .owner-status.banned {
+            color: #b42318;
+            background: color-mix(in srgb, #fda4af 18%, transparent);
+            border: 1px solid color-mix(in srgb, #ef4444 30%, var(--border));
+        }
+        .owner-details-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .owner-stat-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--surface2);
+            padding: 8px;
+        }
+        .owner-stat-label {
+            display: block;
+            margin-bottom: 4px;
+            color: var(--text-muted);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+        .owner-stat-value {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        .owner-files-wrap,
+        .owner-events-wrap {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--surface2);
+            overflow: hidden;
+        }
+        .owner-files-head,
+        .owner-events-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        .owner-files-title,
+        .owner-events-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            color: var(--text-muted);
+        }
+        .owner-files-count,
+        .owner-events-count {
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        .owner-files-list,
+        .owner-events-list {
+            max-height: 220px;
+            overflow-y: auto;
+        }
+        .owner-file-row,
+        .owner-event-row {
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        .owner-file-row:last-child,
+        .owner-event-row:last-child {
+            border-bottom: none;
+        }
+        .owner-file-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 6px;
+            flex-wrap: wrap;
+        }
+        .owner-file-path {
+            display: block;
+            font-family: ui-monospace, "SFMono-Regular", monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        .owner-file-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 11px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .owner-file-link:hover {
+            border-color: var(--accent);
+            color: var(--accent);
+            text-decoration: none;
+        }
+        .owner-file-kind {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--accent) 10%, transparent);
+            color: var(--text-muted);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+        .owner-event-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+        .owner-event-kind {
+            font-family: ui-monospace, "SFMono-Regular", monospace;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .owner-event-time {
+            color: var(--text-muted);
+            font-size: 11px;
+            white-space: nowrap;
+        }
+        .owner-event-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+        .owner-details-note {
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+        .owner-details-empty {
+            padding: 12px 10px;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
 
         .preview-archive-block { border-top: 1px solid var(--border); padding: 10px 12px; }
         .preview-archive-label {
@@ -2616,6 +2840,7 @@ var htmlTmpl = `
             .unlock-hint             { width: 100%; margin-top: 2px; }
             .sort-select             { flex: 1; }
             .sort-order-btn          { width: 36px; height: 36px; }
+            .owner-details-grid      { grid-template-columns: 1fr; }
         }
 
         /* ── tree view ── */
@@ -4448,6 +4673,7 @@ function archiveEntryIcon(e) {
 }
 
 var _vjsPlayerCounter = 0;
+var _ownerDetailsCache = Object.create(null);
 
 function renderPreview(d) {
     var content = document.getElementById('preview-content');
@@ -4604,6 +4830,12 @@ function renderPreview(d) {
     }
     html += '</div>';
 
+    if (d.owner_details_url) {
+        html += '<div class="owner-details-block" id="preview-owner-details">'
+            + '<div class="owner-details-note">Loading owner details…</div>'
+            + '</div>';
+    }
+
     if (d.is_archive && d.archive_entries && d.archive_entries.length > 0) {
         var truncated = d.archive_entries.length >= 200;
         html += '<div class="preview-archive-block">'
@@ -4635,6 +4867,9 @@ function renderPreview(d) {
     content.innerHTML = html;
     var pane = document.getElementById('preview-pane');
     if (pane) pane.scrollTop = 0;
+    if (d.owner_details_url) {
+        loadOwnerDetails(d.owner_details_url);
+    }
 
     // Boot Video.js for non-native video formats.
     if (vjsVideoId) {
@@ -4724,6 +4959,146 @@ function renderPreview(d) {
         var canvas = content.querySelector('canvas[id^="stl-canvas-"]');
         if (canvas) initStlViewer(canvas, d.download_url);
     }
+}
+
+function ownerExplorerURL(relPath) {
+    var rel = String(relPath || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!rel) return EXPLORER_BASE + '/';
+    return EXPLORER_BASE + '/' + rel.split('/').filter(function(part) { return part.length > 0; }).map(encodeURIComponent).join('/');
+}
+
+function previewOwnerPath(event, relPath) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    var rel = String(relPath || '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!rel) return;
+    loadPreview(ownerExplorerURL(rel) + '?preview=true');
+}
+
+function ownerFolderPath(relPath) {
+    var rel = String(relPath || '').trim().replace(/^\/+/, '');
+    if (!rel) return '';
+    rel = rel.replace(/\/+$/, '');
+    var cut = rel.lastIndexOf('/');
+    if (cut === -1) return '';
+    return rel.slice(0, cut);
+}
+
+function ownerDetailsStat(label, value) {
+    return '<div class="owner-stat-card">'
+        + '<span class="owner-stat-label">' + esc(label) + '</span>'
+        + '<span class="owner-stat-value">' + esc(String(value == null || value === '' ? 'Never' : value)) + '</span>'
+        + '</div>';
+}
+
+function renderOwnerFiles(files) {
+    if (!files || !files.length) {
+        return '<div class="owner-details-empty">No tracked files for this owner.</div>';
+    }
+    var rows = files.map(function(path) {
+        var raw = String(path || '').trim();
+        if (!raw) return '';
+        var isDir = /\/$/.test(raw);
+        var target = raw.replace(/\/+$/, '');
+        var folderTarget = isDir ? target : ownerFolderPath(raw);
+        var previewEnc = encodeURIComponent(target);
+        var folderURL = ownerExplorerURL(folderTarget);
+        var folderLabel = isDir ? 'Open folder' : 'Open parent';
+        return '<div class="owner-file-row">'
+            + '<div class="owner-file-actions">'
+            + '<button class="owner-file-link" onclick="previewOwnerPath(event, decodeURIComponent(\'' + previewEnc + '\'))">Preview</button>'
+            + '<a class="owner-file-link" href="' + esc(folderURL) + '">' + folderLabel + '</a>'
+            + '<span class="owner-file-kind">' + (isDir ? 'folder' : 'file') + '</span>'
+            + '</div>'
+            + '<code class="owner-file-path">' + esc(raw) + '</code>'
+            + '</div>';
+    }).filter(function(row) { return row !== ''; }).join('');
+    return rows || '<div class="owner-details-empty">No tracked files for this owner.</div>';
+}
+
+function renderOwnerEvents(events) {
+    if (!events || !events.length) {
+        return '<div class="owner-details-empty">No recent events for this owner.</div>';
+    }
+    return events.slice(0, 12).map(function(evt) {
+        var path = String(evt.path || '').trim();
+        var ip = String(evt.ip || '').trim();
+        return '<div class="owner-event-row">'
+            + '<div class="owner-event-head">'
+            + '<span class="owner-event-kind">' + esc(evt.event || '') + '</span>'
+            + '<span class="owner-event-time">' + esc(evt.time || '') + '</span>'
+            + '</div>'
+            + '<div class="owner-event-meta">'
+            + (path ? '<code class="owner-file-path">' + esc(path) + '</code>' : '')
+            + (ip ? '<span>IP ' + esc(ip) + '</span>' : '')
+            + '</div>'
+            + '</div>';
+    }).join('');
+}
+
+function renderOwnerDetails(payload) {
+    var stats = payload && payload.stats ? payload.stats : {};
+    var files = Array.isArray(payload && payload.files) ? payload.files : [];
+    var events = Array.isArray(payload && payload.events) ? payload.events : [];
+    var hash = String(payload && payload.hash || '');
+    var statusClass = payload && payload.is_banned ? 'banned' : 'active';
+    var statusLabel = payload && payload.is_banned ? 'Banned' : 'Active';
+    return '<div class="owner-details-header">'
+        + '<div class="owner-details-heading">'
+        + '<span class="owner-details-title">Owner profile</span>'
+        + (hash ? '<span class="owner-details-hash"><code>' + esc(hash) + '</code></span>' : '')
+        + '</div>'
+        + '<span class="owner-status ' + statusClass + '">' + statusLabel + '</span>'
+        + '</div>'
+        + '<div class="owner-details-grid">'
+        + ownerDetailsStat('Last login', stats.last_login || 'Never')
+        + ownerDetailsStat('Last address', stats.last_address || 'Never')
+        + ownerDetailsStat('Uploads', String(stats.upload_count || 0) + ' files')
+        + ownerDetailsStat('Uploaded', formatBytes(stats.upload_bytes || 0))
+        + ownerDetailsStat('Downloads', String(stats.download_count || 0) + ' files')
+        + ownerDetailsStat('Downloaded', formatBytes(stats.download_bytes || 0))
+        + '</div>'
+        + '<div class="owner-files-wrap">'
+        + '<div class="owner-files-head"><span class="owner-files-title">Tracked files</span><span class="owner-files-count">' + esc(files.length) + '</span></div>'
+        + '<div class="owner-files-list">' + renderOwnerFiles(files) + '</div>'
+        + '</div>'
+        + '<div class="owner-events-wrap" style="margin-top:10px">'
+        + '<div class="owner-events-head"><span class="owner-events-title">Recent events</span><span class="owner-events-count">' + esc(Math.min(events.length, 12)) + '</span></div>'
+        + '<div class="owner-events-list">' + renderOwnerEvents(events) + '</div>'
+        + '</div>';
+}
+
+function loadOwnerDetails(url) {
+    var slot = document.getElementById('preview-owner-details');
+    if (!slot || !url) return;
+    var requestedURL = String(url);
+    if (_ownerDetailsCache[requestedURL]) {
+        slot.innerHTML = renderOwnerDetails(_ownerDetailsCache[requestedURL]);
+        return;
+    }
+    slot.innerHTML = '<div class="owner-details-note">Loading owner details...</div>';
+    fetch(requestedURL, {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin'
+    }).then(function(res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+    }).then(function(payload) {
+        _ownerDetailsCache[requestedURL] = payload || {};
+        if (!_previewData || _previewData.owner_details_url !== requestedURL) return;
+        var currentSlot = document.getElementById('preview-owner-details');
+        if (currentSlot) {
+            currentSlot.innerHTML = renderOwnerDetails(payload || {});
+        }
+    }).catch(function(err) {
+        if (!_previewData || _previewData.owner_details_url !== requestedURL) return;
+        var currentSlot = document.getElementById('preview-owner-details');
+        if (currentSlot) {
+            currentSlot.innerHTML = '<div class="owner-details-note">Owner details unavailable: ' + esc(err.message || 'request failed') + '</div>';
+        }
+    });
 }
 
 // ── lazy script loader ────────────────────────────────────────────────────────

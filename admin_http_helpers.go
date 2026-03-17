@@ -244,6 +244,30 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+type adminUserStats struct {
+	LastLogin     string `json:"last_login"`
+	LastAddress   string `json:"last_address"`
+	UploadCount   int64  `json:"upload_count"`
+	UploadBytes   int64  `json:"upload_bytes"`
+	DownloadCount int64  `json:"download_count"`
+	DownloadBytes int64  `json:"download_bytes"`
+	FirstTimer    bool   `json:"first_timer"`
+	IsBanned      bool   `json:"is_banned"`
+}
+
+func adminUserStatsPayload(stats userStats) adminUserStats {
+	return adminUserStats{
+		LastLogin:     stats.LastLogin,
+		LastAddress:   stats.LastAddress,
+		UploadCount:   stats.UploadCount,
+		UploadBytes:   stats.UploadBytes,
+		DownloadCount: stats.DownloadCount,
+		DownloadBytes: stats.DownloadBytes,
+		FirstTimer:    stats.FirstTimer,
+		IsBanned:      stats.IsBanned,
+	}
+}
+
 var (
 	errAdminLookupNotFound  = errors.New("identifier not found")
 	errAdminLookupAmbiguous = errors.New("identifier is ambiguous")

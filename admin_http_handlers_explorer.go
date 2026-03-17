@@ -43,6 +43,13 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 			q.Set("owner", owner)
 			return "/admin?" + q.Encode()
 		},
+		OwnerDetailsURL: func(owner string) string {
+			owner = strings.TrimSpace(owner)
+			if owner == "" || owner == systemOwner {
+				return ""
+			}
+			return "/admin/api/users/" + url.PathEscape(owner)
+		},
 	})
 	if err != nil {
 		s.adminExplorerErr = err

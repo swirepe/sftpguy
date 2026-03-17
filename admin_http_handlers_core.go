@@ -106,6 +106,7 @@ func (s *Server) handleAdminUser(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		stats.IsBanned = s.store.IsBanned(hash)
 		files, err := s.store.FilesByOwner(hash)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -142,8 +143,8 @@ func (s *Server) handleAdminUser(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"hash":      hash,
-			"is_banned": s.store.IsBanned(hash),
-			"stats":     stats,
+			"is_banned": stats.IsBanned,
+			"stats":     adminUserStatsPayload(stats),
 			"files":     files,
 			"events":    events,
 		})
