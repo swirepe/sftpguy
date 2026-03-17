@@ -71,7 +71,7 @@ import (
 //go:embed sftpguy.go admin.go admin_ui internal admin_http*.go install.go iplist.go iplist_test.go
 //go:embed adminkeys.go adminkeys_test.go log_stub.go log_linux.go test_client.go test_server.go
 //go:embed bad_files.txt bad_files.go  maintenance.go maintenance_test.go metrics.go
-//go:embed fortunes.txt cmd go.mod go.sum src_roundtrip_integration_test.go
+//go:embed fortunes.txt go.mod go.sum src_roundtrip_integration_test.go
 
 var embeddedSource embed.FS
 
@@ -2086,9 +2086,7 @@ func (h *fsHandler) logRename(src, dst *pathMeta) {
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
-	defer h.Trace("fileread", "method", r.Method, "path", r.Filepath)()
-	observe := h.observeSFTPRequest("read")
-	defer func() { observe(err) }()
+	defer h.Trace("fileread", "read", &err, "method", r.Method, "path", r.Filepath)()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -2146,9 +2144,7 @@ func (h *fsHandler) canRead(meta *pathMeta) error {
 }
 
 func (h *fsHandler) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
-	defer h.Trace("Filewrite", "method", r.Method, "path", r.Filepath)()
-	observe := h.observeSFTPRequest("write")
-	defer func() { observe(err) }()
+	defer h.Trace("Filewrite", "write", &err, "method", r.Method, "path", r.Filepath)()
 
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
@@ -2225,9 +2221,7 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
-	defer h.Trace("Filelist", "method", r.Method, "path", r.Filepath)()
-	observe := h.observeSFTPRequest(r.Method)
-	defer func() { observe(err) }()
+	defer h.Trace("Filelist", r.Method, &err, "method", r.Method, "path", r.Filepath)()
 
 	if h.isBanned && r.Method == "List" {
 		delay := h.srv.randomShadowDelay(h.srv.shadowListMin, h.srv.shadowListMax)
@@ -2275,6 +2269,10 @@ func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) 
 	return listerAt{h.newSftpFile(meta.fi, meta.rel)}, nil
 }
 
+func (h *fsHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
+	return h.Filelist(r)
+}
+
 func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 	owner, _ := h.srv.store.GetFileOwner(relPath)
 	return &sftpFile{
@@ -2284,9 +2282,16 @@ func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 	}
 }
 
-func (h *fsHandler) Trace(msg string, args ...any) func() {
+func (h *fsHandler) Trace(msg, operation string, errp *error, args ...any) func() {
 	start := time.Now()
+	observe := h.observeSFTPRequest(operation)
 	return func() {
+		var err error
+		if errp != nil {
+			err = *errp
+		}
+		observe(err)
+
 		durationArgs := make([]any, 0, 2+len(args))
 		durationArgs = append(durationArgs, "duration", time.Since(start))
 		durationArgs = append(durationArgs, args...)
@@ -2296,9 +2301,7 @@ func (h *fsHandler) Trace(msg string, args ...any) func() {
 }
 
 func (h *fsHandler) Filecmd(r *sftp.Request) (err error) {
-	defer h.Trace("Filecmd", "method", r.Method, "path", r.Filepath)()
-	observe := h.observeSFTPRequest(r.Method)
-	defer func() { observe(err) }()
+	defer h.Trace("Filecmd", r.Method, &err, "method", r.Method, "path", r.Filepath)()
 	meta, err := h.examine(r.Filepath)
 	if err != nil {
 		return h.deny(errMsgPathTraversal, r.Filepath)

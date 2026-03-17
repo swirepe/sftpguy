@@ -52,6 +52,15 @@ type StatsSnapshot struct {
 	SFTPUnsupportedTotal      float64
 	SFTPFailureTotal          float64
 	SFTPErrorTotal            float64
+	SFTPListTotal             float64
+	SFTPStatTotal             float64
+	SFTPLstatTotal            float64
+	SFTPMkdirTotal            float64
+	SFTPRemoveTotal           float64
+	SFTPRmdirTotal            float64
+	SFTPRenameTotal           float64
+	SFTPSetstatTotal          float64
+	SFTPRequestAverageSeconds float64
 
 	SFTPUploadTransfersTotal   float64
 	SFTPDownloadTransfersTotal float64
@@ -281,6 +290,49 @@ func statsvizPlotOptions(source StatsSource) ([]statsviz.Option, error) {
 			{Name: "unsupported", GetValue: func() float64 { return snapshotter.snapshot().SFTPUnsupportedTotal }},
 			{Name: "failure", GetValue: func() float64 { return snapshotter.snapshot().SFTPFailureTotal }},
 			{Name: "error", GetValue: func() float64 { return snapshotter.snapshot().SFTPErrorTotal }},
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := appendPlot(statsviz.TimeSeriesPlotConfig{
+		Name:       "sftpguy_sftp_browse_ops",
+		Title:      "SFTP Browse And Metadata",
+		YAxisTitle: "count",
+		InfoText:   "Directory listings and metadata lookups across SFTP sessions.",
+		Series: []statsviz.TimeSeries{
+			{Name: "list", GetValue: func() float64 { return snapshotter.snapshot().SFTPListTotal }},
+			{Name: "stat/fstat", GetValue: func() float64 { return snapshotter.snapshot().SFTPStatTotal }},
+			{Name: "lstat", GetValue: func() float64 { return snapshotter.snapshot().SFTPLstatTotal }},
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := appendPlot(statsviz.TimeSeriesPlotConfig{
+		Name:       "sftpguy_sftp_mutations",
+		Title:      "SFTP Mutations",
+		YAxisTitle: "count",
+		InfoText:   "Mutation requests observed across uploads, renames, and deletes.",
+		Series: []statsviz.TimeSeries{
+			{Name: "mkdir", GetValue: func() float64 { return snapshotter.snapshot().SFTPMkdirTotal }},
+			{Name: "rename", GetValue: func() float64 { return snapshotter.snapshot().SFTPRenameTotal }},
+			{Name: "remove", GetValue: func() float64 { return snapshotter.snapshot().SFTPRemoveTotal }},
+			{Name: "rmdir", GetValue: func() float64 { return snapshotter.snapshot().SFTPRmdirTotal }},
+			{Name: "setstat", GetValue: func() float64 { return snapshotter.snapshot().SFTPSetstatTotal }},
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := appendPlot(statsviz.TimeSeriesPlotConfig{
+		Name:            "sftpguy_sftp_request_latency",
+		Title:           "Average SFTP Request Duration",
+		YAxisTitle:      "milliseconds",
+		YAxisTickSuffix: " ms",
+		InfoText:        "Average SFTP request duration observed since process start.",
+		Series: []statsviz.TimeSeries{
+			{Name: "avg duration", Unitfmt: ".2f", GetValue: func() float64 { return snapshotter.snapshot().SFTPRequestAverageSeconds * 1000 }},
 		},
 	}); err != nil {
 		return nil, err

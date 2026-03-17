@@ -117,10 +117,25 @@ func TestPrometheusMetricsExposeSFTPTraffic(t *testing.T) {
 	if err := stWrite(sftpCli, "probe.txt", payload); err != nil {
 		t.Fatalf("write probe file: %v", err)
 	}
+	if err := sftpCli.Mkdir("/ops"); err != nil {
+		t.Fatalf("mkdir ops dir: %v", err)
+	}
+	if _, err := sftpCli.ReadDir("/"); err != nil {
+		t.Fatalf("list root dir: %v", err)
+	}
+	if _, err := sftpCli.Stat("/probe.txt"); err != nil {
+		t.Fatalf("stat probe file: %v", err)
+	}
+	if _, err := sftpCli.Lstat("/probe.txt"); err != nil {
+		t.Fatalf("lstat probe file: %v", err)
+	}
 
 	reader, err := sftpCli.Open("/probe.txt")
 	if err != nil {
 		t.Fatalf("open probe file for download: %v", err)
+	}
+	if _, err := reader.Stat(); err != nil {
+		t.Fatalf("fstat probe file: %v", err)
 	}
 	readBack, err := io.ReadAll(reader)
 	closeErr := reader.Close()
@@ -133,8 +148,22 @@ func TestPrometheusMetricsExposeSFTPTraffic(t *testing.T) {
 	if string(readBack) != string(payload) {
 		t.Fatalf("unexpected probe payload: got=%q want=%q", string(readBack), string(payload))
 	}
+	now := time.Now()
+	if err := sftpCli.Chtimes("/probe.txt", now, now); err != nil {
+		t.Fatalf("setstat probe file timestamps: %v", err)
+	}
+	if err := sftpCli.Rename("/probe.txt", "/ops/renamed.txt"); err != nil {
+		t.Fatalf("rename probe file: %v", err)
+	}
+	if err := sftpCli.Remove("/ops/renamed.txt"); err != nil {
+		t.Fatalf("remove renamed probe file: %v", err)
+	}
+	if err := sftpCli.RemoveDirectory("/ops"); err != nil {
+		t.Fatalf("remove ops dir: %v", err)
+	}
 
 	metricsBody := scrapeMetricsBody(t, metricsURL)
+	snapshot := srv.metrics.StatsSnapshot()
 
 	requireMetricAtLeast(t, metricsBody, "sftpguy_users_total", nil, 1)
 	requireMetricAtLeast(t, metricsBody, "sftpguy_sessions_total", map[string]string{
@@ -154,6 +183,54 @@ func TestPrometheusMetricsExposeSFTPTraffic(t *testing.T) {
 		"admin":     "false",
 		"banned":    "false",
 	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "list",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "stat",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "lstat",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "mkdir",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "rename",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "remove",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "rmdir",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
+	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_requests_total", map[string]string{
+		"operation": "setstat",
+		"outcome":   "success",
+		"admin":     "false",
+		"banned":    "false",
+	}, 1)
 	requireMetricAtLeast(t, metricsBody, "sftpguy_sftp_transfers_total", map[string]string{
 		"direction": "upload",
 		"admin":     "false",
@@ -174,6 +251,33 @@ func TestPrometheusMetricsExposeSFTPTraffic(t *testing.T) {
 		"admin":     "false",
 		"banned":    "false",
 	}, float64(len(payload)))
+	if snapshot.SFTPListTotal < 1 {
+		t.Fatalf("expected stats snapshot list total to be recorded, got %v", snapshot.SFTPListTotal)
+	}
+	if snapshot.SFTPStatTotal < 1 {
+		t.Fatalf("expected stats snapshot stat total to be recorded, got %v", snapshot.SFTPStatTotal)
+	}
+	if snapshot.SFTPLstatTotal < 1 {
+		t.Fatalf("expected stats snapshot lstat total to be recorded, got %v", snapshot.SFTPLstatTotal)
+	}
+	if snapshot.SFTPMkdirTotal < 1 {
+		t.Fatalf("expected stats snapshot mkdir total to be recorded, got %v", snapshot.SFTPMkdirTotal)
+	}
+	if snapshot.SFTPRenameTotal < 1 {
+		t.Fatalf("expected stats snapshot rename total to be recorded, got %v", snapshot.SFTPRenameTotal)
+	}
+	if snapshot.SFTPRemoveTotal < 1 {
+		t.Fatalf("expected stats snapshot remove total to be recorded, got %v", snapshot.SFTPRemoveTotal)
+	}
+	if snapshot.SFTPRmdirTotal < 1 {
+		t.Fatalf("expected stats snapshot rmdir total to be recorded, got %v", snapshot.SFTPRmdirTotal)
+	}
+	if snapshot.SFTPSetstatTotal < 1 {
+		t.Fatalf("expected stats snapshot setstat total to be recorded, got %v", snapshot.SFTPSetstatTotal)
+	}
+	if snapshot.SFTPRequestAverageSeconds <= 0 {
+		t.Fatalf("expected stats snapshot average request duration to be positive, got %v", snapshot.SFTPRequestAverageSeconds)
+	}
 }
 
 func waitForHTTPOK(t *testing.T, url string, timeout time.Duration) {

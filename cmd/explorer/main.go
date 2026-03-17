@@ -225,11 +225,12 @@ func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.
 // ── directory listing ─────────────────────────────────────────────────────────
 
 type entry struct {
-	Name    string
-	IsDir   bool
-	Size    int64 // File bytes or Directory item count
-	ModTime time.Time
-	URL     template.URL
+	Name     string
+	IsDir    bool
+	IsPublic bool
+	Size     int64 // File bytes or Directory item count
+	ModTime  time.Time
+	URL      template.URL
 }
 
 func (e entry) SizeStr() string {
@@ -244,6 +245,7 @@ func (e entry) SizeStr() string {
 func (e entry) ModTimeStr() string { return e.ModTime.Format("2006-01-02 15:04") }
 
 func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
+	start := time.Now()
 	w.Header().Set("Cache-Control", "no-store")
 
 	csrf := csrfToken(w, r)
@@ -332,6 +334,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		UploadPath string
 		Header     template.HTML
 		Footer     template.HTML
+		RenderTime time.Duration
 	}{
 		Title:      "Index of /" + relPath,
 		DirLabel:   dirLabel,
@@ -347,6 +350,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		UploadPath: upURL.EscapedPath(),
 		Header:     headerHTML,
 		Footer:     footerHTML,
+		RenderTime: time.Since(start),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -367,22 +371,24 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 			continue
 		}
 		name := de.Name()
+		entryPath := filepath.Join(fullPath, name)
 		entRel := filepath.ToSlash(filepath.Join(relPath, name))
 		u := url.URL{Path: "/" + entRel}
 
 		var sizeVal int64
 		if de.IsDir() {
-			sizeVal = countDirItems(filepath.Join(fullPath, name))
+			sizeVal = countDirItems(entryPath)
 		} else {
 			sizeVal = info.Size()
 		}
 
 		out = append(out, entry{
-			Name:    name,
-			IsDir:   de.IsDir(),
-			Size:    sizeVal,
-			ModTime: info.ModTime(),
-			URL:     template.URL(u.EscapedPath()),
+			Name:     name,
+			IsDir:    de.IsDir(),
+			IsPublic: isPublicPath(entryPath),
+			Size:     sizeVal,
+			ModTime:  info.ModTime(),
+			URL:      template.URL(u.EscapedPath()),
 		})
 	}
 	return out, nil
@@ -824,6 +830,18 @@ tr:hover td{background:#f6f8fa}
 
 .col-mod{white-space:nowrap;color:#57606a;width:160px}
 .col-size{white-space:nowrap;color:#57606a;text-align:right;width:110px}
+.dir-link{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:2px 8px;
+  margin-left:-8px;
+  border:1px solid transparent;
+  border-radius:999px;
+}
+.dir-link:hover{text-decoration:none}
+.dir-link-public{background:#dafbe1;border-color:#2da44e}
+.dir-link-public:hover{background:#c2f0cb}
 .dir-tag{color:#57606a;user-select:none}
 .locked-name{color:#57606a}
 .parent-link td{border-bottom:2px solid #d0d7de}
@@ -955,7 +973,10 @@ footer{
 <tr>
   <td class="col-name">
     {{- if .IsDir}}
-      <span class="dir-tag">[DIR]</span>&nbsp;<a href="{{.URL}}">{{.Name}}/</a>
+      <a href="{{.URL}}" class="dir-link{{if .IsPublic}} dir-link-public{{end}}">
+        <span class="dir-tag">[DIR]</span>
+        <span>{{.Name}}/</span>
+      </a>
     {{- else if or $.Unlocked $.IsPublic}}
       <a href="{{.URL}}" download>{{.Name}}</a>
     {{- else}}
@@ -982,6 +1003,7 @@ footer{
 </footer>
 
 {{if .Footer}}{{.Footer}}{{end}}
+<p style="color:#222222ab">Rendered in {{.RenderTime}}</p>
 
 <script>
 const form = document.getElementById('upload-form');
