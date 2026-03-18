@@ -18,7 +18,7 @@ An instance is running at `ftp.neuroky.me`.  Connect to it with:
 Or create a temporary public key:
 
 ```bash
-TMPKEY=$(mktemp nkxxxxx)
+TMPKEY=$(mktemp nkXXXXXXXX)
 ssh-keygen -t ed25519 -N '' -f $TMPKEY
 sftp  -o "PreferredAuthentications=publickey" -i $TMPKEY ftp.neuroky.me
 ```
