@@ -122,6 +122,13 @@ func (r *selfTestRunner) run() SelfTestReport {
 	if r.cfg.SshNoAuth {
 		suites = append(suites, r.runNonOwner("noClientAuth (anon-by-IP)", preexisting, nil))
 	}
+	suites = append(suites, r.runUnrestrictedDirectoryOwnership(
+		"first (pubkey "+firstLabel+")",
+		firstHash,
+		firstAuth,
+		"second (pubkey "+secondLabel+")",
+		secondAuth,
+	))
 	suites = append(suites, r.runResumeUploads("second (pubkey "+secondLabel+")", secondAuth))
 	suites = append(suites, r.runSystemFile(secondAuth))
 	suites = append(suites, r.runAdminSFTP())
@@ -308,6 +315,73 @@ func (r *selfTestRunner) runResumeUploads(label string, auth ssh.AuthMethod) *st
 	s.check("resume folder upload missing child.txt fallback create (put)", stWrite(sftpCli, missingFile, missingFull))
 	r.checkFileContent(s, existingFile, existingUpdated)
 	r.checkFileContent(s, missingFile, missingFull)
+
+	return s
+}
+
+func (r *selfTestRunner) runUnrestrictedDirectoryOwnership(ownerLabel, ownerHash string, ownerAuth ssh.AuthMethod, otherLabel string, otherAuth ssh.AuthMethod) *stSuite {
+	s := r.startSuite("Unrestricted dir ownership (/public)")
+	defer r.finishSuite(s)
+
+	publicFile := path.Join("public", "selftest_public_"+stRandHex()+".txt")
+	initial := []byte("public owner v1\n")
+	updated := []byte("public owner v2\n")
+
+	publicOwner, err := r.srv.store.GetFileOwner("public")
+	s.check("lookup /public owner", err)
+	s.assert("/public is system-owned", err == nil && publicOwner == systemOwner)
+
+	ownerSSH, ownerSFTP, err := r.openSFTP(ownerAuth)
+	s.check("connect owner ("+ownerLabel+")", err)
+	if err != nil {
+		return s
+	}
+	defer ownerSFTP.Close()
+	defer ownerSSH.Close()
+
+	cleanupNeeded := false
+	defer func() {
+		if cleanupNeeded {
+			_ = ownerSFTP.Remove(publicFile)
+		}
+	}()
+
+	r.checkWrite(s, ownerSFTP, publicFile, initial, true)
+	cleanupNeeded = true
+	r.checkFileContent(s, publicFile, initial)
+
+	trackedOwner, err := r.srv.store.GetFileOwner(publicFile)
+	s.check("lookup /public file owner after create", err)
+	s.assert("/public file is owned by creator", err == nil && trackedOwner == ownerHash)
+
+	otherSSH, otherSFTP, err := r.openSFTP(otherAuth)
+	s.check("connect non-owner ("+otherLabel+")", err)
+	if err != nil {
+		return s
+	}
+	defer otherSFTP.Close()
+	defer otherSSH.Close()
+
+	r.checkWrite(s, otherSFTP, publicFile, []byte("non-owner overwrite\n"), false)
+	r.checkFileContent(s, publicFile, initial)
+	trackedOwner, err = r.srv.store.GetFileOwner(publicFile)
+	s.check("lookup /public file owner after non-owner write", err)
+	s.assert("/public file owner unchanged after non-owner write", err == nil && trackedOwner == ownerHash)
+
+	r.checkDelete(s, otherSFTP, publicFile, false)
+	r.checkFileContent(s, publicFile, initial)
+	trackedOwner, err = r.srv.store.GetFileOwner(publicFile)
+	s.check("lookup /public file owner after non-owner delete", err)
+	s.assert("/public file owner unchanged after non-owner delete", err == nil && trackedOwner == ownerHash)
+
+	r.checkWrite(s, ownerSFTP, publicFile, updated, true)
+	r.checkFileContent(s, publicFile, updated)
+
+	r.checkDelete(s, ownerSFTP, publicFile, true)
+	if _, statErr := os.Stat(r.local(publicFile)); os.IsNotExist(statErr) {
+		cleanupNeeded = false
+	}
+	s.assert("/public file metadata removed after owner delete", !r.srv.store.FileExistsInDB(publicFile))
 
 	return s
 }

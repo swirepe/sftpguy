@@ -9,7 +9,9 @@ import (
 	"time"
 )
 
-func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
+func startPermissionsTestServer(t *testing.T, name string) (*Server, *selfTestRunner) {
+	t.Helper()
+
 	port := testFreeTCPPort(t)
 	tmpDir := t.TempDir()
 
@@ -19,7 +21,7 @@ func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
 	}
 
 	cfg := Config{
-		Name:                 "sftpguy-public-rename-test",
+		Name:                 name,
 		Port:                 port,
 		HostKeyFile:          filepath.Join(tmpDir, "id_ed25519"),
 		DBPath:               filepath.Join(tmpDir, "sftp.db"),
@@ -73,6 +75,16 @@ func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
 		t.Fatal("server did not become ready within timeout")
 	}
 
+	return srv, &selfTestRunner{
+		srv: srv,
+		cfg: cfg,
+		log: logger.WithGroup("test"),
+	}
+}
+
+func requireSystemOwnedPublicDir(t *testing.T, srv *Server) {
+	t.Helper()
+
 	publicOwner, err := srv.store.GetFileOwner("public")
 	if err != nil {
 		t.Fatalf("get public owner: %v", err)
@@ -80,12 +92,11 @@ func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
 	if publicOwner != systemOwner {
 		t.Fatalf("expected public directory to be system-owned, got %q", publicOwner)
 	}
+}
 
-	runner := &selfTestRunner{
-		srv: srv,
-		cfg: cfg,
-		log: logger.WithGroup("test"),
-	}
+func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
+	srv, runner := startPermissionsTestServer(t, "sftpguy-public-rename-test")
+	requireSystemOwnedPublicDir(t, srv)
 
 	auth, _, ownerHash := runner.newPubKeyAuth()
 	sshCli, sftpCli, err := runner.openSFTP(auth)
@@ -135,5 +146,95 @@ func TestSFTPRenameOwnFileInPublicDirectory(t *testing.T) {
 	}
 	if srv.store.FileExistsInDB(original) {
 		t.Fatal("expected old path metadata to be removed after rename")
+	}
+}
+
+func TestSFTPOwnershipEnforcedInPublicDirectory(t *testing.T) {
+	srv, runner := startPermissionsTestServer(t, "sftpguy-public-ownership-test")
+	requireSystemOwnedPublicDir(t, srv)
+
+	ownerAuth, _, ownerHash := runner.newPubKeyAuth()
+	otherAuth, _, _ := runner.newPubKeyAuth()
+
+	ownerSSH, ownerSFTP, err := runner.openSFTP(ownerAuth)
+	if err != nil {
+		t.Fatalf("open owner sftp: %v", err)
+	}
+	defer ownerSSH.Close()
+	defer ownerSFTP.Close()
+
+	otherSSH, otherSFTP, err := runner.openSFTP(otherAuth)
+	if err != nil {
+		t.Fatalf("open non-owner sftp: %v", err)
+	}
+	defer otherSSH.Close()
+	defer otherSFTP.Close()
+
+	publicPath := "public/owned-" + stRandHex() + ".txt"
+	fullPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(publicPath))
+	initial := []byte("hello public")
+	updated := []byte("updated by owner")
+
+	if err := stWrite(ownerSFTP, publicPath, initial); err != nil {
+		t.Fatalf("write user-owned file in public/: %v", err)
+	}
+
+	owner, err := srv.store.GetFileOwner(publicPath)
+	if err != nil {
+		t.Fatalf("get file owner after create: %v", err)
+	}
+	if owner != ownerHash {
+		t.Fatalf("unexpected owner after create: got=%q want=%q", owner, ownerHash)
+	}
+
+	if err := stWrite(otherSFTP, publicPath, []byte("intruder overwrite")); err == nil {
+		t.Fatal("expected non-owner overwrite in public/ to be denied")
+	}
+
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatalf("read public file after non-owner overwrite attempt: %v", err)
+	}
+	if string(data) != string(initial) {
+		t.Fatalf("unexpected file contents after non-owner overwrite attempt: got=%q want=%q", string(data), string(initial))
+	}
+
+	owner, err = srv.store.GetFileOwner(publicPath)
+	if err != nil {
+		t.Fatalf("get file owner after non-owner overwrite attempt: %v", err)
+	}
+	if owner != ownerHash {
+		t.Fatalf("unexpected owner after non-owner overwrite attempt: got=%q want=%q", owner, ownerHash)
+	}
+
+	if err := otherSFTP.Remove(publicPath); err == nil {
+		t.Fatal("expected non-owner delete in public/ to be denied")
+	}
+
+	if _, err := os.Stat(fullPath); err != nil {
+		t.Fatalf("expected public file to remain after non-owner delete attempt, got err=%v", err)
+	}
+
+	if err := stWrite(ownerSFTP, publicPath, updated); err != nil {
+		t.Fatalf("owner overwrite in public/: %v", err)
+	}
+
+	data, err = os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatalf("read public file after owner overwrite: %v", err)
+	}
+	if string(data) != string(updated) {
+		t.Fatalf("unexpected file contents after owner overwrite: got=%q want=%q", string(data), string(updated))
+	}
+
+	if err := ownerSFTP.Remove(publicPath); err != nil {
+		t.Fatalf("owner delete in public/: %v", err)
+	}
+
+	if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
+		t.Fatalf("expected public file to be removed after owner delete, got err=%v", err)
+	}
+	if srv.store.FileExistsInDB(publicPath) {
+		t.Fatal("expected deleted public file metadata to be removed from the database")
 	}
 }

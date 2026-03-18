@@ -798,6 +798,9 @@ tr:hover td{background:#f6f8fa}
   .col-name { width: 60%; }
   .col-mod  { width: 160px; }
   .col-size { width: 100px; text-align: right; }
+  .dir-tag {
+    text-wrap: nowrap;
+  }
 }
 
 /* MOBILE TWEAKS (Screens 650px and below) */
