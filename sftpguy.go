@@ -69,7 +69,7 @@ import (
 //go:generate go run . -update-version
 //go:embed VERSION
 //go:embed go.mod go.sum
-//go:embed fortunes.txt bad_files.txt
+//go:embed README.md fortunes.txt bad_files.txt
 //go:embed admin_ui internal cmd
 //go:embed *.go
 var embeddedSource embed.FS
