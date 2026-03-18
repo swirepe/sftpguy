@@ -25,7 +25,7 @@ sftp  -o "PreferredAuthentications=publickey" -i $TMPKEY ftp.neuroky.me
 
 Or if you want to use a password:
 
-   sftp -o "PreferredAuthentications=keyboard-interactive" ftp.neuroky.me
+    sftp -o "PreferredAuthentications=keyboard-interactive" ftp.neuroky.me
 
 These are all different ways to access the same archive.  A web-based version (source at [cmd/explorer/main.go](cmd/explorer/main.go)) is running at [https://ftp.neuroky.me/](https://ftp.neuroky.me/).
 
