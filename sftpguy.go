@@ -203,6 +203,16 @@ var migrations = []Migration{
 		Column:    "last_address",
 		ColumnDef: "TEXT DEFAULT NULL",
 	},
+	AddColumn{
+		Table:     "users",
+		Column:    "seen",
+		ColumnDef: "INTEGER DEFAULT 0",
+	},
+	AddColumn{
+		Table:     "files",
+		Column:    "downloads",
+		ColumnDef: "INTEGER DEFAULT 0",
+	},
 }
 
 // ============================================================================
@@ -1599,7 +1609,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 
 		case "exec":
 			s.logExec(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
-
+			s.PurgeSshdBot(pubHash, sConn.RemoteAddr(), req.Payload)
 			req.Reply(false, nil)
 
 		default:
@@ -1609,6 +1619,46 @@ func (s *Server) handleChannel(ch ssh.Channel,
 		}
 
 	}
+}
+
+var sshdPathRegex = regexp.MustCompile(`\./\.\d+/sshd`)
+var ipRegex = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
+
+func (s *Server) PurgeSshdBot(pubHash string, remoteAddr net.Addr, payload []byte) {
+	/*
+	   time=2026-03-18T12:02:45.587-05:00 level=WARN msg=exec cmd="chmod +x ./.4697738884435969277/sshd;nohup ./.4697738884435969277/sshd 1.165.130.37 137.184.53.92 154.211.13.102 103.39.222.143 159.203.108.39 124.112.194.91 120.209.186.110 1.62.252.20 160.177.201.24 154.91.170.41 83.168.105.145 143.110.247.87 196.70.225.173 154.82.73.111 49.233.95.165 51.210.149.136 50.6.231.155 45.118.144.36 180.76.105.108 51.15.19.10 80.71.149.196 161.97.84.142 183.94.33.160 103.147.14.179 170.150.255.26 23.165.104.184 180.76.137.24 125.212.248.44 221.213.196.23 106.15.108.69 45.81.23.49 107.158.163.112 50.6.231.169 43.224.248.178 103.143.11.137 42.51.49.239 144.91.125.113 180.163.61.238 159.203.35.6 218.29.176.225 122.10.115.18 114.218.57.21 62.60.213.108 45.148.119.184 134.209.236.64 121.28.170.66 125.74.128.224 69.87.207.133 203.189.196.168 111.203.190.237 49.72.111.25 &" user.id=anon-auth:2ad14294e8 user.uid=1456726645 user.session=e7701077931b3818 user.remote_address=113.201.153.165:50474 user.hash_banned=false user.ip_banned=false
+	*/
+	/*
+		There's a bot that keeps trying to start its own sshd.  When this happens
+		1. get the path of the ssh they are using (\.\d+\sshd)
+		2. add it to the bad list (s.store.badFileList.AddFile())
+		3. block that host's range and the ip addresses it tries to call back to
+		4. delete that user and files
+	*/
+	var cmd struct{ Value string }
+	ssh.Unmarshal(payload, &cmd)
+
+	sshdPath := sshdPathRegex.FindString(cmd.Value)
+	if sshdPath == "" {
+		return
+	}
+	absPath := filepath.Join(s.absUploadDir, sshdPath)
+	if _, err := os.Stat(absPath); err != nil {
+		return
+	}
+	ips := ipRegex.FindAllString(cmd.Value, -1)
+	if len(ips) == 0 {
+		return
+	}
+	// if you've gotten here, you are sshdbot
+	s.logger.Info("sshdbot detected", "path", sshdPath, "ips", ips)
+	comment := fmt.Sprintf("[sshdbot] %s ips: %d", time.Now(), len(ips))
+	s.store.blacklist.AddWithComment(comment, ips...)
+	host, _, _ := net.SplitHostPort(remoteAddr.String())
+	s.store.blacklist.AddRange(host, 24, comment)
+	s.store.badFileList.AddFile(absPath)
+	s.PurgeUser(pubHash)
+
 }
 
 func (s *Server) userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {

@@ -105,6 +105,39 @@ func (bl *IPList) performReload(lastReload ipReloadResult, lastChanged *time.Tim
 	return lastReload, *lastChanged
 }
 
+func (bl *IPList) AddWithComment(comment string, ips ...string) {
+	if len(ips) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+	cleanComment := strings.ReplaceAll(comment, "\n", " ")
+
+	if len(ips) == 1 {
+		sb.WriteString(fmt.Sprintf("%s # %s\n", ips[0], cleanComment))
+	} else {
+		sb.WriteString(fmt.Sprintf("# %s\n", cleanComment))
+		for _, ip := range ips {
+			sb.WriteString(ip + "\n")
+		}
+	}
+
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	f, err := os.OpenFile(bl.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		f.WriteString(sb.String())
+
+		// Signal reload
+		select {
+		case bl.addlineChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // AddRange adds a new IP or CIDR to the file and triggers a reload.
 func (bl *IPList) AddRange(host string, mask int, comment string) error {
 	// Construct CIDR string
@@ -170,6 +203,8 @@ func (bl *IPList) Stop() {
 }
 
 func (bl *IPList) Reload() (entries int, addresses uint64, err error) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
 	newRanger := cidranger.NewPCTrieRanger()
 
 	file, err := os.Open(bl.filepath)
