@@ -798,8 +798,11 @@ tr:hover td{background:#f6f8fa}
   .col-name { width: 60%; }
   .col-mod  { width: 160px; }
   .col-size { width: 100px; text-align: right; }
-  .dir-tag {
+  .dir-tag-desktop {
     text-wrap: nowrap;
+  }
+  .dir-tag-mobile {
+    display: none;
   }
 }
 
@@ -825,9 +828,13 @@ tr:hover td{background:#f6f8fa}
     font-size: 14px;
   }
 
-  /* Make the [DIR] tag less prominent to save space */
-  .dir-tag {
-    font-size: 11px;
+  .dir-tag-desktop {
+    display: none;
+  }
+  .dir-tag-mobile {
+    display: inline;
+    font-size: 14px;
+    line-height: 1;
   }
 }
 
@@ -845,7 +852,13 @@ tr:hover td{background:#f6f8fa}
 .dir-link:hover{text-decoration:none}
 .dir-link-public{background:#dafbe1;border-color:#2da44e}
 .dir-link-public:hover{background:#c2f0cb}
-.dir-tag{color:#57606a;user-select:none}
+.dir-tag{
+  color:#57606a;
+  user-select:none;
+  display:inline-flex;
+  align-items:center;
+}
+.dir-tag-mobile{display:none}
 .locked-name{color:#57606a}
 .parent-link td{border-bottom:2px solid #d0d7de}
 .parent-link:hover td{background:#f6f8fa}
@@ -977,7 +990,8 @@ footer{
   <td class="col-name">
     {{- if .IsDir}}
       <a href="{{.URL}}" class="dir-link{{if .IsPublic}} dir-link-public{{end}}">
-        <span class="dir-tag">[DIR]</span>
+        <span class="dir-tag dir-tag-desktop">[DIR]</span>
+        <span class="dir-tag dir-tag-mobile" aria-hidden="true">&#128193;</span>
         <span>{{.Name}}/</span>
       </a>
     {{- else if or $.Unlocked $.IsPublic}}
