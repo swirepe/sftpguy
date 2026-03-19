@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
@@ -63,14 +64,12 @@ func main() {
 
 	maxFileSize = maxSizeMB << 20
 
-	// Load optional header/footer fragments.
 	if headerPath != "" {
 		b, err := os.ReadFile(headerPath)
 		if err != nil {
 			log.Fatalf("read header file %q: %v", headerPath, err)
 		}
 		headerHTML = template.HTML(b)
-		log.Printf("header fragment loaded from %s (%d bytes)", headerPath, len(b))
 	}
 	if footerPath != "" {
 		b, err := os.ReadFile(footerPath)
@@ -78,7 +77,6 @@ func main() {
 			log.Fatalf("read footer file %q: %v", footerPath, err)
 		}
 		footerHTML = template.HTML(b)
-		log.Printf("footer fragment loaded from %s (%d bytes)", footerPath, len(b))
 	}
 
 	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -102,11 +100,28 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, http.HandlerFunc(logMiddleware)))
 }
 
-// ── logging middleware ────────────────────────────────────────────────────────
+// ── logging & security middleware ─────────────────────────────────────────────
 
 func logMiddleware(w http.ResponseWriter, r *http.Request) {
+	// Generate a random nonce for this request
+	nonce := generateNonce()
+
+	// Update CSP to allow scripts only with this specific nonce
+	csp := fmt.Sprintf("default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-%s';", nonce)
+	w.Header().Set("Content-Security-Policy", csp)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+
 	log.Printf("[%s] %s %s %s", clientIP(r), r.Method, r.URL.Path, r.URL.RawQuery)
-	handle(w, r)
+
+	// Pass nonce through request context or just handle it directly
+	handle(w, r, nonce)
+}
+
+func generateNonce() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func clientIP(r *http.Request) string {
@@ -122,7 +137,7 @@ func clientIP(r *http.Request) string {
 
 // ── routing ───────────────────────────────────────────────────────────────────
 
-func handle(w http.ResponseWriter, r *http.Request) {
+func handle(w http.ResponseWriter, r *http.Request, nonce string) {
 	if isCrossOrigin(r) {
 		ext := strings.ToLower(filepath.Ext(r.URL.Path))
 		if ext != "" && ext != ".html" {
@@ -141,7 +156,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		handleGET(w, r, fullPath, relPath)
+		handleGET(w, r, fullPath, relPath, nonce)
 	case http.MethodPost:
 		handlePOST(w, r, fullPath, relPath)
 	default:
@@ -182,7 +197,7 @@ func isUnderRoot(fullPath string) bool {
 
 // ── GET handler ───────────────────────────────────────────────────────────────
 
-func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
+func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -194,13 +209,11 @@ func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath string)
 	}
 
 	if info.IsDir() {
-		serveDir(w, r, fullPath, relPath)
+		serveDir(w, r, fullPath, relPath, nonce)
 	} else {
 		serveFile(w, r, fullPath, info, relPath)
 	}
 }
-
-// ── file download ─────────────────────────────────────────────────────────────
 
 func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.FileInfo, relPath string) {
 	if !isUnlocked(r) && !isPublicPath(fullPath) {
@@ -217,8 +230,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.
 		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
-	w.Header().Set("Content-Disposition",
-		"attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
+	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
 	http.ServeFile(w, r, fullPath)
 }
 
@@ -228,7 +240,7 @@ type entry struct {
 	Name     string
 	IsDir    bool
 	IsPublic bool
-	Size     int64 // File bytes or Directory item count
+	Size     int64
 	ModTime  time.Time
 	URL      template.URL
 }
@@ -244,7 +256,7 @@ func (e entry) SizeStr() string {
 }
 func (e entry) ModTimeStr() string { return e.ModTime.Format("2006-01-02 15:04") }
 
-func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
+func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
 	start := time.Now()
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -307,18 +319,6 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		return " ▼"
 	}
 
-	dirLabel := "root"
-	if relPath != "" {
-		dirLabel = relPath
-	}
-
-	// Generate a clean UploadPath
-	upURL := url.URL{Path: "/" + relPath}
-
-	// Pass whether this directory itself is under /public so the template
-	// can render file links without the lock treatment.
-	isPublicDir := isPublicPath(fullPath)
-
 	data := struct {
 		Title      string
 		DirLabel   string
@@ -329,6 +329,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		IsPublic   bool
 		WantedFile string
 		CSRFToken  string
+		Nonce      string
 		SortLink   func(string) template.URL
 		Arrow      func(string) string
 		UploadPath string
@@ -336,27 +337,31 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath string) 
 		Footer     template.HTML
 		RenderTime time.Duration
 	}{
-		Title:      "Index of /" + relPath,
-		DirLabel:   dirLabel,
+		Title: "Index of /" + relPath,
+		DirLabel: func() string {
+			if relPath == "" {
+				return "root"
+			}
+			return relPath
+		}(),
 		Crumbs:     buildCrumbs(relPath),
 		ParentURL:  parentURL,
 		Entries:    entries,
 		Unlocked:   isUnlocked(r),
-		IsPublic:   isPublicDir,
+		IsPublic:   isPublicPath(fullPath),
 		WantedFile: wantedFile,
 		CSRFToken:  csrf,
+		Nonce:      nonce,
 		SortLink:   sortLink,
 		Arrow:      arrow,
-		UploadPath: upURL.EscapedPath(),
+		UploadPath: (&url.URL{Path: "/" + relPath}).EscapedPath(),
 		Header:     headerHTML,
 		Footer:     footerHTML,
 		RenderTime: time.Since(start),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.Execute(w, data); err != nil {
-		log.Printf("template error: %v", err)
-	}
+	_ = tmpl.Execute(w, data)
 }
 
 func readDir(fullPath, relPath string) ([]entry, error) {
@@ -370,10 +375,8 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 		if err != nil {
 			continue
 		}
-		name := de.Name()
-		entryPath := filepath.Join(fullPath, name)
-		entRel := filepath.ToSlash(filepath.Join(relPath, name))
-		u := url.URL{Path: "/" + entRel}
+		entryPath := filepath.Join(fullPath, de.Name())
+		entRel := filepath.ToSlash(filepath.Join(relPath, de.Name()))
 
 		var sizeVal int64
 		if de.IsDir() {
@@ -383,24 +386,19 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 		}
 
 		out = append(out, entry{
-			Name:     name,
+			Name:     de.Name(),
 			IsDir:    de.IsDir(),
 			IsPublic: isPublicPath(entryPath),
 			Size:     sizeVal,
 			ModTime:  info.ModTime(),
-			URL:      template.URL(u.EscapedPath()),
+			URL:      template.URL((&url.URL{Path: "/" + entRel}).EscapedPath()),
 		})
 	}
 	return out, nil
 }
 
-// countDirItems returns the number of immediate children in a directory.
-// Faster than a recursive walk.
 func countDirItems(path string) int64 {
-	des, err := os.ReadDir(path)
-	if err != nil {
-		return 0
-	}
+	des, _ := os.ReadDir(path)
 	return int64(len(des))
 }
 
@@ -408,7 +406,7 @@ func sortEntries(entries []entry, by, order string) {
 	sort.SliceStable(entries, func(i, j int) bool {
 		a, b := entries[i], entries[j]
 		if a.IsDir != b.IsDir {
-			return a.IsDir // dirs first
+			return a.IsDir
 		}
 		var less bool
 		switch by {
@@ -416,7 +414,7 @@ func sortEntries(entries []entry, by, order string) {
 			less = a.Size < b.Size
 		case "modified":
 			less = a.ModTime.Before(b.ModTime)
-		default: // "name"
+		default:
 			less = strings.ToLower(a.Name) < strings.ToLower(b.Name)
 		}
 		if order == "desc" {
@@ -446,10 +444,9 @@ func buildCrumbs(relPath string) []crumb {
 			continue
 		}
 		acc += "/" + p
-		u := url.URL{Path: acc}
 		crumbs = append(crumbs, crumb{
 			Name:      p,
-			URL:       template.URL(u.EscapedPath()),
+			URL:       template.URL((&url.URL{Path: acc}).EscapedPath()),
 			IsCurrent: i == len(parts)-1,
 		})
 	}
@@ -460,30 +457,31 @@ func buildCrumbs(relPath string) []crumb {
 
 func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
 	ip := clientIP(r)
-
-	info, err := os.Stat(fullPath)
-	if err != nil || !info.IsDir() {
-		http.Error(w, "Not a directory", http.StatusBadRequest)
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	mr, err := r.MultipartReader()
 	if err != nil {
-		http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 
-	csrfPart, err := mr.NextPart()
-	if err != nil || csrfPart.FormName() != "csrf_token" {
-		log.Printf("[%s] UPLOAD REJECTED: missing csrf part", ip)
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
+	var csrfValid bool
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			log.Printf("[%s] UPLOAD REJECTED: no csrf", ip)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if part.FormName() == "csrf_token" {
+			tokenBytes, _ := io.ReadAll(io.LimitReader(part, 128))
+			csrfValid = validateCSRF(r, string(tokenBytes))
+			part.Close()
+			break
+		}
+		part.Close()
 	}
-	tokenBytes, _ := io.ReadAll(io.LimitReader(csrfPart, 128))
-	csrfPart.Close()
-	if !validateCSRF(r, string(tokenBytes)) {
-		log.Printf("[%s] UPLOAD REJECTED: invalid csrf token", ip)
+
+	if !csrfValid {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
@@ -493,41 +491,31 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieUnlock,
-		Value:    "true",
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   86400 * 30,
-		SameSite: http.SameSiteStrictMode,
+		Name: cookieUnlock, Value: "true", Path: "/",
+		HttpOnly: true, MaxAge: 86400 * 30, SameSite: http.SameSiteStrictMode,
 	})
-
-	target := "/" + filepath.ToSlash(relPath)
-	http.Redirect(w, r, target, http.StatusSeeOther)
+	http.Redirect(w, r, "/"+filepath.ToSlash(relPath), http.StatusSeeOther)
 }
 
 func streamParts(mr *multipart.Reader, destDir, ip string) error {
 	topRemap := map[string]string{}
-
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			// This happens if the connection is dropped or MaxBytesReader is triggered
-			return fmt.Errorf("multipart stream interrupted: %w", err)
+			return err
 		}
 
 		rawName := partFilename(part)
 		if rawName == "" {
-			io.Copy(io.Discard, part)
 			part.Close()
 			continue
 		}
 
 		cleanRel := filepath.FromSlash(filepath.Clean("/" + filepath.ToSlash(rawName)))
 		cleanRel = strings.TrimPrefix(cleanRel, string(filepath.Separator))
-
 		segments := strings.SplitN(cleanRel, string(filepath.Separator), 2)
 		topName := segments[0]
 		isNested := len(segments) == 2
@@ -535,15 +523,12 @@ func streamParts(mr *multipart.Reader, destDir, ip string) error {
 		var finalRel string
 		if isNested {
 			if _, ok := topRemap[topName]; !ok {
-				want := filepath.Join(destDir, topName)
-				unique := uniqueDirPath(want)
-				topRemap[topName] = filepath.Base(unique)
-				if err := os.MkdirAll(unique, 0755); err != nil {
-					log.Printf("[%s] MKDIR %q: %v", ip, unique, err)
-					io.Copy(io.Discard, part)
+				actual, err := atomicMkdirUnique(filepath.Join(destDir, topName))
+				if err != nil {
 					part.Close()
 					continue
 				}
+				topRemap[topName] = filepath.Base(actual)
 			}
 			finalRel = filepath.Join(topRemap[topName], segments[1])
 		} else {
@@ -551,29 +536,14 @@ func streamParts(mr *multipart.Reader, destDir, ip string) error {
 		}
 
 		destPath := filepath.Join(destDir, finalRel)
-
 		if !isUnderRoot(destPath) {
-			log.Printf("[%s] UPLOAD SKIP (traversal): %q", ip, rawName)
-			io.Copy(io.Discard, part)
 			part.Close()
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			log.Printf("[%s] MKDIR parent: %v", ip, err)
-			io.Copy(io.Discard, part)
-			part.Close()
-			continue
-		}
-
-		if !isNested {
-			destPath = uniqueFilePath(destPath)
-		}
-
-		log.Printf("[%s] UPLOAD %q → %q", ip, rawName, destPath)
-		if err := writeFile(part, destPath); err != nil {
-			part.Close()
-			return err
+		os.MkdirAll(filepath.Dir(destPath), 0755)
+		if err := writeFileAtomic(part, destPath, !isNested); err != nil {
+			log.Printf("[%s] WRITE ERR: %v", ip, err)
 		}
 		part.Close()
 	}
@@ -589,112 +559,73 @@ func partFilename(p *multipart.Part) string {
 	if name == "" {
 		return ""
 	}
-	base := filepath.Base(filepath.Clean("/" + filepath.ToSlash(name)))
-	if base == "." || base == string(filepath.Separator) {
-		return ""
-	}
 	return name
 }
 
-func writeFile(r io.Reader, path string) (err error) {
-	f, err := os.Create(path)
+func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (err error) {
+	var f *os.File
+	if !uniqueNaming {
+		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	} else {
+		dir, base := filepath.Split(path)
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+		for i := 1; i < 1000 && errors.Is(err, os.ErrExist); i++ {
+			f, err = os.OpenFile(filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+		}
+	}
 	if err != nil {
 		return err
 	}
-
-	// We use a closure in defer to capture the state of 'err'
-	// at the moment the function returns.
 	defer func() {
 		f.Close()
 		if err != nil {
-			log.Printf("[CLEAN] error occurred during copy, remove the incomplete file: %s, %v", path, err)
-			os.Remove(path)
+			os.Remove(f.Name())
 		}
 	}()
-
 	_, err = io.Copy(f, r)
 	return err
 }
 
-func uniqueFilePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
+func atomicMkdirUnique(path string) (string, error) {
+	if err := os.Mkdir(path, 0755); err == nil {
+		return path, nil
 	}
-	dir, base := filepath.Split(path)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-	for i := 1; ; i++ {
-		candidate := filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+	for i := 1; i < 1000; i++ {
+		cand := fmt.Sprintf("%s (%d)", path, i)
+		if err := os.Mkdir(cand, 0755); err == nil {
+			return cand, nil
 		}
 	}
+	return "", errors.New("mkdir collision")
 }
-
-func uniqueDirPath(path string) string {
-	path = filepath.Clean(path)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	parent := filepath.Dir(path)
-	base := filepath.Base(path)
-	for i := 1; ; i++ {
-		candidate := filepath.Join(parent, fmt.Sprintf("%s (%d)", base, i))
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
-}
-
-// ── CSRF ──────────────────────────────────────────────────────────────────────
 
 func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	if c, err := r.Cookie(cookieCSRF); err == nil && len(c.Value) == 64 {
 		return c.Value
 	}
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
+	rand.Read(b)
 	token := hex.EncodeToString(b)
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieCSRF,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true, // Server-side template handles embedding the token
-		MaxAge:   86400 * 30,
-		SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, &http.Cookie{Name: cookieCSRF, Value: token, Path: "/", HttpOnly: true, MaxAge: 86400 * 30, SameSite: http.SameSiteStrictMode})
 	return token
 }
 
 func validateCSRF(r *http.Request, formToken string) bool {
 	c, err := r.Cookie(cookieCSRF)
-	if err != nil || c.Value == "" {
-		return false
-	}
-	return formToken != "" && c.Value == formToken
+	return err == nil && c.Value != "" && formToken == c.Value
 }
-
-// ── unlock cookie ─────────────────────────────────────────────────────────────
 
 func isUnlocked(r *http.Request) bool {
 	c, err := r.Cookie(cookieUnlock)
 	return err == nil && c.Value == "true"
 }
 
-// isPublicPath returns true when fullPath is the /public directory itself
-// or any file/subdirectory nested within it.
 func isPublicPath(fullPath string) bool {
-	publicRoot := filepath.Join(rootDir, "public")
-	rel, err := filepath.Rel(publicRoot, fullPath)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, "..")
+	rel, err := filepath.Rel(filepath.Join(rootDir, "public"), fullPath)
+	return err == nil && !strings.HasPrefix(rel, "..")
 }
-
-// ── formatting ────────────────────────────────────────────────────────────────
 
 func fmtBytes(b int64) string {
 	if b < 1024 {
@@ -721,234 +652,87 @@ const pageHTML = `<!DOCTYPE html>
 <style>
 *,*::before,*::after{box-sizing:border-box}
 body{
-  font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
-  font-size:14px;line-height:1.6;
-  margin:0;padding:24px 32px;
-  background:#fff;color:#1a1a1a;
-  max-width:980px;
+  font-family:ui-monospace,Menlo,monospace; font-size:14px; line-height:1.6;
+  margin:0; padding:24px 32px; background:#fff; color:#1a1a1a; max-width:980px;
 }
-a{color:#0550ae;text-decoration:none}
+a{color:#0550ae; text-decoration:none}
 a:hover{text-decoration:underline}
-
-.bc{font-size:13px;color:#57606a;margin-bottom:14px}
-.bc a{color:#57606a}.bc a:hover{color:#0550ae}
-.bc .sep{margin:0 3px;opacity:.5}
-.bc .cur{color:#1a1a1a;font-weight:600}
-
-h1{font-size:15px;font-weight:700;margin:0 0 6px}
-hr{border:none;border-top:1px solid #d0d7de;margin:0 0 14px}
-
-.banner{
-  background:#fff8c5;border:1px solid #d4a72c;
-  border-radius:4px;padding:10px 14px;
-  margin-bottom:14px;font-size:13px;
-}
-.banner strong{color:#7a4900}
-.banner-public{
-  background:#dafbe1;border-color:#2da44e;color:#1a7f37;font-weight:600;
-}
-
-.table-wrapper {
-  width: 100%;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-bottom: 24px;
-  /* Fixed layout only applies to desktop (see media query below) */
-  table-layout: auto; 
-}
-
-th, td {
-  padding: 8px 12px 8px 0;
-  border-bottom: 1px solid #eaeef2;
-  vertical-align: top;
-  text-align: left;
-}
-
-th{
-  text-align:left;padding:5px 16px 5px 0;
-  border-bottom:2px solid #d0d7de;
-  font-weight:700;white-space:nowrap;font-size:13px;
-}
-th a{color:#1a1a1a}
-th a:hover{color:#0550ae;text-decoration:none}
-td{
-  padding:4px 16px 4px 0;
-  border-bottom:1px solid #eaeef2;
-  vertical-align:top;
-  word-wrap: break-word;
-}
-tr:last-child td{border-bottom:none}
+.bc{font-size:13px; color:#57606a; margin-bottom:14px}
+.bc a{color:#57606a} .bc .sep{margin:0 3px; opacity:.5} .bc .cur{color:#1a1a1a; font-weight:600}
+h1{font-size:15px; font-weight:700; margin:0 0 6px}
+hr{border:none; border-top:1px solid #d0d7de; margin:0 0 14px}
+.banner{ background:#fff8c5; border:1px solid #d4a72c; border-radius:4px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+.banner-public{ background:#dafbe1; border-color:#2da44e; color:#1a7f37; font-weight:600; }
+table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
+th, td { padding: 8px 12px 8px 0; border-bottom: 1px solid #eaeef2; vertical-align: top; text-align: left; }
+th{ border-bottom:2px solid #d0d7de; font-weight:700; font-size:13px; white-space:nowrap; }
 tr:hover td{background:#f6f8fa}
-.col-name {
-  /* overflow-wrap is more modern than word-wrap */
-  overflow-wrap: break-word;
-  word-wrap: break-word;
-  word-break: break-all; /* Ensures long strings without dots/dashes also break */
-}
+.col-name { overflow-wrap: break-word; word-break: break-all; }
 
-/* DESKTOP TWEAKS (Screens wider than 650px) */
+/* Responsive Visibility Fixes */
+.dir-tag-desktop { display: inline; color:#57606a; user-select:none; text-wrap: nowrap; }
+.dir-tag-mobile  { display: none; }
+
 @media (min-width: 651px) {
-  table {
-    table-layout: fixed;
-  }
+  table { table-layout: fixed; }
   .col-name { width: 60%; }
   .col-mod  { width: 160px; }
   .col-size { width: 100px; text-align: right; }
-  .dir-tag-desktop {
-    text-wrap: nowrap;
-  }
-  .dir-tag-mobile {
-    display: none;
-  }
 }
 
-/* MOBILE TWEAKS (Screens 650px and below) */
 @media (max-width: 650px) {
-  /* Hide the "Last Modified" column to save horizontal space */
-  .col-mod {
-    display: none;
-  }
-  
-  th, td {
-    padding: 10px 8px 10px 0; /* Slightly larger tap targets */
-  }
-
-  .col-size {
-    text-align: right;
-    white-space: nowrap;
-    width: 80px;
-    font-size: 12px; /* Smaller font for meta info */
-  }
-  
-  .col-name {
-    font-size: 14px;
-  }
-
-  .dir-tag-desktop {
-    display: none;
-  }
-  .dir-tag-mobile {
-    display: inline;
-    font-size: 14px;
-    line-height: 1;
-  }
+  .col-mod { display: none; }
+  .col-size { text-align: right; width: 80px; font-size: 12px; }
+  .dir-tag-desktop { display: none; }
+  .dir-tag-mobile  { display: inline; margin-right: 4px; }
 }
 
-.col-mod{white-space:nowrap;color:#57606a;width:160px}
-.col-size{white-space:nowrap;color:#57606a;text-align:right;width:110px}
-.dir-link{
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-  padding:2px 8px;
-  margin-left:-8px;
-  border:1px solid transparent;
-  border-radius:999px;
-}
-.dir-link:hover{text-decoration:none}
-.dir-link-public{background:#dafbe1;border-color:#2da44e}
-.dir-link-public:hover{background:#c2f0cb}
-.dir-tag{
-  color:#57606a;
-  user-select:none;
-  display:inline-flex;
-  align-items:center;
-}
-.dir-tag-mobile{display:none}
-.locked-name{color:#57606a}
-.parent-link td{border-bottom:2px solid #d0d7de}
-.parent-link:hover td{background:#f6f8fa}
+.dir-link{ display:inline-flex; align-items:center; gap:4px; padding:2px 8px; margin-left:-8px; border-radius:999px; }
+.dir-link-public { background: #dafbe1; }
+.dir-link-public td { border-bottom-color: #bee7c9; }
+.dir-link-public:hover td {
+  background: #bee7c9 !important;
 
-.upload{
-  border:1px solid #d0d7de;border-radius:6px;
-  padding:14px 16px;background:#f6f8fa;
-  margin-bottom: 24px;
+  font-weight: 600;
+  text-decoration: none;
 }
-.upload h2{font-size:13px;font-weight:700;margin:0 0 10px;color:#57606a;
-  text-transform:uppercase;letter-spacing:.04em}
-.upload-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.upload-row input[type=file]{font:inherit;font-size:13px;max-width:340px}
-.btn{
-  padding:5px 14px;font:inherit;font-size:13px;
-  border:1px solid;border-radius:6px;cursor:pointer;
-  display:inline-flex;align-items:center;justify-content:center;
-}
-.btn-primary{background:#1a7f37;color:#fff;border-color:#1a7f37}
-.btn-primary:hover{background:#166d30;border-color:#166d30}
-.btn-primary:disabled{background:#8c959f;border-color:#8c959f;cursor:not-allowed}
-.btn-secondary{background:#f6f8fa;color:#24292f;border-color:#d0d7de}
-.btn-secondary:hover:not(:disabled){background:#f3f4f6;border-color:#1a7f37}
-.btn-secondary:disabled{opacity:0.6;cursor:not-allowed}
-
-/* Progress Bar Styles */
-.progress-wrapper {
-  display: none;
-  margin-top: 16px;
-  background: #eaeef2;
-  border-radius: 4px;
-  height: 18px;
-  position: relative;
-  overflow: hidden;
-  border: 1px solid #d0d7de;
-}
-.progress-bar {
-  height: 100%;
-  background-color: #0969da;
-  width: 0%;
-  transition: width 0.1s ease;
-}
-.progress-text {
-  position: absolute;
-  width: 100%;
-  text-align: center;
-  font-size: 11px;
-  line-height: 16px;
-  font-weight: 700;
-  color: #1a1a1a;
-  mix-blend-mode: multiply;
+ 
+.public-row td:first-child {
+  box-shadow: inset 4px 0 0 #2da44e;
+  padding-left: 12px !important; /* Add some space so text doesn't touch the bar */
 }
 
-footer{
-  margin-top:28px;padding-top:12px;
-  border-top:1px solid #eaeef2;
-  font-size:12px;color:#57606a;
+/* Optional: Make the public file links slightly different */
+.public-row td a {
+  font-weight: 500;
 }
-.status-ok{color:#1a7f37;font-weight:600}
-.status-locked{color:#57606a}
+
+.upload{ border:1px solid #d0d7de; border-radius:6px; padding:14px 16px; background:#f6f8fa; margin-bottom: 24px; }
+.btn{ padding:5px 14px; font:inherit; font-size:13px; border:1px solid; border-radius:6px; cursor:pointer; }
+.btn-primary{ background:#1a7f37; color:#fff; border-color:#1a7f37; }
+.btn-secondary{ background:#f6f8fa; color:#24292f; border-color:#d0d7de; }
+.progress-wrapper { display: none; margin-top: 16px; background: #eaeef2; height: 18px; position: relative; border-radius: 4px; overflow: hidden; border:1px solid #d0d7de; }
+.progress-bar { height: 100%; background: #0969da; width: 0%; transition: width 0.1s; }
+.progress-text { position: absolute; width:100%; text-align:center; font-size:11px; line-height:16px; font-weight:700; mix-blend-mode:multiply; }
+footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-size:12px; color:#57606a; }
 </style>
 </head>
 <body>
-
 {{if .Header}}{{.Header}}{{end}}
-
-<nav class="bc" aria-label="Breadcrumb" id="top">
+<nav class="bc">
 {{- range $i, $c := .Crumbs}}
   {{- if $i}}<span class="sep">/</span>{{end}}
   {{- if $c.IsCurrent}}<span class="cur">{{$c.Name}}</span>
   {{- else}}<a href="{{$c.URL}}">{{$c.Name}}</a>{{end}}
 {{- end}}
 </nav>
-
 <h1>{{.Title}}</h1>
 <hr>
 
 {{if and .WantedFile (not .IsPublic)}}
-<div class="banner">
-  <strong>Downloads are locked.</strong>
-  To download <em>{{.WantedFile}}</em>, upload any file using the form below.
-</div>
-{{else if and (not .Unlocked) (not .IsPublic)}}
-<div class="banner">
-  <span class="status-locked">&#8856; Downloads locked &mdash; upload any file to unlock</span>
-</div>
+<div class="banner"><strong>Downloads are locked.</strong> Upload a file to download <em>{{.WantedFile}}</em>.</div>
 {{else if .IsPublic}}
-<div class="banner banner-public">
-  &#10022; Public directory &mdash; all files are freely available to download.
-</div>
+<div class="banner banner-public">✧ Public directory — downloads always available.</div>
 {{end}}
 
 <div class="upload">
@@ -957,14 +741,11 @@ footer{
     <input type="hidden" name="csrf_token" id="csrf_token" value="{{.CSRFToken}}">
     <div class="upload-row">
       <input type="file" name="uploadFiles" id="pick-files" multiple>
-      <input type="file" name="uploadFiles" id="pick-folder"
-             webkitdirectory directory style="display:none">
-      <button type="button" class="btn btn-secondary" id="btn-folder"
-              onclick="document.getElementById('pick-folder').click()">&#128193; Folder</button>
-      <button type="submit" class="btn btn-primary" id="btn-submit">&#8679; Upload</button>
+      <input type="file" name="uploadFiles" id="pick-folder" webkitdirectory directory style="display:none">
+      <button type="button" class="btn btn-secondary" id="btn-folder">📂 Folder</button>
+      <button type="submit" class="btn btn-primary" id="btn-submit">⬆ Upload</button>
     </div>
   </form>
-  
   <div class="progress-wrapper" id="progress-wrapper">
     <div class="progress-text" id="progress-text">0%</div>
     <div class="progress-bar" id="progress-bar"></div>
@@ -973,56 +754,37 @@ footer{
 
 <table>
 <thead>
-<tr>
-  <th class="col-name"><a href="{{call .SortLink "name"}}">Name{{call .Arrow "name"}}</a></th>
-  <th class="col-mod"><a href="{{call .SortLink "modified"}}">Last Modified{{call .Arrow "modified"}}</a></th>
-  <th class="col-size"><a href="{{call .SortLink "size"}}">Size{{call .Arrow "size"}}</a></th>
-</tr>
+  <tr>
+    <th class="col-name"><a href="{{call .SortLink "name"}}">Name{{call .Arrow "name"}}</a></th>
+    <th class="col-mod"><a href="{{call .SortLink "modified"}}">Modified{{call .Arrow "modified"}}</a></th>
+    <th class="col-size"><a href="{{call .SortLink "size"}}">Size{{call .Arrow "size"}}</a></th>
+  </tr>
 </thead>
 <tbody>
-{{if .ParentURL -}}
-<tr class="parent-link">
-  <td colspan="3"><a href="{{.ParentURL}}">&#8593; Parent Directory</a></td>
-</tr>
-{{end -}}
+{{if .ParentURL}}<tr><td colspan="3"><a href="{{.ParentURL}}">↑ Parent Directory</a></td></tr>{{end}}
 {{range .Entries}}
-<tr>
+<tr class="{{if .IsPublic}}public-row{{end}} {{if and .IsPublic .IsDir}}dir-link-public{{end}}">
   <td class="col-name">
     {{- if .IsDir}}
-      <a href="{{.URL}}" class="dir-link{{if .IsPublic}} dir-link-public{{end}}">
-        <span class="dir-tag dir-tag-desktop">[DIR]</span>
-        <span class="dir-tag dir-tag-mobile" aria-hidden="true">&#128193;</span>
+      <a href="{{.URL}}" class="dir-link">
+        <span class="dir-tag-desktop">[DIR]</span>
+        <span class="dir-tag-mobile">📂</span>
         <span>{{.Name}}/</span>
       </a>
     {{- else if or $.Unlocked $.IsPublic}}
       <a href="{{.URL}}" download>{{.Name}}</a>
-    {{- else}}
-      <span class="locked-name" title="Upload a file to unlock downloads">{{.Name}}</span>
-    {{- end}}
+    {{- else}}<span style="color:#57606a">{{.Name}}</span>{{end}}
   </td>
   <td class="col-mod">{{.ModTimeStr}}</td>
   <td class="col-size">{{.SizeStr}}</td>
 </tr>
-{{else}}
-<tr><td colspan="3" style="color:#57606a;padding:12px 0">Empty directory.</td></tr>
 {{end}}
 </tbody>
 </table>
 
-<footer>
-{{if .Unlocked -}}
-  <span class="status-ok">&#10003; Downloads unlocked</span>
-{{- else if .IsPublic -}}
-  <span class="status-ok">&#10003; Public directory &mdash; downloads always available</span>
-{{- else -}}
-  <span class="status-locked">&#8856; Downloads locked &mdash; upload any file to unlock</span>
-{{- end}}
-</footer>
+<footer>Rendered in {{.RenderTime}}</footer>
 
-{{if .Footer}}{{.Footer}}{{end}}
-<p style="color:#222222ab; font-size: 12px;">Rendered in {{.RenderTime}}</p>
-<p><a href="#top">[return to top]</a></p>
-<script>
+<script nonce="{{.Nonce}}">
 const form = document.getElementById('upload-form');
 const fileInput = document.getElementById('pick-files');
 const folderInput = document.getElementById('pick-folder');
@@ -1032,85 +794,56 @@ const progressWrapper = document.getElementById('progress-wrapper');
 const progressBar = document.getElementById('progress-bar');
 const progressText = document.getElementById('progress-text');
 
-function performUpload(files) {
-  if (!files || files.length === 0) return;
+// Fixed: Externalized onclick handler to satisfy CSP
+folderBtn.addEventListener('click', () => folderInput.click());
 
-  // 1. Disable UI
-  submitBtn.disabled = true;
-  folderBtn.disabled = true;
-  fileInput.disabled = true;
+async function performUpload(files, paths = []) {
+  if (!files || files.length === 0) return;
+  submitBtn.disabled = folderBtn.disabled = fileInput.disabled = true;
   progressWrapper.style.display = 'block';
 
-  // 2. Prepare Data
   const formData = new FormData();
   formData.append('csrf_token', document.getElementById('csrf_token').value);
   for (let i = 0; i < files.length; i++) {
-    // Note: webkitRelativePath is preserved by FormData in modern browsers
-    formData.append('uploadFiles', files[i], files[i].webkitRelativePath || files[i].name);
+    const path = paths[i] || files[i].webkitRelativePath || files[i].name;
+    formData.append('uploadFiles', files[i], path);
   }
 
-  // 3. Setup XHR
   const xhr = new XMLHttpRequest();
   xhr.open('POST', form.action, true);
-
   xhr.upload.onprogress = (e) => {
     if (e.lengthComputable) {
-      const percent = Math.round((e.loaded / e.total) * 100);
-      progressBar.style.width = percent + '%';
-      progressText.innerText = percent + '%';
-      if (percent >= 100) {
-        progressText.innerText = "Processing on server...";
-      }
+      const p = Math.round((e.loaded / e.total) * 100);
+      progressBar.style.width = p + '%';
+      progressText.innerText = p + '%';
     }
   };
-
-  xhr.onload = () => {
-    if (xhr.status >= 200 && xhr.status < 400) {
-      // Success: Refresh to show new files and updated "Unlock" status
-      window.location.reload();
-    } else {
-      alert('Upload failed: ' + xhr.responseText);
-      resetUI();
-    }
-  };
-
-  xhr.onerror = () => {
-    alert('Network error during upload.');
-    resetUI();
-  };
-
+  xhr.onload = () => { window.location.reload(); };
   xhr.send(formData);
 }
 
-function resetUI() {
-  submitBtn.disabled = false;
-  folderBtn.disabled = false;
-  fileInput.disabled = false;
-  progressWrapper.style.display = 'none';
-  progressBar.style.width = '0%';
-}
+form.addEventListener('submit', (e) => { e.preventDefault(); performUpload(fileInput.files); });
+folderInput.addEventListener('change', () => performUpload(folderInput.files));
 
-// Event Listeners
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  performUpload(fileInput.files);
-});
-
-folderInput.addEventListener('change', () => {
-  performUpload(folderInput.files);
-});
-
-// Drag and Drop
 document.addEventListener('dragover', (e) => e.preventDefault());
-document.addEventListener('drop', (e) => {
+document.addEventListener('drop', async (e) => {
   e.preventDefault();
-  if (submitBtn.disabled) return;
-  const files = e.dataTransfer && e.dataTransfer.files;
-  if (files && files.length > 0) {
-    performUpload(files);
-  }
+  const items = e.dataTransfer.items;
+  if (!items) return;
+  const files = [], paths = [];
+  const traverse = async (item, path = "") => {
+    if (item.isFile) {
+      const f = await new Promise(res => item.file(res));
+      files.push(f); paths.push(path + f.name);
+    } else if (item.isDirectory) {
+      const r = item.createReader();
+      const entries = await new Promise(res => r.readEntries(res));
+      for (const ent of entries) await traverse(ent, path + item.name + "/");
+    }
+  };
+  for (const it of items) { const ent = it.webkitGetAsEntry(); if (ent) await traverse(ent); }
+  performUpload(files, paths);
 });
 </script>
-
 </body>
 </html>`
