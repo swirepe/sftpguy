@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -139,6 +140,84 @@ func TestMaintenanceLoopSkipsBadFilePurge(t *testing.T) {
 	}
 	if snap.LastRun.Result.PurgeBlacklistedFiles.Matches != 0 || snap.LastRun.Result.PurgeBlacklistedFiles.Purges != 0 {
 		t.Fatalf("expected scheduled maintenance to skip purge result, got %+v", snap.LastRun.Result.PurgeBlacklistedFiles)
+	}
+}
+
+func TestNewServerMigratesLegacyIPBansWithoutBlockingStartup(t *testing.T) {
+	tmpDir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	originalDefaultBadFileHashes := defaultBadFileHashes
+	defaultBadFileHashes = ""
+	defer func() {
+		defaultBadFileHashes = originalDefaultBadFileHashes
+	}()
+
+	cfg := Config{
+		Name:          "sftpguy-maintenance-migrate-test",
+		Port:          2222,
+		HostKeyFile:   filepath.Join(tmpDir, "host_key"),
+		DBPath:        filepath.Join(tmpDir, "sftp.db"),
+		LogFile:       filepath.Join(tmpDir, "sftp.log"),
+		UploadDir:     filepath.Join(tmpDir, "uploads"),
+		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
+		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
+		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
+	}
+
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {
+		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
+			t.Fatalf("write support file %s: %v", p, err)
+		}
+	}
+
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ip_banned (ip_address TEXT PRIMARY KEY, banned_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create legacy ip_banned table: %v", err)
+	}
+	const legacyIP = "198.51.100.10"
+	if _, err := db.Exec(`INSERT INTO ip_banned (ip_address, banned_at) VALUES (?, ?)`, legacyIP, "2026-03-19T14:00:00Z"); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert legacy ip_banned row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	type result struct {
+		srv *Server
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		srv, err := NewServer(cfg, logger)
+		done <- result{srv: srv, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("new server: %v", res.err)
+		}
+		defer res.srv.Shutdown()
+
+		if !res.srv.store.blacklist.Matches(legacyIP) {
+			t.Fatalf("expected migrated legacy IP %s to be present in blacklist", legacyIP)
+		}
+
+		var remaining int
+		if err := res.srv.store.db.QueryRow(`SELECT COUNT(*) FROM ip_banned`).Scan(&remaining); err != nil {
+			t.Fatalf("count legacy ip_banned rows: %v", err)
+		}
+		if remaining != 0 {
+			t.Fatalf("expected legacy ip_banned rows to be removed, got %d", remaining)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("NewServer did not return while migrating legacy ip bans")
 	}
 }
 

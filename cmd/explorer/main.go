@@ -667,7 +667,7 @@ table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
 th, td { padding: 8px 12px 8px 0; border-bottom: 1px solid #eaeef2; vertical-align: top; text-align: left; }
 th{ border-bottom:2px solid #d0d7de; font-weight:700; font-size:13px; white-space:nowrap; }
 tr:hover td{background:#f6f8fa}
-.col-name { overflow-wrap: break-word; word-break: break-all; }
+.col-name { overflow-wrap: break-word; word-break: break-word; }
 
 /* Responsive Visibility Fixes */
 .dir-tag-desktop { display: inline; color:#57606a; user-select:none; text-wrap: nowrap; }

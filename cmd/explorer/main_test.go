@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -22,13 +23,13 @@ func TestHandleDirectoryListingHighlightsPublicDirectoriesAndLockedFiles(t *test
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, `href="/public" class="dir-link dir-link-public"`) {
+	if !regexp.MustCompile(`(?s)<tr class="public-row dir-link-public">\s*<td class="col-name">\s*<a href="/public" class="dir-link">`).MatchString(body) {
 		t.Fatalf("expected public directory highlight, body=%s", body)
 	}
-	if strings.Contains(body, `href="/private" class="dir-link dir-link-public"`) {
+	if regexp.MustCompile(`(?s)<tr class="public-row dir-link-public">\s*<td class="col-name">\s*<a href="/private" class="dir-link">`).MatchString(body) {
 		t.Fatalf("did not expect non-public directory highlight, body=%s", body)
 	}
-	if !strings.Contains(body, `<span class="locked-name" title="Upload a file to unlock downloads">secret.txt</span>`) {
+	if !strings.Contains(body, `<span style="color:#57606a">secret.txt</span>`) {
 		t.Fatalf("expected locked file rendering, body=%s", body)
 	}
 	if strings.Contains(body, `<a href="/secret.txt" download>secret.txt</a>`) {
@@ -54,7 +55,7 @@ func TestHandlePublicDirectoryRendersBannerAndPublicDownloads(t *testing.T) {
 	if !strings.Contains(body, `<a href="/public/readme.txt" download>readme.txt</a>`) {
 		t.Fatalf("expected public file download link, body=%s", body)
 	}
-	if !strings.Contains(body, `href="/public/assets" class="dir-link dir-link-public"`) {
+	if !regexp.MustCompile(`(?s)<tr class="public-row dir-link-public">\s*<td class="col-name">\s*<a href="/public/assets" class="dir-link">`).MatchString(body) {
 		t.Fatalf("expected nested public directory highlight, body=%s", body)
 	}
 }
@@ -117,7 +118,7 @@ func serveExplorerRequest(method, target string, cookies []*http.Cookie) *httpte
 	}
 
 	w := httptest.NewRecorder()
-	handle(w, req)
+	handle(w, req, "test-nonce")
 	return w
 }
 

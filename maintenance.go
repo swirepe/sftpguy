@@ -43,32 +43,46 @@ func (s *Store) migrateLegacyIPBans() (migrated int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+
+	type legacyIPBan struct {
+		ip       string
+		bannedAt string
+	}
+	legacyBans := make([]legacyIPBan, 0, 8)
 
 	logger := s.logger.WithGroup("maintenance").With("operation", "migrate_legacy_ip_bans")
 	for rows.Next() {
 		var ip string
 		var bannedAt string
 		if err := rows.Scan(&ip, &bannedAt); err != nil {
+			_ = rows.Close()
 			return 0, err
 		}
-		added, err := s.blacklist.AddExactIPWithComment(ip, legacyIPBanComment(bannedAt))
+		legacyBans = append(legacyBans, legacyIPBan{ip: ip, bannedAt: bannedAt})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	for _, legacy := range legacyBans {
+		added, err := s.blacklist.AddExactIPWithComment(legacy.ip, legacyIPBanComment(legacy.bannedAt))
 		if err != nil {
-			logger.Warn("failed to migrate legacy ip ban", "ip", ip, "err", err)
+			logger.Warn("failed to migrate legacy ip ban", "ip", legacy.ip, "err", err)
 			continue
 		}
 		// Note: We delete even if 'added' is false, because 'false'  means
 		// the IP was already in the new blacklist, so it's safe to remove from legacy.
-		_, delErr := s.db.Exec(`DELETE FROM ip_banned WHERE ip_address = ?`, ip)
+		_, delErr := s.db.Exec(`DELETE FROM ip_banned WHERE ip_address = ?`, legacy.ip)
 		if delErr != nil {
-			logger.Error("failed to remove migrated ip from legacy table", "ip", ip, "err", delErr)
+			logger.Error("failed to remove migrated ip from legacy table", "ip", legacy.ip, "err", delErr)
 		}
 		if added {
 			migrated++
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
 	}
 	if migrated > 0 {
 		logger.Info("migrated legacy ip bans to blacklist", "count", migrated)

@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-var ipBanTimestampPattern = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b`)
+var (
+	ipBanTimestampPattern      = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b`)
+	ipBanLegacyBannedAtPattern = regexp.MustCompile(`\bbanned_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\b`)
+)
 
 func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -298,5 +301,8 @@ func (s *Server) handleAdminUnbanIP(w http.ResponseWriter, r *http.Request) {
 }
 
 func extractIPBanTimestamp(comment string) string {
+	if match := ipBanLegacyBannedAtPattern.FindStringSubmatch(comment); len(match) == 2 {
+		return match[1]
+	}
 	return ipBanTimestampPattern.FindString(comment)
 }
