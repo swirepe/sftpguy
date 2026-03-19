@@ -25,7 +25,7 @@ func TestHandleAdminUserReturnsSnakeCaseStats(t *testing.T) {
 	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, "owned.txt", 5, 5); err != nil {
 		t.Fatalf("register owned file: %v", err)
 	}
-	if err := srv.store.RecordDownload(ownerHash, 9); err != nil {
+	if err := srv.store.RecordDownload(ownerHash, "owned.txt", 9); err != nil {
 		t.Fatalf("record download: %v", err)
 	}
 
@@ -52,6 +52,9 @@ func TestHandleAdminUserReturnsSnakeCaseStats(t *testing.T) {
 	}
 	if got := stringFromAny(stats["last_address"]); got != "203.0.113.44" {
 		t.Fatalf("unexpected last_address: got=%q want=%q", got, "203.0.113.44")
+	}
+	if got := int64FromAny(stats["seen"]); got != 1 {
+		t.Fatalf("unexpected seen: got=%d want=%d", got, 1)
 	}
 	if got := int64FromAny(stats["upload_count"]); got != 1 {
 		t.Fatalf("unexpected upload_count: got=%d want=%d", got, 1)
@@ -93,6 +96,9 @@ func TestAdminExplorerPreviewIncludesOwnerDetailsURL(t *testing.T) {
 	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, relPath, 5, 5); err != nil {
 		t.Fatalf("register file metadata: %v", err)
 	}
+	if err := srv.store.RecordDownload(ownerHash, relPath, 5); err != nil {
+		t.Fatalf("record file download: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/explorer/"+relPath+"?preview=true", nil)
 	w := httptest.NewRecorder()
@@ -111,7 +117,130 @@ func TestAdminExplorerPreviewIncludesOwnerDetailsURL(t *testing.T) {
 	if got := stringFromAny(payload["owner"]); got != ownerHash {
 		t.Fatalf("unexpected owner: got=%q want=%q", got, ownerHash)
 	}
+	if got := int64FromAny(payload["downloads"]); got != 1 {
+		t.Fatalf("unexpected downloads: got=%d want=%d", got, 1)
+	}
 	if got := stringFromAny(payload["owner_details_url"]); got != "/admin/api/users/"+url.PathEscape(ownerHash) {
 		t.Fatalf("unexpected owner_details_url: got=%q want=%q", got, "/admin/api/users/"+url.PathEscape(ownerHash))
+	}
+}
+
+func TestHandleAdminUsersAndFilesExposeSeenAndDownloads(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "admin-user-list-owner"
+	if _, err := srv.store.UpsertUserSession(ownerHash, &net.TCPAddr{
+		IP:   net.ParseIP("203.0.113.60"),
+		Port: 2222,
+	}); err != nil {
+		t.Fatalf("upsert first owner session: %v", err)
+	}
+	if _, err := srv.store.UpsertUserSession(ownerHash, &net.TCPAddr{
+		IP:   net.ParseIP("203.0.113.60"),
+		Port: 2222,
+	}); err != nil {
+		t.Fatalf("upsert second owner session: %v", err)
+	}
+
+	const relPath = "downloads/report.txt"
+	fullPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(relPath))
+	if err := os.MkdirAll(filepath.Dir(fullPath), permDir); err != nil {
+		t.Fatalf("mkdir download dir: %v", err)
+	}
+	if err := os.WriteFile(fullPath, []byte("report"), permFile); err != nil {
+		t.Fatalf("write report file: %v", err)
+	}
+	if err := srv.store.EnsureDirectory(ownerHash, "downloads"); err != nil {
+		t.Fatalf("ensure download dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, relPath, int64(len("report")), int64(len("report"))); err != nil {
+		t.Fatalf("register report file: %v", err)
+	}
+	if err := srv.store.RecordDownload(ownerHash, relPath, int64(len("report"))); err != nil {
+		t.Fatalf("record first report download: %v", err)
+	}
+	if err := srv.store.RecordDownload(ownerHash, relPath, int64(len("report"))); err != nil {
+		t.Fatalf("record second report download: %v", err)
+	}
+
+	usersReq := httptest.NewRequest(http.MethodGet, "/admin/api/users?q="+ownerHash, nil)
+	usersW := httptest.NewRecorder()
+	srv.handleAdminUsers(usersW, usersReq)
+	if usersW.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/users status=%d body=%s", usersW.Code, usersW.Body.String())
+	}
+
+	var usersPayload map[string]any
+	if err := json.Unmarshal(usersW.Body.Bytes(), &usersPayload); err != nil {
+		t.Fatalf("decode users payload: %v", err)
+	}
+	users, ok := usersPayload["users"].([]any)
+	if !ok || len(users) != 1 {
+		t.Fatalf("unexpected users payload: %#v", usersPayload["users"])
+	}
+	userRow, ok := users[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected user row payload: %#v", users[0])
+	}
+	if got := int64FromAny(userRow["seen"]); got != 2 {
+		t.Fatalf("unexpected users.seen: got=%d want=%d", got, 2)
+	}
+
+	filesReq := httptest.NewRequest(http.MethodGet, "/admin/api/files?path=downloads", nil)
+	filesW := httptest.NewRecorder()
+	srv.handleAdminFiles(filesW, filesReq)
+	if filesW.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/files status=%d body=%s", filesW.Code, filesW.Body.String())
+	}
+
+	var filesPayload map[string]any
+	if err := json.Unmarshal(filesW.Body.Bytes(), &filesPayload); err != nil {
+		t.Fatalf("decode files payload: %v", err)
+	}
+	entries, ok := filesPayload["entries"].([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("unexpected file entries payload: %#v", filesPayload["entries"])
+	}
+	entry, ok := entries[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected file entry payload: %#v", entries[0])
+	}
+	if got := int64FromAny(entry["downloads"]); got != 2 {
+		t.Fatalf("unexpected file downloads: got=%d want=%d", got, 2)
+	}
+
+	searchReq := httptest.NewRequest(http.MethodGet, "/admin/api/files/search?owner="+url.QueryEscape(ownerHash), nil)
+	searchW := httptest.NewRecorder()
+	srv.handleAdminFileSearch(searchW, searchReq)
+	if searchW.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/files/search status=%d body=%s", searchW.Code, searchW.Body.String())
+	}
+
+	var searchPayload map[string]any
+	if err := json.Unmarshal(searchW.Body.Bytes(), &searchPayload); err != nil {
+		t.Fatalf("decode file search payload: %v", err)
+	}
+	results, ok := searchPayload["results"].([]any)
+	if !ok || len(results) != 2 {
+		t.Fatalf("unexpected file search results payload: %#v", searchPayload["results"])
+	}
+
+	foundFile := false
+	for _, raw := range results {
+		row, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringFromAny(row["path"]) != relPath {
+			continue
+		}
+		foundFile = true
+		if got := int64FromAny(row["downloads"]); got != 2 {
+			t.Fatalf("unexpected search downloads: got=%d want=%d", got, 2)
+		}
+	}
+	if !foundFile {
+		t.Fatalf("expected %q in search results, got %#v", relPath, searchPayload["results"])
 	}
 }

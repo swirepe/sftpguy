@@ -504,6 +504,7 @@
           sort: {
             hash: u.hash || "",
             last_login: u.last_login || "",
+            seen: Number(u.seen || 0),
             upload_bytes: Number(u.upload_bytes || 0),
             download_bytes: Number(u.download_bytes || 0),
             banned: u.is_banned ? 1 : 0
@@ -511,6 +512,7 @@
           cells: [
             ownerCell(u.hash),
             esc(u.last_login || ""),
+            esc(u.seen || 0),
             esc(formatBytes(u.upload_bytes || 0)),
             esc(formatBytes(u.download_bytes || 0)),
             "<span class=\"tag " + (u.is_banned ? "bad" : "ok") + "\">" + (u.is_banned ? "BANNED" : "ACTIVE") + "</span>",
@@ -526,6 +528,7 @@
         [
           {label:"User", key:"hash"},
           {label:"Last Login", key:"last_login"},
+          {label:"Seen", key:"seen"},
           {label:"Uploaded", key:"upload_bytes"},
           {label:"Downloaded", key:"download_bytes"},
           {label:"Status", key:"banned"},
@@ -557,12 +560,14 @@
 	            sort: {
 	              path: e.path || "",
 	              owner: e.owner || "",
+	              downloads: Number(e.downloads || 0),
 	              size: Number(e.size || 0),
 	              is_dir: e.is_dir ? 1 : 0
 	            },
 	            cells: [
 	              (e.is_dir ? (openPathButton(e.path, "Open") + " ") : "") + pathWithExplorer(e.path || "", !!e.is_dir, e.is_dir ? ((e.path || "") + "/") : (e.path || "")),
 	              ownerCell(e.owner || "-"),
+	              e.is_dir ? "<span class=\"muted\">-</span>" : esc(e.downloads || 0),
 	              esc(e.size_human || formatBytes(e.size || 0)),
 	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
 	              markBadButton(e.path || "", !!e.is_dir)
@@ -576,6 +581,7 @@
 	            [
 	              {label:"Path", key:"path"},
 	              {label:"Owner", key:"owner"},
+	              {label:"Downloads", key:"downloads"},
 	              {label:"Size", key:"size"},
 	              {label:"Type", key:"is_dir"},
 	              {label:"Actions", key:"path"}
@@ -593,6 +599,7 @@
 	          sort: {
 	            name: e.name || "",
             owner: e.owner || "",
+            downloads: Number(e.downloads || 0),
             size: Number(e.size || 0),
             is_dir: e.is_dir ? 1 : 0
           },
@@ -601,6 +608,7 @@
               ? (openPathButton(e.path, (e.name || "") + "/") + explorerLink(e.path || "", true))
               : (esc(e.name || "") + explorerLink(e.path || "", false)),
             ownerCell(e.owner || "-"),
+            e.is_dir ? "<span class=\"muted\">-</span>" : esc(e.downloads || 0),
             esc(e.size_human || formatBytes(e.size || 0)),
             e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
             markBadButton(e.path || "", !!e.is_dir)
@@ -613,6 +621,7 @@
 	          [
 	            {label:"Name", key:"name"},
             {label:"Owner", key:"owner"},
+            {label:"Downloads", key:"downloads"},
             {label:"Size", key:"size"},
             {label:"Type", key:"is_dir"},
             {label:"Actions", key:"name"}
@@ -1589,7 +1598,8 @@
           "<span class=\"tag " + (s.is_banned ? "bad" : "ok") + "\">" + (s.is_banned ? "BANNED" : "ACTIVE") + "</span>" +
           actionButtons +
         "</div>" +
-        (isUser ? "<div class=\"muted\">upload_count=" + esc(stats.upload_count || 0) + " upload_bytes=" + esc(formatBytes(stats.upload_bytes || 0)) +
+        (isUser ? "<div class=\"muted\">seen=" + esc(stats.seen || 0) +
+          " upload_count=" + esc(stats.upload_count || 0) + " upload_bytes=" + esc(formatBytes(stats.upload_bytes || 0)) +
           " download_count=" + esc(stats.download_count || 0) + " download_bytes=" + esc(formatBytes(stats.download_bytes || 0)) +
           " last_login=<code>" + esc(stats.last_login || "") + "</code>" +
           " last_address=<code>" + esc(stats.last_address || "") + "</code></div>" : "") +
@@ -1669,10 +1679,10 @@
     }
 
     function exportUsersCSV() {
-      const lines = ["hash,last_login,upload_count,upload_bytes,download_count,download_bytes,is_banned"];
+      const lines = ["hash,last_login,seen,upload_count,upload_bytes,download_count,download_bytes,is_banned"];
       (state.users || []).forEach(function(u) {
         lines.push([
-          csvEscape(u.hash), csvEscape(u.last_login), csvEscape(u.upload_count), csvEscape(u.upload_bytes),
+          csvEscape(u.hash), csvEscape(u.last_login), csvEscape(u.seen), csvEscape(u.upload_count), csvEscape(u.upload_bytes),
           csvEscape(u.download_count), csvEscape(u.download_bytes), csvEscape(u.is_banned)
         ].join(","));
       });

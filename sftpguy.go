@@ -310,6 +310,7 @@ type userStats struct {
 	UploadCount   int64
 	LastLogin     string
 	LastAddress   string
+	Seen          int64
 	UploadBytes   int64
 	DownloadCount int64
 	DownloadBytes int64
@@ -515,8 +516,12 @@ func (s *Store) RegisterFile(path, owner string, size int64, isDir bool) {
 		isDirVal = 1
 	}
 
-	s.exec(`INSERT OR REPLACE INTO files (path, owner_hash, size, is_dir) 
-	        VALUES (?, ?, ?, ?)`, path, owner, size, isDirVal)
+	s.exec(`INSERT INTO files (path, owner_hash, size, is_dir)
+	        VALUES (?, ?, ?, ?)
+	        ON CONFLICT(path) DO UPDATE SET
+	            owner_hash = excluded.owner_hash,
+	            size = excluded.size,
+	            is_dir = excluded.is_dir`, path, owner, size, isDirVal)
 }
 
 func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
@@ -561,9 +566,10 @@ func (s *Store) GetUserStats(hash string) (userStats, error) {
 			IFNULL(upload_bytes, 0),
 			IFNULL(download_count, 0),
 			IFNULL(download_bytes, 0),
+			IFNULL(seen, 0),
 			IFNULL(last_address, '')
 		FROM users
-		WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes, &u.LastAddress)
+		WHERE pubkey_hash = ?`, hash).Scan(&u.LastLogin, &u.UploadCount, &u.UploadBytes, &u.DownloadCount, &u.DownloadBytes, &u.Seen, &u.LastAddress)
 	if err == sql.ErrNoRows {
 		u.FirstTimer = true
 		u.LastLogin = "Never"
@@ -586,11 +592,12 @@ func (s *Store) UpsertUserSession(hash string, remoteAddr net.Addr) (userStats, 
 	now := time.Now().Format("2006-01-02 15:04:05")
 
 	_, err = s.exec(`
-		INSERT INTO users (pubkey_hash, last_login, last_address) 
-		VALUES (?, ?, ?)
+		INSERT INTO users (pubkey_hash, last_login, last_address, seen)
+		VALUES (?, ?, ?, 1)
 		ON CONFLICT(pubkey_hash) DO UPDATE SET 
 			last_login = excluded.last_login,
-			last_address = excluded.last_address
+			last_address = excluded.last_address,
+			seen = IFNULL(users.seen, 0) + 1
 	`, hash, now, host)
 
 	if err != nil {
@@ -607,6 +614,23 @@ func (s *Store) GetFileOwner(relPath string) (string, error) {
 		return "", nil
 	}
 	return owner, err
+}
+
+type FileAdminMeta struct {
+	OwnerHash string
+	Downloads int64
+}
+
+func (s *Store) GetFileAdminMeta(relPath string) (FileAdminMeta, error) {
+	var meta FileAdminMeta
+	err := s.db.QueryRow(`
+		SELECT IFNULL(owner_hash, ''), IFNULL(downloads, 0)
+		FROM files
+		WHERE path = ?`, relPath).Scan(&meta.OwnerHash, &meta.Downloads)
+	if err == sql.ErrNoRows {
+		return FileAdminMeta{}, nil
+	}
+	return meta, err
 }
 
 func (s *Store) ClaimFile(hash, relPath string) error {
@@ -686,9 +710,26 @@ func (s *Store) UpdateFileWrite(hash, ownerHint, relPath string, newSize, delta 
 	})
 }
 
-func (s *Store) RecordDownload(hash string, bytes int64) error {
-	_, err := s.exec("UPDATE users SET download_count = download_count + 1, download_bytes = download_bytes + ? WHERE pubkey_hash = ?", bytes, hash)
-	return err
+func (s *Store) RecordDownload(hash, relPath string, bytes int64) error {
+	return s.transact(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`
+			UPDATE users
+			SET download_count = download_count + 1,
+			    download_bytes = download_bytes + ?
+			WHERE pubkey_hash = ?`, bytes, hash); err != nil {
+			return err
+		}
+		if strings.TrimSpace(relPath) == "" {
+			return nil
+		}
+		if _, err := tx.Exec(`
+			UPDATE files
+			SET downloads = downloads + 1
+			WHERE path = ? AND is_dir = 0`, relPath); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) RenamePath(oldRel, newRel string) error {
@@ -1609,7 +1650,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 
 		case "exec":
 			s.logExec(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
-			s.PurgeSshdBot(pubHash, sConn.RemoteAddr(), req.Payload)
+			s.PurgeSshdBot(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
 			req.Reply(false, nil)
 
 		default:
@@ -1624,7 +1665,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 var sshdPathRegex = regexp.MustCompile(`\./\.\d+/sshd`)
 var ipRegex = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 
-func (s *Server) PurgeSshdBot(pubHash string, remoteAddr net.Addr, payload []byte) {
+func (s *Server) PurgeSshdBot(pubHash string, sessionID string, remoteAddr net.Addr, payload []byte) {
 	/*
 	   time=2026-03-18T12:02:45.587-05:00 level=WARN msg=exec cmd="chmod +x ./.4697738884435969277/sshd;nohup ./.4697738884435969277/sshd 1.165.130.37 137.184.53.92 154.211.13.102 103.39.222.143 159.203.108.39 124.112.194.91 120.209.186.110 1.62.252.20 160.177.201.24 154.91.170.41 83.168.105.145 143.110.247.87 196.70.225.173 154.82.73.111 49.233.95.165 51.210.149.136 50.6.231.155 45.118.144.36 180.76.105.108 51.15.19.10 80.71.149.196 161.97.84.142 183.94.33.160 103.147.14.179 170.150.255.26 23.165.104.184 180.76.137.24 125.212.248.44 221.213.196.23 106.15.108.69 45.81.23.49 107.158.163.112 50.6.231.169 43.224.248.178 103.143.11.137 42.51.49.239 144.91.125.113 180.163.61.238 159.203.35.6 218.29.176.225 122.10.115.18 114.218.57.21 62.60.213.108 45.148.119.184 134.209.236.64 121.28.170.66 125.74.128.224 69.87.207.133 203.189.196.168 111.203.190.237 49.72.111.25 &" user.id=anon-auth:2ad14294e8 user.uid=1456726645 user.session=e7701077931b3818 user.remote_address=113.201.153.165:50474 user.hash_banned=false user.ip_banned=false
 	*/
@@ -1659,6 +1700,7 @@ func (s *Server) PurgeSshdBot(pubHash string, remoteAddr net.Addr, payload []byt
 	s.store.badFileList.AddFile(absPath)
 	s.PurgeUser(pubHash)
 
+	s.store.LogEvent(EventAdminSSHDBotDetected, pubHash, sessionID, remoteAddr, "path", cmd.Value, "ips", ips)
 }
 
 func (s *Server) userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {
@@ -2159,7 +2201,7 @@ func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 		return nil, err
 	}
 	h.logDownload(meta)
-	h.srv.store.RecordDownload(h.pubHash, meta.fi.Size())
+	h.srv.store.RecordDownload(h.pubHash, meta.rel, meta.fi.Size())
 
 	reader = newMetricsReaderAt(f, h, "download")
 

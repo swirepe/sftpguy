@@ -247,6 +247,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 type adminUserStats struct {
 	LastLogin     string `json:"last_login"`
 	LastAddress   string `json:"last_address"`
+	Seen          int64  `json:"seen"`
 	UploadCount   int64  `json:"upload_count"`
 	UploadBytes   int64  `json:"upload_bytes"`
 	DownloadCount int64  `json:"download_count"`
@@ -259,6 +260,7 @@ func adminUserStatsPayload(stats userStats) adminUserStats {
 	return adminUserStats{
 		LastLogin:     stats.LastLogin,
 		LastAddress:   stats.LastAddress,
+		Seen:          stats.Seen,
 		UploadCount:   stats.UploadCount,
 		UploadBytes:   stats.UploadBytes,
 		DownloadCount: stats.DownloadCount,

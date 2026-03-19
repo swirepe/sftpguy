@@ -32,6 +32,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			u.pubkey_hash,
 			IFNULL(u.last_login, ''),
+			IFNULL(u.seen, 0),
 			u.upload_count,
 			u.upload_bytes,
 			u.download_count,
@@ -51,6 +52,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	type userRow struct {
 		Hash          string `json:"hash"`
 		LastLogin     string `json:"last_login"`
+		Seen          int64  `json:"seen"`
 		UploadCount   int64  `json:"upload_count"`
 		UploadBytes   int64  `json:"upload_bytes"`
 		DownloadCount int64  `json:"download_count"`
@@ -61,7 +63,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var row userRow
 		var banned int
-		if err := rows.Scan(&row.Hash, &row.LastLogin, &row.UploadCount, &row.UploadBytes, &row.DownloadCount, &row.DownloadBytes, &banned); err != nil {
+		if err := rows.Scan(&row.Hash, &row.LastLogin, &row.Seen, &row.UploadCount, &row.UploadBytes, &row.DownloadCount, &row.DownloadBytes, &banned); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -198,6 +200,7 @@ func (s *Server) handleAdminFiles(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 		Path      string `json:"path"`
 		Owner     string `json:"owner"`
+		Downloads int64  `json:"downloads"`
 		IsDir     bool   `json:"is_dir"`
 		Size      int64  `json:"size"`
 		SizeHuman string `json:"size_human"`
@@ -210,11 +213,12 @@ func (s *Server) handleAdminFiles(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		nextRel := filepath.ToSlash(filepath.Join(relDir, e.Name()))
-		owner, _ := s.store.GetFileOwner(nextRel)
+		meta, _ := s.store.GetFileAdminMeta(nextRel)
 		row := fileRow{
 			Name:      e.Name(),
 			Path:      nextRel,
-			Owner:     owner,
+			Owner:     meta.OwnerHash,
+			Downloads: meta.Downloads,
 			IsDir:     e.IsDir(),
 			Size:      info.Size(),
 			SizeHuman: formatBytes(info.Size()),
@@ -262,6 +266,7 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 		Path      string `json:"path"`
 		Name      string `json:"name"`
 		Owner     string `json:"owner"`
+		Downloads int64  `json:"downloads"`
 		Size      int64  `json:"size"`
 		SizeHuman string `json:"size_human"`
 		IsDir     bool   `json:"is_dir"`
@@ -275,7 +280,7 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	listQuery := `
-		SELECT path, IFNULL(owner_hash,''), IFNULL(size,0), is_dir
+		SELECT path, IFNULL(owner_hash,''), IFNULL(downloads,0), IFNULL(size,0), is_dir
 		FROM files
 		WHERE ` + where + `
 		ORDER BY is_dir DESC, size DESC, path ASC
@@ -292,7 +297,7 @@ func (s *Server) handleAdminFileSearch(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var row resultRow
 		var isDir int
-		if err := rows.Scan(&row.Path, &row.Owner, &row.Size, &isDir); err != nil {
+		if err := rows.Scan(&row.Path, &row.Owner, &row.Downloads, &row.Size, &isDir); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

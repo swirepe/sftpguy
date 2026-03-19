@@ -110,6 +110,7 @@ var (
 	basePath          string
 	embedAssets       bool
 	tmpl              *template.Template
+	fileDetailsLookup func(relPath string) (FileDetails, error)
 	ownerLookup       func(relPath string) (string, error)
 	ownerFilesURLFunc func(owner string) string
 	ownerDetailsURLFn func(owner string) string
@@ -378,6 +379,7 @@ type FileEntry struct {
 	Owner             string
 	OwnerShort        string
 	OwnerFilesURL     template.URL
+	Downloads         int64
 	Size              int64
 	SizeReadable      string
 	Category          string
@@ -468,14 +470,20 @@ func templateDict(values ...interface{}) (map[string]interface{}, error) {
 }
 
 type Config struct {
-	RootDir         string
-	BasePath        string
-	EmbedAssets     bool
-	MaxUploadBytes  int64
-	WarmCacheMax    int
-	LookupOwner     func(relPath string) (string, error)
-	OwnerFilesURL   func(owner string) string
-	OwnerDetailsURL func(owner string) string
+	RootDir           string
+	BasePath          string
+	EmbedAssets       bool
+	MaxUploadBytes    int64
+	WarmCacheMax      int
+	LookupFileDetails func(relPath string) (FileDetails, error)
+	LookupOwner       func(relPath string) (string, error)
+	OwnerFilesURL     func(owner string) string
+	OwnerDetailsURL   func(owner string) string
+}
+
+type FileDetails struct {
+	Owner     string
+	Downloads int64
 }
 
 type Explorer struct {
@@ -505,6 +513,7 @@ func New(cfg Config) (*Explorer, error) {
 	embedAssets = cfg.EmbedAssets
 	maxFileSize = cfg.MaxUploadBytes
 	basePath = normalizeBasePath(cfg.BasePath)
+	fileDetailsLookup = cfg.LookupFileDetails
 	ownerLookup = cfg.LookupOwner
 	ownerFilesURLFunc = cfg.OwnerFilesURL
 	ownerDetailsURLFn = cfg.OwnerDetailsURL
@@ -1110,6 +1119,8 @@ func sortFiles(files []FileEntry, by, order string) {
 		}
 		var less bool
 		switch by {
+		case "downloads":
+			less = files[i].Downloads < files[j].Downloads
 		case "size":
 			si, sj := files[i].Size, files[j].Size
 			if files[i].IsDir {
@@ -1176,7 +1187,7 @@ func treeStats(children []FileEntry) (dirs, files int, _ int64) {
 func createFileEntry(name, relPath string, info os.FileInfo, isDir, isNew, unlocked bool) FileEntry {
 	entryRelPath := filepath.ToSlash(filepath.Join(relPath, name))
 	urlStr := explorerURL(entryRelPath)
-	owner, ownerShort, ownerFilesURL, _ := ownerInfoForPath(entryRelPath)
+	details, ownerShort, ownerFilesURL, _ := fileDetailsForPath(entryRelPath)
 
 	var thumbURL string
 	if unlocked && imageExts[strings.ToLower(filepath.Ext(name))] {
@@ -1186,9 +1197,10 @@ func createFileEntry(name, relPath string, info os.FileInfo, isDir, isNew, unloc
 	absPath := filepath.Join(rootDir, relPath, name)
 	entry := FileEntry{
 		Name:          name,
-		Owner:         owner,
+		Owner:         details.Owner,
 		OwnerShort:    ownerShort,
 		OwnerFilesURL: ownerFilesURL,
+		Downloads:     details.Downloads,
 		Size:          info.Size(),
 		SizeReadable:  formatBytes(info.Size()),
 		IsDir:         isDir,
@@ -1417,6 +1429,7 @@ type previewPayload struct {
 	Owner           string `json:"owner,omitempty"`
 	OwnerFilesURL   string `json:"owner_files_url,omitempty"`
 	OwnerDetailsURL string `json:"owner_details_url,omitempty"`
+	Downloads       int64  `json:"downloads"`
 	Size            string `json:"size"`
 	ModTime         string `json:"mod_time"`
 	Ext             string `json:"ext,omitempty"`
@@ -1465,11 +1478,13 @@ func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath 
 	}
 
 	unlocked := isUnlocked(r)
+	details, _, ownerFilesURL, ownerDetailsURL := fileDetailsForPath(relPath)
 
 	cacheKey := fullPath
 	if unlocked {
 		cacheKey += ":unlocked"
 	}
+	cacheKey += fmt.Sprintf(":owner=%s:downloads=%d", details.Owner, details.Downloads)
 	if cached, ok := getPreview(cacheKey, info.ModTime()); ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(cached)
@@ -1499,8 +1514,8 @@ func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath 
 		p = buildFilePreviewPayload(fullPath, info, escapedPath, unlocked)
 	}
 	p.RelPath = filepath.ToSlash(relPath)
-	owner, _, ownerFilesURL, ownerDetailsURL := ownerInfoForPath(relPath)
-	p.Owner = owner
+	p.Owner = details.Owner
+	p.Downloads = details.Downloads
 	if ownerFilesURL != "" {
 		p.OwnerFilesURL = string(ownerFilesURL)
 	}
@@ -1859,39 +1874,48 @@ func cookieValue(r *http.Request, name, def string) string {
 	return c.Value
 }
 
-func ownerInfoForPath(relPath string) (owner string, ownerShort string, filesURL template.URL, detailsURL template.URL) {
+func fileDetailsForPath(relPath string) (details FileDetails, ownerShort string, filesURL template.URL, detailsURL template.URL) {
 	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(relPath)), "/")
 	if clean == "." {
 		clean = ""
 	}
-	if clean == "" || ownerLookup == nil {
-		return "", "", "", ""
+	if clean == "" {
+		return FileDetails{}, "", "", ""
 	}
 
-	found, err := ownerLookup(clean)
-	if err != nil {
-		return "", "", "", ""
+	if fileDetailsLookup != nil {
+		found, err := fileDetailsLookup(clean)
+		if err != nil {
+			return FileDetails{}, "", "", ""
+		}
+		details = found
+	} else if ownerLookup != nil {
+		found, err := ownerLookup(clean)
+		if err != nil {
+			return FileDetails{}, "", "", ""
+		}
+		details.Owner = found
 	}
-	owner = strings.TrimSpace(found)
-	if owner == "" {
-		return "", "", "", ""
+	details.Owner = strings.TrimSpace(details.Owner)
+	if details.Owner == "" {
+		return details, "", "", ""
 	}
 
-	ownerShort = owner
+	ownerShort = details.Owner
 	if len(ownerShort) > 12 {
 		ownerShort = ownerShort[:12]
 	}
 	if ownerFilesURLFunc != nil {
-		if u := strings.TrimSpace(ownerFilesURLFunc(owner)); u != "" {
+		if u := strings.TrimSpace(ownerFilesURLFunc(details.Owner)); u != "" {
 			filesURL = template.URL(u)
 		}
 	}
 	if ownerDetailsURLFn != nil {
-		if u := strings.TrimSpace(ownerDetailsURLFn(owner)); u != "" {
+		if u := strings.TrimSpace(ownerDetailsURLFn(details.Owner)); u != "" {
 			detailsURL = template.URL(u)
 		}
 	}
-	return owner, ownerShort, filesURL, detailsURL
+	return details, ownerShort, filesURL, detailsURL
 }
 
 func isUnlocked(r *http.Request) bool {
@@ -3276,6 +3300,9 @@ var htmlTmpl = `
                             {{end}}
                         </div>
                         {{end}}
+                        {{if not .IsDir}}
+                        <div class="tile-owner-line">{{.Downloads}} downloads</div>
+                        {{end}}
                     </div>
                 </div>
                 {{end}}
@@ -3362,6 +3389,7 @@ var htmlTmpl = `
                     <th>Uploader</th>
                     <th><a href="?sort=modified&order={{if eq .SortBy "modified"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}desc{{end}}">Last Modified</a></th>
                     <th><a href="?sort=size&order={{if eq .SortBy "size"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}asc{{end}}">Size</a></th>
+                    <th><a href="?sort=downloads&order={{if eq .SortBy "downloads"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}desc{{end}}">Downloads</a></th>
                     <th>Description</th>
                 </tr>
             </thead>
@@ -3369,6 +3397,7 @@ var htmlTmpl = `
                 {{if ne .CurrentPath ""}}
                 <tr>
                     <td><a href="{{.ParentURL}}">Parent Directory</a></td>
+                    <td>-</td>
                     <td>-</td>
                     <td>-</td>
                     <td>-</td>
@@ -3399,11 +3428,12 @@ var htmlTmpl = `
                     </td>
                     <td class="classic-meta">{{.ModTime}}</td>
                     <td class="classic-meta classic-size">{{if .IsDir}}{{.TotalSizeReadable}}{{else}}{{.SizeReadable}}{{end}}</td>
+                    <td class="classic-meta">{{if .IsDir}}-{{else}}{{.Downloads}}{{end}}</td>
                     <td class="classic-meta classic-desc">{{.Category}}</td>
                 </tr>
                 {{end}}
                 {{if not .Files}}
-                <tr><td colspan="5"><em>Empty directory</em></td></tr>
+                <tr><td colspan="6"><em>Empty directory</em></td></tr>
                 {{end}}
             </tbody>
         </table>
@@ -3446,6 +3476,11 @@ var htmlTmpl = `
                     </a>
                 </th>
                 <th scope="col">
+                    <a href="?sort=downloads&order={{if eq .SortBy "downloads"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}desc{{end}}">
+                        Downloads{{if eq .SortBy "downloads"}}<span class="sort-arrow" aria-hidden="true">{{if eq .Order "asc"}}▲{{else}}▼{{end}}</span>{{end}}
+                    </a>
+                </th>
+                <th scope="col">
                     <a href="?sort=modified&order={{if eq .SortBy "modified"}}{{if eq .Order "asc"}}desc{{else}}asc{{end}}{{else}}desc{{end}}">
                         Modified{{if eq .SortBy "modified"}}<span class="sort-arrow" aria-hidden="true">{{if eq .Order "asc"}}▲{{else}}▼{{end}}</span>{{end}}
                     </a>
@@ -3455,7 +3490,7 @@ var htmlTmpl = `
         <tbody>
             {{if ne .CurrentPath ""}}
             <tr class="is-dir parent-row" data-is-parent="true" onclick="window.location='{{.ParentURL}}{{if .SortSuffix}}?{{.SortSuffix}}{{end}}'">
-                <td colspan="4">
+                <td colspan="5">
                     <div class="cell-name">
                         <svg class="icon muted" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                             <polyline points="9 14 4 9 9 4"/>
@@ -3508,6 +3543,7 @@ var htmlTmpl = `
                     {{end}}
                 </td>
                 <td class="cell-meta cell-size">{{if .IsDir}}{{.TotalSizeReadable}}{{else}}{{.SizeReadable}}{{end}}</td>
+                <td class="cell-meta">{{if .IsDir}}-{{else}}{{.Downloads}}{{end}}</td>
                 <td class="cell-meta">{{.ModTime}}</td>
             </tr>
             {{end}}
@@ -4789,6 +4825,9 @@ function renderPreview(d) {
     html += '<div class="preview-meta">';
     html += metaRow('Size', d.size);
     html += metaRow('Modified', d.mod_time);
+    if (!d.is_dir) {
+        html += metaRow('Downloads', Number(d.downloads || 0).toLocaleString());
+    }
     if (d.owner) {
         if (d.owner_files_url) {
             html += metaRowHTML('Owner', '<a class="owner-chip" href="' + esc(d.owner_files_url) + '" title="' + esc(d.owner) + '"><code>' + esc(d.owner.length > 12 ? d.owner.slice(0, 12) : d.owner) + '</code></a>');
@@ -5054,6 +5093,7 @@ function renderOwnerDetails(payload) {
         + '</div>'
         + '<div class="owner-details-grid">'
         + ownerDetailsStat('Last login', stats.last_login || 'Never')
+        + ownerDetailsStat('Seen', String(stats.seen || 0) + ' logins')
         + ownerDetailsStat('Last address', stats.last_address || 'Never')
         + ownerDetailsStat('Uploads', String(stats.upload_count || 0) + ' files')
         + ownerDetailsStat('Uploaded', formatBytes(stats.upload_bytes || 0))
@@ -5321,6 +5361,7 @@ function mountStlScene(canvas, geo) {
     <option value="name"     {{if or (eq .SortBy "name") (eq .SortBy "")}}selected{{end}}>Name</option>
     <option value="modified" {{if eq .SortBy "modified"}}selected{{end}}>Modified</option>
     <option value="size"     {{if eq .SortBy "size"}}selected{{end}}>Size</option>
+    <option value="downloads" {{if eq .SortBy "downloads"}}selected{{end}}>Downloads</option>
 </select>
 <a href="?sort={{$sortBy}}&order={{$nextOrder}}"
    class="sort-order-btn{{if eq $curOrder "asc"}} active{{end}}"
@@ -5509,6 +5550,7 @@ function mountStlScene(canvas, geo) {
             <span class="locked-text" title="Upload a file to unlock downloads">{{.Name}}</span>
         {{end}}
         <span class="tree-size">{{.SizeReadable}}</span>
+        <span class="tree-size">{{.Downloads}} dl</span>
         {{if $unlocked}}
         <button class="copy-link-btn" onclick="copyLink(event, '{{.URL}}')" aria-label="Copy link to {{.Name}}" title="Copy link">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

@@ -30,6 +30,16 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 		BasePath:       adminexplorer.DefaultBasePath,
 		EmbedAssets:    false,
 		MaxUploadBytes: s.cfg.MaxFileSize,
+		LookupFileDetails: func(relPath string) (adminexplorer.FileDetails, error) {
+			meta, err := s.store.GetFileAdminMeta(relPath)
+			if err != nil {
+				return adminexplorer.FileDetails{}, err
+			}
+			return adminexplorer.FileDetails{
+				Owner:     meta.OwnerHash,
+				Downloads: meta.Downloads,
+			}, nil
+		},
 		LookupOwner: func(relPath string) (string, error) {
 			return s.store.GetFileOwner(relPath)
 		},
