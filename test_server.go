@@ -14,6 +14,8 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -83,11 +85,13 @@ func (r *selfTestRunner) run() SelfTestReport {
 	firstAuth, firstLabel, firstHash := r.newPubKeyAuth()
 	secondAuth, secondLabel, secondHash := r.newPubKeyAuth()
 	banVictimAuth, banVictimLabel, banVictimHash := r.newPubKeyAuthWithHash()
+	botAuth, botLabel, botHash := r.newPubKeyAuthWithHash()
 	kbAuth, kbLabel, kbHash := r.newKbAuth()
 
 	r.rememberTestUser(firstHash, "first ("+firstLabel+")")
 	r.rememberTestUser(secondHash, "second ("+secondLabel+")")
 	r.rememberTestUser(banVictimHash, "ban_victim ("+banVictimLabel+")")
+	r.rememberTestUser(botHash, "sshdbot ("+botLabel+")")
 	r.rememberTestUser(kbHash, "kbint ("+kbLabel+")")
 	if r.cfg.SshNoAuth {
 		r.rememberActivityUser(stAnonHash("127.0.0.1"), "noauth (127.0.0.1)")
@@ -98,6 +102,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 		"first", firstLabel,
 		"second", secondLabel,
 		"ban_victim", banVictimLabel,
+		"sshdbot", botLabel,
 		"kbint", kbLabel,
 	)
 
@@ -134,6 +139,7 @@ func (r *selfTestRunner) run() SelfTestReport {
 	suites = append(suites, r.runAdminSFTP())
 	suites = append(suites, r.runAdminSFTPConfiguredKey())
 	suites = append(suites, r.runBanUnban(banVictimAuth, banVictimLabel, banVictimHash, preexisting))
+	suites = append(suites, r.runPurgeSSHDBot(botAuth, botLabel, botHash))
 	suites = append(suites, r.runOwnerCleanup(firstAuth, preexisting))
 
 	// ── log each suite then print report ─────────────────────────────────────
@@ -648,6 +654,139 @@ func (r *selfTestRunner) runBanUnban(victimAuth ssh.AuthMethod, victimLabel, vic
 	r.checkDelete(s, sftpCli, victimFile, true)
 	_ = sftpCli.Close()
 	_ = sshCli.Close()
+
+	return s
+}
+
+func (r *selfTestRunner) runPurgeSSHDBot(auth ssh.AuthMethod, botLabel, botHash string) *stSuite {
+	s := r.startSuite("Purge SSHD bot (" + botLabel + ")")
+	defer r.finishSuite(s)
+
+	if r.srv == nil || r.srv.store == nil || r.srv.store.blacklist == nil || r.srv.store.badFileList == nil {
+		s.skip("sshdbot coverage", "support lists unavailable")
+		return s
+	}
+
+	blacklistPath := strings.TrimSpace(r.srv.store.blacklistPath)
+	badFilesPath := strings.TrimSpace(r.srv.store.badFilesPath)
+	if blacklistPath == "" || badFilesPath == "" {
+		s.skip("sshdbot coverage", "support list paths unavailable")
+		return s
+	}
+
+	blacklistOrig, hadBlacklist, err := stReadOptionalFile(blacklistPath)
+	s.check("read blacklist file", err)
+	if err != nil {
+		return s
+	}
+	badFilesOrig, hadBadFiles, err := stReadOptionalFile(badFilesPath)
+	s.check("read bad file list", err)
+	if err != nil {
+		return s
+	}
+
+	defer func() {
+		restoreErr := stRestoreOptionalFile(blacklistPath, blacklistOrig, hadBlacklist)
+		s.check("restore blacklist file", restoreErr)
+		_, _, reloadErr := r.srv.store.blacklist.Reload()
+		s.check("reload blacklist after restore", reloadErr)
+
+		restoreErr = stRestoreOptionalFile(badFilesPath, badFilesOrig, hadBadFiles)
+		s.check("restore bad file list", restoreErr)
+		_, reloadErr = r.srv.store.badFileList.Reload()
+		s.check("reload bad file list after restore", reloadErr)
+	}()
+
+	sshCli, sftpCli, err := r.openSFTP(auth)
+	s.check("connect as sshdbot seed user", err)
+	if err != nil {
+		return s
+	}
+	defer sshCli.Close()
+	defer sftpCli.Close()
+
+	botDir := "." + stRandDigits()
+	botFile := path.Join(botDir, "sshd")
+	victimFile := "selftest_sshdbot_victim_" + stRandHex() + ".txt"
+	botPayload := []byte("fake sshd payload for self-test\n")
+	victimPayload := []byte("file that should be purged with the sshd bot user\n")
+
+	s.check("mkdir sshdbot folder", sftpCli.Mkdir(botDir))
+	r.checkWrite(s, sftpCli, botFile, botPayload, true)
+	r.checkFileContent(s, botFile, botPayload)
+	r.checkWrite(s, sftpCli, victimFile, victimPayload, true)
+	r.checkFileContent(s, victimFile, victimPayload)
+
+	stats, err := r.srv.store.GetUserStats(botHash)
+	s.check("get sshdbot user stats before purge", err)
+	s.assert("sshdbot user exists before purge", err == nil && !stats.FirstTimer)
+
+	callbackIPs := []string{"198.51.100.10", "203.0.113.77"}
+	cmd := fmt.Sprintf("chmod +x ./%s;nohup ./%s %s %s &", botFile, botFile, callbackIPs[0], callbackIPs[1])
+	s.wantFail("exec sshdbot payload rejected", r.tryExecCommand(auth, cmd))
+
+	_, _, err = r.srv.store.blacklist.Reload()
+	s.check("reload blacklist after sshdbot purge", err)
+	_, err = r.srv.store.badFileList.Reload()
+	s.check("reload bad file list after sshdbot purge", err)
+	if err != nil {
+		return s
+	}
+
+	_, statErr := os.Stat(r.local(botFile))
+	s.assert("sshdbot binary removed from disk", errors.Is(statErr, os.ErrNotExist))
+	_, statErr = os.Stat(r.local(victimFile))
+	s.assert("sshdbot owned files removed from disk", errors.Is(statErr, os.ErrNotExist))
+	s.assert("sshdbot binary metadata removed", !r.srv.store.FileExistsInDB(botFile))
+	s.assert("sshdbot victim metadata removed", !r.srv.store.FileExistsInDB(victimFile))
+
+	stats, err = r.srv.store.GetUserStats(botHash)
+	s.check("get sshdbot user stats after purge", err)
+	s.assert("sshdbot user removed from users table", err == nil && stats.FirstTimer)
+
+	payloadHash := fmt.Sprintf("%x", sha256.Sum256(botPayload))
+	s.assert("sshdbot binary hash added to bad file list", r.srv.store.badFileList.Matches(payloadHash))
+	for _, ip := range callbackIPs {
+		s.assert("sshdbot callback IP blacklisted: "+ip, r.srv.store.blacklist.Matches(ip))
+	}
+
+	var eventPath, eventMeta, eventIP string
+	err = r.srv.store.db.QueryRow(`
+		SELECT
+			IFNULL(path, ''),
+			IFNULL(meta, ''),
+			IFNULL(ip_address, '')
+		FROM log
+		WHERE id > ? AND event = ? AND user_id = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`, s.logStartID, EventAdminSSHDBotDetected, botHash).Scan(&eventPath, &eventMeta, &eventIP)
+	s.check("query sshdbot detection event", err)
+	if err != nil {
+		return s
+	}
+
+	s.assert("sshdbot event path recorded", eventPath == "./"+botFile)
+	s.assert("sshdbot event includes remote ip", strings.TrimSpace(eventIP) != "")
+	if strings.TrimSpace(eventIP) != "" {
+		s.assert("sshdbot source host blacklisted", r.srv.store.blacklist.Matches(eventIP))
+	}
+
+	var meta struct {
+		Cmd string   `json:"cmd"`
+		Ips []string `json:"ips"`
+	}
+	err = json.Unmarshal([]byte(eventMeta), &meta)
+	s.check("parse sshdbot event meta", err)
+	if err != nil {
+		return s
+	}
+
+	s.assert("sshdbot event command recorded", meta.Cmd == cmd)
+	s.assert(
+		"sshdbot event callback IPs recorded",
+		len(meta.Ips) == len(callbackIPs) && meta.Ips[0] == callbackIPs[0] && meta.Ips[1] == callbackIPs[1],
+	)
 
 	return s
 }
@@ -1167,6 +1306,10 @@ func (r *selfTestRunner) openSFTPNoAuth() (*ssh.Client, *sftp.Client, error) {
 }
 
 func (r *selfTestRunner) tryExec(auth ssh.AuthMethod) error {
+	return r.tryExecCommand(auth, "ls")
+}
+
+func (r *selfTestRunner) tryExecCommand(auth ssh.AuthMethod, cmd string) error {
 	cli, err := r.dialSSH(r.sshCfg(auth))
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -1177,7 +1320,7 @@ func (r *selfTestRunner) tryExec(auth ssh.AuthMethod) error {
 		return fmt.Errorf("new session: %w", err)
 	}
 	defer sess.Close()
-	if err := sess.Run("ls"); err != nil {
+	if err := sess.Run(cmd); err != nil {
 		return err
 	}
 	return nil
@@ -1337,9 +1480,36 @@ func stRandHex() string {
 	return fmt.Sprintf("%08x", binary.BigEndian.Uint32(b))
 }
 
+func stRandDigits() string {
+	b := make([]byte, 4)
+	cryptorand.Read(b) //nolint:errcheck
+	return fmt.Sprintf("%d", binary.BigEndian.Uint32(b))
+}
+
 func stAnonHash(ip string) string {
 	sum := sha256.Sum256([]byte("anon-auth:" + strings.TrimSpace(ip)))
 	return fmt.Sprintf("anon-auth:%x", sum)
+}
+
+func stReadOptionalFile(filename string) ([]byte, bool, error) {
+	data, err := os.ReadFile(filename)
+	if err == nil {
+		return data, true, nil
+	}
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func stRestoreOptionalFile(filename string, data []byte, existed bool) error {
+	if existed {
+		return os.WriteFile(filename, data, permFile)
+	}
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func stTrunc(s string, n int) string {

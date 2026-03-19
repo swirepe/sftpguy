@@ -68,6 +68,7 @@ func TestSourceSnapshotBuildAndSelfTest(t *testing.T) {
 		"-blacklist", filepath.Join(runtimeDir, "blacklist.txt"),
 		"-whitelist", filepath.Join(runtimeDir, "whitelist.txt"),
 		"-admin.keys", filepath.Join(runtimeDir, "admin_keys.txt"),
+		"-bad", filepath.Join(runtimeDir, "bad_files.txt"),
 	)
 }
 

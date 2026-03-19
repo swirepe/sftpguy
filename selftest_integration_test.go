@@ -39,6 +39,7 @@ func TestServerSelfTestSuite(t *testing.T) {
 		BlacklistPath:        filepath.Join(tmpDir, "blacklist.txt"),
 		WhitelistPath:        filepath.Join(tmpDir, "whitelist.txt"),
 		AdminKeysPath:        filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:         filepath.Join(tmpDir, "bad_files.txt"),
 	}
 
 	// Create list files so reloaders start cleanly.
@@ -50,6 +51,9 @@ func TestServerSelfTestSuite(t *testing.T) {
 	}
 	if err := os.WriteFile(cfg.AdminKeysPath, []byte(""), permFile); err != nil {
 		t.Fatalf("write admin keys file: %v", err)
+	}
+	if err := os.WriteFile(cfg.BadFilesPath, []byte(""), permFile); err != nil {
+		t.Fatalf("write bad files file: %v", err)
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
