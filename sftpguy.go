@@ -1692,15 +1692,16 @@ func (s *Server) PurgeSshdBot(pubHash string, sessionID string, remoteAddr net.A
 		return
 	}
 	// if you've gotten here, you are sshdbot
-	s.logger.Info("sshdbot detected", "path", sshdPath, "ips", ips)
-	comment := fmt.Sprintf("[sshdbot] %s ips: %d", time.Now(), len(ips))
-	s.store.blacklist.AddWithComment(comment, ips...)
 	host, _, _ := net.SplitHostPort(remoteAddr.String())
+	s.logger.Info("sshdbot detected", "path", sshdPath, "host", host, "ips", ips, "cmd", cmd.Value)
+	comment := fmt.Sprintf("[sshdbot] host: %s, %s ips: %d", time.Now(), host, len(ips))
+	s.store.blacklist.AddWithComment(comment, ips...)
+
 	s.store.blacklist.AddRange(host, 24, comment)
 	s.store.badFileList.AddFile(absPath)
 	s.PurgeUser(pubHash)
 
-	s.store.LogEvent(EventAdminSSHDBotDetected, pubHash, sessionID, remoteAddr, "path", cmd.Value, "ips", ips)
+	s.store.LogEvent(EventAdminSSHDBotDetected, pubHash, sessionID, remoteAddr, "path", sshdPath, "cmd", cmd.Value, "ips", ips)
 }
 
 func (s *Server) userGroup(pubHash, sessionID string, remoteAddr net.Addr) slog.Attr {
