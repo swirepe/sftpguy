@@ -470,8 +470,10 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		adminKeysPath: adminKeysPath,
 		badFilesPath:  badFilesPath}
 
-	if _, err := store.migrateLegacyIPBans(); err != nil {
+	if migrated, err := store.migrateLegacyIPBans(); err != nil {
 		logger.Warn("failed to migrate legacy ip bans", "err", err)
+	} else {
+		logger.Info("Migrated legacy ip bans table", "count", migrated)
 	}
 
 	return store, nil
