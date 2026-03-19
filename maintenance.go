@@ -57,6 +57,12 @@ func (s *Store) migrateLegacyIPBans() (migrated int, err error) {
 			logger.Warn("failed to migrate legacy ip ban", "ip", ip, "err", err)
 			continue
 		}
+		// Note: We delete even if 'added' is false, because 'false'  means
+		// the IP was already in the new blacklist, so it's safe to remove from legacy.
+		_, delErr := s.db.Exec(`DELETE FROM ip_banned WHERE ip_address = ?`, ip)
+		if delErr != nil {
+			logger.Error("failed to remove migrated ip from legacy table", "ip", ip, "err", delErr)
+		}
 		if added {
 			migrated++
 		}
