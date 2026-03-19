@@ -24,6 +24,14 @@ type IPList struct {
 	mu          sync.Mutex // Protects file writes
 }
 
+type IPListEntry struct {
+	Raw        string
+	Value      string
+	Normalized string
+	Comment    string
+	ExactIP    string
+}
+
 type ipReloadResult struct {
 	entries   int
 	addresses uint64
@@ -111,7 +119,7 @@ func (bl *IPList) AddWithComment(comment string, ips ...string) {
 	}
 
 	var sb strings.Builder
-	cleanComment := strings.ReplaceAll(comment, "\n", " ")
+	cleanComment := sanitizeIPListComment(comment)
 
 	if len(ips) == 1 {
 		sb.WriteString(fmt.Sprintf("%s # %s\n", ips[0], cleanComment))
@@ -136,6 +144,115 @@ func (bl *IPList) AddWithComment(comment string, ips ...string) {
 		default:
 		}
 	}
+}
+
+func (bl *IPList) AddExactIPWithComment(ip, comment string) (bool, error) {
+	exactIP := canonicalExactIPEntry(ip)
+	if exactIP == "" {
+		return false, fmt.Errorf("invalid IP: %s", ip)
+	}
+
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	content, err := bl.readContentUnlocked()
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range parseIPListEntries(content) {
+		if entry.ExactIP == exactIP {
+			return false, nil
+		}
+	}
+
+	line := exactIP
+	if cleanComment := sanitizeIPListComment(comment); cleanComment != "" {
+		line = fmt.Sprintf("%s # %s", exactIP, cleanComment)
+	}
+
+	f, err := os.OpenFile(bl.filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return false, fmt.Errorf("failed to open file for writing: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return false, fmt.Errorf("failed to write to file: %w", err)
+	}
+
+	if _, _, err := bl.reloadUnlocked(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (bl *IPList) ExactEntries() ([]IPListEntry, error) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	content, err := bl.readContentUnlocked()
+	if err != nil {
+		return nil, err
+	}
+
+	all := parseIPListEntries(content)
+	exact := make([]IPListEntry, 0, len(all))
+	for _, entry := range all {
+		if entry.ExactIP != "" {
+			exact = append(exact, entry)
+		}
+	}
+	return exact, nil
+}
+
+func (bl *IPList) RemoveExactIP(ip string) (bool, error) {
+	exactIP := canonicalExactIPEntry(ip)
+	if exactIP == "" {
+		return false, fmt.Errorf("invalid IP: %s", ip)
+	}
+
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	content, err := bl.readContentUnlocked()
+	if err != nil {
+		return false, err
+	}
+	if content == "" {
+		return false, nil
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	lines := make([]string, 0, strings.Count(content, "\n")+1)
+	removed := false
+	for scanner.Scan() {
+		rawLine := scanner.Text()
+		entry, ok := parseIPListEntry(rawLine)
+		if ok && entry.ExactIP == exactIP {
+			removed = true
+			continue
+		}
+		lines = append(lines, rawLine)
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("failed to scan file: %w", err)
+	}
+	if !removed {
+		return false, nil
+	}
+
+	rewritten := strings.Join(lines, "\n")
+	if rewritten != "" {
+		rewritten += "\n"
+	}
+	if err := os.WriteFile(bl.filepath, []byte(rewritten), 0644); err != nil {
+		return false, fmt.Errorf("failed to rewrite file: %w", err)
+	}
+
+	if _, _, err := bl.reloadUnlocked(); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // AddRange adds a new IP or CIDR to the file and triggers a reload.
@@ -180,7 +297,7 @@ func (bl *IPList) AddRange(host string, mask int, comment string) error {
 
 	line := cidrStr
 	if comment != "" {
-		line = fmt.Sprintf("%s # %s", cidrStr, comment)
+		line = fmt.Sprintf("%s # %s", cidrStr, sanitizeIPListComment(comment))
 	}
 
 	if _, err := f.WriteString(line + "\n"); err != nil {
@@ -205,6 +322,10 @@ func (bl *IPList) Stop() {
 func (bl *IPList) Reload() (entries int, addresses uint64, err error) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
+	return bl.reloadUnlocked()
+}
+
+func (bl *IPList) reloadUnlocked() (entries int, addresses uint64, err error) {
 	newRanger := cidranger.NewPCTrieRanger()
 
 	file, err := os.Open(bl.filepath)
@@ -323,10 +444,76 @@ func (bl *IPList) EnsureContent(content string) (int, error) {
 		}
 	}
 
-	if _, _, err := bl.Reload(); err != nil {
+	if _, _, err := bl.reloadUnlocked(); err != nil {
 		return len(linesToAppend), err
 	}
 	return len(linesToAppend), nil
+}
+
+func sanitizeIPListComment(comment string) string {
+	return strings.TrimSpace(strings.ReplaceAll(comment, "\n", " "))
+}
+
+func canonicalExactIPEntry(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String()
+	}
+	_, network, err := net.ParseCIDR(value)
+	if err != nil || network == nil || network.IP == nil {
+		return ""
+	}
+	ones, bits := network.Mask.Size()
+	if ones != bits {
+		return ""
+	}
+	return network.IP.String()
+}
+
+func parseIPListEntry(raw string) (IPListEntry, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return IPListEntry{}, false
+	}
+
+	entry := IPListEntry{Raw: raw}
+	if idx := strings.Index(line, "#"); idx >= 0 {
+		entry.Comment = strings.TrimSpace(line[idx+1:])
+		line = strings.TrimSpace(line[:idx])
+	}
+	if line == "" {
+		return IPListEntry{}, false
+	}
+
+	entry.Value = line
+	entry.Normalized = normalizeIPPattern(line)
+	entry.ExactIP = canonicalExactIPEntry(entry.Normalized)
+	return entry, true
+}
+
+func parseIPListEntries(content string) []IPListEntry {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	entries := make([]IPListEntry, 0, 8)
+	for scanner.Scan() {
+		if entry, ok := parseIPListEntry(scanner.Text()); ok {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+func (bl *IPList) readContentUnlocked() (string, error) {
+	b, err := os.ReadFile(bl.filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read file: %w", err)
+	}
+	return string(b), nil
 }
 
 func normalizeIPPattern(input string) string {

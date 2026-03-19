@@ -297,8 +297,12 @@ func readArchiveMetricsSnapshot(store *Store, contributorThreshold int64) (archi
 		return snap, err
 	}
 
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM ip_banned`).Scan(&snap.bannedIPs); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return snap, err
+	if store.blacklist != nil {
+		entries, err := store.blacklist.ExactEntries()
+		if err != nil {
+			return snap, err
+		}
+		snap.bannedIPs = int64(len(entries))
 	}
 
 	return snap, nil

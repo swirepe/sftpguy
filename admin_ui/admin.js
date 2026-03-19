@@ -1323,7 +1323,6 @@
           "<span class=\"pill\">ip <code>" + esc(test.ip || "") + "</code></span>" +
           "<span class=\"tag " + (m.whitelist ? "ok" : "") + "\">whitelist=" + esc(m.whitelist ? "yes" : "no") + "</span>" +
           "<span class=\"tag " + (m.blacklist ? "bad" : "") + "\">blacklist=" + esc(m.blacklist ? "yes" : "no") + "</span>" +
-          "<span class=\"tag " + (m.db_banned ? "warn" : "") + "\">db_banned=" + esc(m.db_banned ? "yes" : "no") + "</span>" +
           "<span class=\"tag " + (m.effective_banned ? "bad" : "ok") + "\">effective=" + esc(m.effective_banned ? "BANNED" : "ALLOWED") + "</span>" +
         "</div>" +
         "<div class=\"muted\">Whitelist has highest precedence.</div>";

@@ -65,19 +65,21 @@ func (s *Store) IsBanned(pubkeyHash string) bool {
 }
 
 func (s *Store) IsIPBanned(ip string) bool {
-	if s.whitelist.Matches(ip) {
+	if s == nil {
+		return false
+	}
+
+	if s.whitelist != nil && s.whitelist.Matches(ip) {
 		s.logger.Debug("IP is whitelisted", "ip", ip)
 		return false
 	}
 
-	if s.blacklist.Matches(ip) {
+	if s.blacklist != nil && s.blacklist.Matches(ip) {
 		s.logger.Debug("IP is blacklisted", "ip", ip)
 		return true
 	}
 
-	var exists bool
-	s.db.QueryRow("SELECT 1 FROM ip_banned WHERE ip_address = ?", ip).Scan(&exists)
-	return exists
+	return false
 }
 
 func (s *Store) IsBannedByIp(remoteAddr net.Addr) bool {
@@ -198,7 +200,10 @@ func (s *Server) Ban(pubHash string) {
 
 func (s *Server) Unban(pubHash string) {
 	s.store.exec("DELETE FROM shadow_banned WHERE pubkey_hash = ?", pubHash)
-	s.store.exec("DELETE FROM ip_banned WHERE ip_address = ?", pubHash)
+}
+
+func adminIPBanComment(ts time.Time) string {
+	return "admin ban at " + ts.Format(time.RFC3339)
 }
 
 func (s *Server) PurgeUser(pubHash string) error {

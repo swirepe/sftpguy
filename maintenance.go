@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -26,6 +27,77 @@ type MaintenanceResult struct {
 	CleanDeleted          CleanDeletedResult          `json:"clean_deleted"`
 	ReconcileOrphans      ReconcileOrphansResult      `json:"reconcile_orphans"`
 	PurgeBlacklistedFiles PurgeBlackListedFilesResult `json:"purge_blacklisted_files"`
+}
+
+func (s *Store) migrateLegacyIPBans() (migrated int, err error) {
+	if s == nil || s.db == nil || s.blacklist == nil {
+		return -1, nil
+	}
+
+	exists, err := s.tableExists("ip_banned")
+	if err != nil || !exists {
+		return 0, err
+	}
+
+	rows, err := s.db.Query(`SELECT ip_address, banned_at FROM ip_banned ORDER BY banned_at ASC`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	logger := s.logger.WithGroup("maintenance").With("operation", "migrate_legacy_ip_bans")
+	for rows.Next() {
+		var ip string
+		var bannedAt string
+		if err := rows.Scan(&ip, &bannedAt); err != nil {
+			return 0, err
+		}
+		added, err := s.blacklist.AddExactIPWithComment(ip, legacyIPBanComment(bannedAt))
+		if err != nil {
+			logger.Warn("failed to migrate legacy ip ban", "ip", ip, "err", err)
+			continue
+		}
+		if added {
+			migrated++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if migrated > 0 {
+		logger.Info("migrated legacy ip bans to blacklist", "count", migrated)
+	}
+	return migrated, nil
+}
+
+func (s *Store) tableExists(name string) (bool, error) {
+	var exists int
+	err := s.db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return exists == 1, nil
+}
+
+func legacyIPBanComment(bannedAt string) string {
+	return "migrated from ip_banned at " + normalizeBanTimestamp(bannedAt)
+}
+
+func normalizeBanTimestamp(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Now().Format(time.RFC3339)
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.Format(time.RFC3339)
+	}
+	if parsed, err := time.Parse("2006-01-02 15:04:05", value); err == nil {
+		return parsed.Format(time.RFC3339)
+	}
+	return value
 }
 
 func (s *Server) RunMaintenancePass(ctx context.Context) (bool, MaintenanceResult) {

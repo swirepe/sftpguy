@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 )
+
+var ipBanTimestampPattern = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b`)
 
 func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -219,21 +223,25 @@ func (s *Server) handleAdminBanned(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ipRows, err := s.store.db.Query(`SELECT ip_address, banned_at FROM ip_banned ORDER BY banned_at DESC`)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer ipRows.Close()
 	type bannedIP struct {
 		IP       string `json:"ip"`
 		BannedAt string `json:"banned_at"`
+		Comment  string `json:"comment,omitempty"`
 	}
 	ips := make([]bannedIP, 0)
-	for ipRows.Next() {
-		var row bannedIP
-		if err := ipRows.Scan(&row.IP, &row.BannedAt); err == nil {
-			ips = append(ips, row)
+	if s.store.blacklist != nil {
+		entries, err := s.store.blacklist.ExactEntries()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			ips = append(ips, bannedIP{
+				IP:       entry.ExactIP,
+				BannedAt: extractIPBanTimestamp(entry.Comment),
+				Comment:  entry.Comment,
+			})
 		}
 	}
 
@@ -253,16 +261,19 @@ func (s *Server) handleAdminBanIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload.IP = strings.TrimSpace(payload.IP)
-	if net.ParseIP(payload.IP) == nil {
+	parsedIP := net.ParseIP(payload.IP)
+	if parsedIP == nil {
 		http.Error(w, "invalid ip address", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.store.exec("INSERT OR IGNORE INTO ip_banned (ip_address) VALUES (?)", payload.IP); err != nil {
+	payload.IP = parsedIP.String()
+	added, err := s.store.blacklist.AddExactIPWithComment(payload.IP, adminIPBanComment(time.Now()))
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.store.LogEvent(EventAdminBan, systemOwner, "admin-http", nil, "target", payload.IP, "type", "ip")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": payload.IP})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": payload.IP, "added": added})
 }
 
 func (s *Server) handleAdminUnbanIP(w http.ResponseWriter, r *http.Request) {
@@ -271,14 +282,21 @@ func (s *Server) handleAdminUnbanIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/admin/api/banned/ip/"))
-	if net.ParseIP(ip) == nil {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
 		http.Error(w, "invalid ip address", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.store.exec("DELETE FROM ip_banned WHERE ip_address = ?", ip); err != nil {
+	ip = parsedIP.String()
+	removed, err := s.store.blacklist.RemoveExactIP(ip)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.store.LogEvent(EventAdminUnban, systemOwner, "admin-http", nil, "target", ip, "type", "ip")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": ip})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": ip, "removed": removed})
+}
+
+func extractIPBanTimestamp(comment string) string {
+	return ipBanTimestampPattern.FindString(comment)
 }

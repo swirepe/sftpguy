@@ -129,9 +129,6 @@ func (s *Server) handleAdminIPListTest(w http.ResponseWriter, r *http.Request) {
 		blacklistMatch = s.store.blacklist.Matches(ip)
 	}
 
-	var dbFlag int
-	_ = s.store.db.QueryRow(`SELECT 1 FROM ip_banned WHERE ip_address = ?`, ip).Scan(&dbFlag)
-	dbBanned := dbFlag == 1
 	effective := s.store.IsIPBanned(ip)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -139,11 +136,10 @@ func (s *Server) handleAdminIPListTest(w http.ResponseWriter, r *http.Request) {
 		"matches": map[string]any{
 			"whitelist":        whitelistMatch,
 			"blacklist":        blacklistMatch,
-			"db_banned":        dbBanned,
 			"effective_banned": effective,
 		},
 		"notes": map[string]any{
-			"precedence": "whitelist overrides blacklist and db bans",
+			"precedence": "whitelist overrides blacklist",
 		},
 	})
 }

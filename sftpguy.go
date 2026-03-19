@@ -172,11 +172,6 @@ const (
 			ON UPDATE CASCADE
 	);
 
-	CREATE TABLE IF NOT EXISTS ip_banned (
-		ip_address TEXT PRIMARY KEY,
-		banned_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
 	CREATE TABLE IF NOT EXISTS log (
 		id           INTEGER PRIMARY KEY,
 		timestamp    INTEGER NOT NULL,
@@ -464,7 +459,7 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		logger.Info("seeded default bad file hashes", "entries", added)
 	}
 
-	return &Store{db: db,
+	store := &Store{db: db,
 		logger:        logger,
 		blacklist:     black,
 		whitelist:     white,
@@ -473,7 +468,13 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		blacklistPath: blackPath,
 		whitelistPath: whitePath,
 		adminKeysPath: adminKeysPath,
-		badFilesPath:  badFilesPath}, nil
+		badFilesPath:  badFilesPath}
+
+	if _, err := store.migrateLegacyIPBans(); err != nil {
+		logger.Warn("failed to migrate legacy ip bans", "err", err)
+	}
+
+	return store, nil
 }
 
 func (s *Store) transact(fn func(*sql.Tx) error) error {
