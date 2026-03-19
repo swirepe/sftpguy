@@ -89,7 +89,7 @@ func (s *Store) tableExists(name string) (bool, error) {
 }
 
 func legacyIPBanComment(bannedAt string) string {
-	return "migrated from ip_banned at " + normalizeBanTimestamp(bannedAt)
+	return fmt.Sprintf("[%s] migrated from ip_banned; banned_at=%s", time.Now().Format(time.RFC3339), normalizeBanTimestamp(bannedAt))
 }
 
 func normalizeBanTimestamp(value string) string {
