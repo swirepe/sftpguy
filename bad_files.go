@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -147,7 +146,7 @@ func (hl *HashList) Reload() (entries int, err error) {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	scanner := newLongLineScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -214,7 +213,7 @@ func (hl *HashList) AddFile(absPath string) error {
 }
 
 func (hl *HashList) EnsureContent(content string) (int, error) {
-	scanner := bufio.NewScanner(strings.NewReader(content))
+	scanner := newLongLineScanner(strings.NewReader(content))
 	type pendingHash struct {
 		hash     string
 		filename string

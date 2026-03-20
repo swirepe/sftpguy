@@ -190,3 +190,65 @@ func TestHandleAdminMaintenanceLogsFiltersMaintenanceGroup(t *testing.T) {
 		t.Fatalf("unexpected maintenance log fields: %+v", resp.Entries[0].Fields)
 	}
 }
+
+func TestHandleAdminMaintenanceLogsAcceptsLongLines(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	longMsg := strings.Repeat("x", 70*1024)
+	logLine := `time=2026-03-13T10:00:01-04:00 level=INFO msg="` + longMsg + `" maintenance.operation=clean_deleted maintenance.deleted=2`
+	if err := os.WriteFile(srv.cfg.LogFile, []byte(logLine+"\n"), permFile); err != nil {
+		t.Fatalf("write long log file: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/maintenance/logs?q=clean_deleted", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminMaintenanceLogs(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/maintenance/logs status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Entries []adminMaintenanceLogEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode maintenance logs response: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("expected 1 maintenance log entry, got %d", len(resp.Entries))
+	}
+	if resp.Entries[0].Operation != "clean_deleted" {
+		t.Fatalf("unexpected maintenance log operation: got=%q want=%q", resp.Entries[0].Operation, "clean_deleted")
+	}
+	if resp.Entries[0].Fields["deleted"] != "2" {
+		t.Fatalf("unexpected maintenance log fields: %+v", resp.Entries[0].Fields)
+	}
+}
+
+func TestHashListReloadAcceptsLongFilenames(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	longName := strings.Repeat("x", 70*1024)
+	content := hash + "  " + longName + "\n"
+	if err := os.WriteFile(srv.store.badFilesPath, []byte(content), permFile); err != nil {
+		t.Fatalf("write bad files content: %v", err)
+	}
+
+	entries, err := srv.store.badFileList.Reload()
+	if err != nil {
+		t.Fatalf("reload bad file list: %v", err)
+	}
+	if entries != 1 {
+		t.Fatalf("unexpected bad file entry count: got=%d want=1", entries)
+	}
+
+	name, ok := srv.store.badFileList.Lookup(hash)
+	if !ok {
+		t.Fatal("expected hash lookup to succeed after reload")
+	}
+	if name != longName {
+		t.Fatalf("unexpected stored filename length: got=%d want=%d", len(name), len(longName))
+	}
+}

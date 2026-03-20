@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -269,7 +268,7 @@ func readMaintenanceLogEntries(path string, limit int, filter string) ([]adminMa
 
 	filter = strings.ToLower(strings.TrimSpace(filter))
 	lines := make([]string, 0, limit)
-	scanner := bufio.NewScanner(file)
+	scanner := newLongLineScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		lineLower := strings.ToLower(line)

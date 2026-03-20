@@ -261,7 +261,7 @@ func tailFile(filename string, n int, filter string) ([]string, error) {
 	defer file.Close()
 
 	var lines []string
-	scanner := bufio.NewScanner(file)
+	scanner := newLongLineScanner(file)
 	for scanner.Scan() {
 		txt := scanner.Text()
 		if filter == "" || strings.Contains(txt, filter) {
