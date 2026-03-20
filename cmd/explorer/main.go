@@ -719,7 +719,7 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 </head>
 <body>
 {{if .Header}}{{.Header}}{{end}}
-<nav class="bc">
+<nav class="bc" id="top">
 {{- range $i, $c := .Crumbs}}
   {{- if $i}}<span class="sep">/</span>{{end}}
   {{- if $c.IsCurrent}}<span class="cur">{{$c.Name}}</span>
@@ -781,6 +781,9 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 {{end}}
 </tbody>
 </table>
+
+<p><ahref="#top">[return to top]</a></p>
+{{if .Footer}}{{.Footer}}{{end}}
 
 <footer>Rendered in {{.RenderTime}}</footer>
 
