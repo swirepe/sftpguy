@@ -725,6 +725,48 @@ func (r *selfTestRunner) runPurgeSSHDBot(auth ssh.AuthMethod, botLabel, botHash 
 	cmd := fmt.Sprintf("chmod +x ./%s;nohup ./%s %s %s &", botFile, botFile, callbackIPs[0], callbackIPs[1])
 	s.wantFail("exec sshdbot payload rejected", r.tryExecCommand(auth, cmd))
 
+	// The live exec path launches the purge in a goroutine, so wait for its
+	// side effects before asserting on disk, DB, and log state.
+	err = stWaitFor(2*time.Second, func() (bool, error) {
+		_, statErr := os.Stat(r.local(botFile))
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return false, nil
+		}
+
+		_, statErr = os.Stat(r.local(victimFile))
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return false, nil
+		}
+
+		if r.srv.store.FileExistsInDB(botFile) || r.srv.store.FileExistsInDB(victimFile) {
+			return false, nil
+		}
+
+		stats, err := r.srv.store.GetUserStats(botHash)
+		if err != nil {
+			return false, err
+		}
+		if !stats.FirstTimer {
+			return false, nil
+		}
+
+		var eventCount int
+		err = r.srv.store.db.QueryRow(`
+			SELECT COUNT(*)
+			FROM log
+			WHERE id > ? AND event = ? AND user_id = ?
+		`, s.logStartID, EventAdminSSHDBotDetected, botHash).Scan(&eventCount)
+		if err != nil {
+			return false, err
+		}
+
+		return eventCount > 0, nil
+	})
+	s.check("wait for sshdbot purge side effects", err)
+	if err != nil {
+		return s
+	}
+
 	_, _, err = r.srv.store.blacklist.Reload()
 	s.check("reload blacklist after sshdbot purge", err)
 	_, err = r.srv.store.badFileList.Reload()
@@ -1472,6 +1514,23 @@ func stWaitReady(port int, timeout time.Duration) bool {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false
+}
+
+func stWaitFor(timeout time.Duration, fn func() (bool, error)) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := fn()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s", timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func stRandHex() string {

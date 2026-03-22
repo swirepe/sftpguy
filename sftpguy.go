@@ -2674,18 +2674,16 @@ func (sw *statWriter) Close() error {
 
 	sw.h.logUpload(sw.rel, size, delta)
 
-	go func() {
-		purgedBadFile, err := sw.purgeBadUploadIfMatched()
-		if err != nil {
-			sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
-				"path", sw.rel,
-				"owner", sw.h.pubHash,
-				"err", err)
-		}
-		if !purgedBadFile {
-			sw.reportUserStatus(sw.h.pubHash)
-		}
-	}()
+	purgedBadFile, err := sw.purgeBadUploadIfMatched()
+	if err != nil {
+		sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
+			"path", sw.rel,
+			"owner", sw.h.pubHash,
+			"err", err)
+	}
+	if !purgedBadFile {
+		go sw.reportUserStatus(sw.h.pubHash)
+	}
 
 	return nil
 }
