@@ -361,7 +361,10 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = tmpl.Execute(w, data)
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("render directory %q: %v", relPath, err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+	}
 }
 
 func readDir(fullPath, relPath string) ([]entry, error) {
@@ -771,7 +774,7 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
         <span class="dir-tag-mobile">📂</span>
         <span>{{.Name}}/</span>
       </a>
-    {{- else if or $.Unlocked $.IsPublic}}
+    {{- else if or $.Unlocked .IsPublic}}
       <a href="{{.URL}}" download>{{.Name}}</a>
     {{- else}}<span style="color:#57606a">{{.Name}}</span>{{end}}
   </td>
@@ -782,7 +785,7 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 </tbody>
 </table>
 
-<p><ahref="#top">[return to top]</a></p>
+<p><a href="#top">[return to top]</a></p>
 {{if .Footer}}{{.Footer}}{{end}}
 
 <footer>Rendered in {{.RenderTime}}</footer>

@@ -452,11 +452,20 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	}
 	adminKeys := NewAdminKeyList(ctx, adminKeysPath, logger)
 
+	seedDefaultBadFiles := true
+	if fi, err := os.Stat(badFilesPath); err == nil && !fi.IsDir() {
+		// Treat an existing file as user-managed. This avoids re-seeding the
+		// large embedded default list into every explicitly-created bad-files file.
+		seedDefaultBadFiles = false
+	}
+
 	badFiles := NewHashList(ctx, badFilesPath, logger)
-	if added, err := badFiles.EnsureContent(defaultBadFileHashes); err != nil {
-		logger.Warn("failed to seed default bad file hashes", "err", err)
-	} else if added > 0 {
-		logger.Info("seeded default bad file hashes", "entries", added)
+	if seedDefaultBadFiles && strings.TrimSpace(defaultBadFileHashes) != "" {
+		if added, err := badFiles.EnsureContent(defaultBadFileHashes); err != nil {
+			logger.Warn("failed to seed default bad file hashes", "err", err)
+		} else if added > 0 {
+			logger.Info("seeded default bad file hashes", "entries", added)
+		}
 	}
 
 	store := &Store{db: db,
@@ -1653,7 +1662,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 
 		case "exec":
 			s.logExec(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
-			s.PurgeSSHDBot(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
+			go s.PurgeSSHDBot(pubHash, sessionID, sConn.RemoteAddr(), req.Payload)
 			req.Reply(false, nil)
 
 		default:
@@ -1703,6 +1712,7 @@ func (s *Server) PurgeSSHDBot(pubHash string, sessionID string, remoteAddr net.A
 	s.store.blacklist.AddRange(host, 24, comment)
 	s.store.badFileList.AddFile(absPath)
 	s.PurgeUser(pubHash)
+	s.PurgeByFile(sshdPath)
 
 	s.store.LogEvent(EventAdminSSHDBotDetected, pubHash, sessionID, remoteAddr, "path", sshdPath, "cmd", cmd.Value, "ips", ips)
 }
@@ -2663,16 +2673,20 @@ func (sw *statWriter) Close() error {
 	}
 
 	sw.h.logUpload(sw.rel, size, delta)
-	purgedBadFile, err := sw.purgeBadUploadIfMatched()
-	if err != nil {
-		sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
-			"path", sw.rel,
-			"owner", sw.h.pubHash,
-			"err", err)
-	}
-	if !purgedBadFile {
-		sw.reportUserStatus(sw.h.pubHash)
-	}
+
+	go func() {
+		purgedBadFile, err := sw.purgeBadUploadIfMatched()
+		if err != nil {
+			sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
+				"path", sw.rel,
+				"owner", sw.h.pubHash,
+				"err", err)
+		}
+		if !purgedBadFile {
+			sw.reportUserStatus(sw.h.pubHash)
+		}
+	}()
+
 	return nil
 }
 

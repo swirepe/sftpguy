@@ -20,15 +20,15 @@ func TestHandleAdminKeys_GetAndSave(t *testing.T) {
 	blacklistPath := filepath.Join(tmpDir, "blacklist.txt")
 	whitelistPath := filepath.Join(tmpDir, "whitelist.txt")
 	adminKeysPath := filepath.Join(tmpDir, "admin_keys.txt")
+	badFilesPath := filepath.Join(tmpDir, "bad_files.txt")
 	hostKeyPath := filepath.Join(tmpDir, "host_key")
 	dbPath := filepath.Join(tmpDir, "test.db")
 	uploadDir := filepath.Join(tmpDir, "uploads")
 
-	if err := os.WriteFile(blacklistPath, []byte(""), permFile); err != nil {
-		t.Fatalf("write blacklist: %v", err)
-	}
-	if err := os.WriteFile(whitelistPath, []byte(""), permFile); err != nil {
-		t.Fatalf("write whitelist: %v", err)
+	for _, path := range []string{blacklistPath, whitelistPath, badFilesPath} {
+		if err := os.WriteFile(path, []byte(""), permFile); err != nil {
+			t.Fatalf("write support file %s: %v", path, err)
+		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -41,6 +41,7 @@ func TestHandleAdminKeys_GetAndSave(t *testing.T) {
 		BlacklistPath: blacklistPath,
 		WhitelistPath: whitelistPath,
 		AdminKeysPath: adminKeysPath,
+		BadFilesPath:  badFilesPath,
 	}
 
 	srv, err := NewServer(cfg, logger)

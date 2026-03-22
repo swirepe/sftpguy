@@ -42,9 +42,10 @@ func TestPrometheusMetricsExposeSFTPTraffic(t *testing.T) {
 		BlacklistPath:        filepath.Join(tmpDir, "blacklist.txt"),
 		WhitelistPath:        filepath.Join(tmpDir, "whitelist.txt"),
 		AdminKeysPath:        filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:         filepath.Join(tmpDir, "bad_files.txt"),
 	}
 
-	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath} {
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath} {
 		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
 			t.Fatalf("write support file %s: %v", p, err)
 		}
