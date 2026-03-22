@@ -280,11 +280,17 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
+	var oldSize int64
 	err = h.withTx(func(tx *sql.Tx) error {
 		if err := h.ownerCheck(tx, rel); err != nil {
 			return err
 		}
-		_, err := tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, 0, 0)", rel, h.hash)
+		switch err := tx.QueryRow("SELECT size FROM files WHERE path = ?", rel).Scan(&oldSize); err {
+		case nil, sql.ErrNoRows:
+		default:
+			return err
+		}
+		_, err := tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, ?, 0)", rel, h.hash, oldSize)
 		return err
 	})
 	if err != nil {
@@ -297,7 +303,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &statWriter{File: f, h: h, rel: rel}, nil
+	return &statWriter{File: f, h: h, rel: rel, oldSize: oldSize}, nil
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
@@ -371,7 +377,12 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 			if err := os.Rename(full, tFull); err != nil {
 				return err
 			}
-			_, err := tx.Exec("UPDATE files SET path = ? WHERE path = ?", tRel, rel)
+			prefixLen := len(rel) + 1
+			_, err := tx.Exec(`
+				UPDATE files
+				SET path = ? || substr(path, ?)
+				WHERE path = ? OR substr(path, 1, ?) = ?`,
+				tRel, prefixLen, rel, prefixLen, rel+"/")
 			return err
 		})
 	}
@@ -382,8 +393,9 @@ func (h *fsHandler) Filecmd(r *sftp.Request) error {
 
 type statWriter struct {
 	*os.File
-	h   *fsHandler
-	rel string
+	h       *fsHandler
+	rel     string
+	oldSize int64
 }
 
 func (w *statWriter) WriteAt(p []byte, off int64) (int, error) {
@@ -394,24 +406,38 @@ func (w *statWriter) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (w *statWriter) Close() error {
-	w.Sync()
-	fi, _ := w.Stat()
+	if err := w.Sync(); err != nil {
+		_ = w.File.Close()
+		return err
+	}
+	fi, err := w.Stat()
+	if err != nil {
+		_ = w.File.Close()
+		return err
+	}
 	newSize := fi.Size()
 
 	defer w.File.Close()
 
-	tx, _ := w.h.db.Begin()
-	defer tx.Rollback()
-	var oldSize int64
-	tx.QueryRow("SELECT size FROM files WHERE path = ?", w.rel).Scan(&oldSize)
-	delta := max(newSize-oldSize, 0)
-	tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, ?, 0)", w.rel, w.h.hash, newSize)
-	tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash)
-
-	if err := tx.Commit(); err == nil {
-		log.Printf("[UP] %s (%s) by %s", w.rel, formatBytes(newSize), w.h.hash[:8])
-		w.h.printStatus()
+	tx, err := w.h.db.Begin()
+	if err != nil {
+		return err
 	}
+	defer tx.Rollback()
+
+	delta := max(newSize-w.oldSize, 0)
+	if _, err := tx.Exec("INSERT OR REPLACE INTO files (path, owner, size, is_dir) VALUES (?, ?, ?, 0)", w.rel, w.h.hash, newSize); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE users SET uploaded = uploaded + ? WHERE hash = ?", delta, w.h.hash); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	log.Printf("[UP] %s (%s) by %s", w.rel, formatBytes(newSize), w.h.hash[:8])
+	w.h.printStatus()
 	return nil
 }
 
