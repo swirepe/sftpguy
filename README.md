@@ -229,7 +229,8 @@ This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc
 
 This repo also contains a couple of related helper binaries:
 
-- `cmd/mini`: a much smaller stripped-down share-first SFTP server
-- `cmd/explorer`: a standalone HTTP file explorer/uploader
+- [`cmd/mini`](cmd/mini/mini.go): a much smaller stripped-down share-first SFTP server
+- [`cmd/explorer`](cmd/explorer/main.go): a standalone HTTP file explorer/uploader, as seen running at [https://ftp.neuroky.me](https://ftp.neuroky.me)
+- [`cmd/explorer-deluxe`](cmd/explorer-deluxe/main.go): a fancier `cmd/explorer` with thumbnails, a tree view, etc.  The basis of the [admin explorer](internal/adminexplorer/explorer.go), but without the admin capabilities.  
 
 The main project entrypoint is still the root `./sftpguy` binary.
