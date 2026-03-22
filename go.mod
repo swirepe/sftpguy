@@ -1,6 +1,6 @@
 module sftpguy
 
-go 1.24.2
+go 1.25.0
 
 require (
 	github.com/arl/statsviz v0.8.0
@@ -27,7 +27,8 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/image v0.37.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
 
