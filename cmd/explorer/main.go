@@ -232,6 +232,7 @@ func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.
 	}
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
 	http.ServeFile(w, r, fullPath)
+	log.Printf("[%s] READ %s", clientIP(r), relPath)
 }
 
 // ── directory listing ─────────────────────────────────────────────────────────
