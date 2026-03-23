@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
@@ -195,7 +196,7 @@ func isUnderRoot(fullPath string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-// ── GET handler ───────────────────────────────────────────────────────────────
+// ── GET/HEAD handler ──────────────────────────────────────────────────────────
 
 func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
 	info, err := os.Stat(fullPath)
@@ -361,10 +362,21 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 		RenderTime: time.Since(start),
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.Execute(w, data); err != nil {
+	var body bytes.Buffer
+	if err := tmpl.Execute(&body, data); err != nil {
 		log.Printf("render directory %q: %v", relPath, err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", body.Len()))
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := body.WriteTo(w); err != nil {
+		log.Printf("write directory %q: %v", relPath, err)
 	}
 }
 
@@ -628,6 +640,10 @@ func isUnlocked(r *http.Request) bool {
 }
 
 func isPublicPath(fullPath string) bool {
+	if strings.HasSuffix(fullPath, "/robots.txt") {
+		return true
+	}
+
 	rel, err := filepath.Rel(filepath.Join(rootDir, "public"), fullPath)
 	return err == nil && !strings.HasPrefix(rel, "..")
 }

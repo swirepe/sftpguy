@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -88,6 +89,50 @@ func TestHandlePublicFileServesWithoutUnlock(t *testing.T) {
 	}
 	if got := w.Body.String(); got != "hello world" {
 		t.Fatalf("body = %q, want %q", got, "hello world")
+	}
+}
+
+func TestHandleHeadDirectoryListingReturnsHeadersOnly(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustMkdir(t, filepath.Join(root, "public"))
+	mustWriteFile(t, filepath.Join(root, "notes.txt"), "hello")
+
+	get := serveExplorerRequest(http.MethodGet, "/", nil)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, body=%s", get.Code, get.Body.String())
+	}
+
+	head := serveExplorerRequest(http.MethodHead, "/", nil)
+	if head.Code != http.StatusOK {
+		t.Fatalf("HEAD / status = %d, body=%s", head.Code, head.Body.String())
+	}
+	if got := head.Body.String(); got != "" {
+		t.Fatalf("HEAD / body = %q, want empty body", got)
+	}
+	if got := head.Header().Get("Content-Type"); !strings.Contains(got, "text/html") {
+		t.Fatalf("HEAD / Content-Type = %q, want html content type", got)
+	}
+	if got := head.Header().Get("Content-Length"); got == "" {
+		t.Fatalf("HEAD / Content-Length is empty")
+	} else if _, err := strconv.Atoi(got); err != nil {
+		t.Fatalf("HEAD / Content-Length = %q, want numeric value", got)
+	}
+}
+
+func TestHandleHeadPublicFileServesHeadersOnly(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustWriteFile(t, filepath.Join(root, "public", "hello.txt"), "hello world")
+
+	w := serveExplorerRequest(http.MethodHead, "/public/hello.txt", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD /public/hello.txt status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Disposition"); !strings.Contains(got, "hello.txt") {
+		t.Fatalf("Content-Disposition = %q, want filename for hello.txt", got)
+	}
+	if got := w.Body.String(); got != "" {
+		t.Fatalf("body = %q, want empty body", got)
 	}
 }
 
