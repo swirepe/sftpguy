@@ -548,6 +548,7 @@ func streamParts(mr *multipart.Reader, destDir, ip string) error {
 		if err := writeFileAtomic(part, destPath, !isNested); err != nil {
 			log.Printf("[%s] WRITE ERR: %v", ip, err)
 		}
+		log.Printf("[%s] WRITE %s", ip, finalRel)
 		part.Close()
 	}
 	return nil
@@ -736,6 +737,8 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 <div class="banner"><strong>Downloads are locked.</strong> Upload a file to download <em>{{.WantedFile}}</em>.</div>
 {{else if .IsPublic}}
 <div class="banner banner-public">✧ Public directory — downloads always available.</div>
+{{else if not .Unlocked}}
+<div class="banner"><strong>Downloads are locked.</strong> Upload a file to unlock downloads.</div>
 {{end}}
 
 <div class="upload">
