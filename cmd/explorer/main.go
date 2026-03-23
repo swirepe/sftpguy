@@ -684,6 +684,7 @@ h1{font-size:15px; font-weight:700; margin:0 0 6px}
 hr{border:none; border-top:1px solid #d0d7de; margin:0 0 14px}
 .banner{ background:#fff8c5; border:1px solid #d4a72c; border-radius:4px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
 .banner-public{ background:#dafbe1; border-color:#2da44e; color:#1a7f37; font-weight:600; }
+.banner-contributor{ background:#dafbe1; border-color:#2da44e; color:#1a7f37; }
 table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
 th, td { padding: 8px 12px 8px 0; border-bottom: 1px solid #eaeef2; vertical-align: top; text-align: left; }
 th{ border-bottom:2px solid #d0d7de; font-weight:700; font-size:13px; white-space:nowrap; }
@@ -804,6 +805,10 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 {{end}}
 </tbody>
 </table>
+
+{{if and .Unlocked (not .IsPublic)}}
+<div class="banner banner-contributor"><strong>&#9786; Downloads are unlocked.&nbsp;</strong><span>Thank you for contributing.</span></div>
+{{end}}
 
 <p><a href="#top">[return to top]</a></p>
 {{if .Footer}}{{.Footer}}{{end}}
