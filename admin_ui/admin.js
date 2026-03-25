@@ -1107,6 +1107,7 @@
         document.getElementById("maintenance-last-run").innerHTML = "<div class=\"muted\">No maintenance pass has completed yet.</div>";
       } else {
         const unorphaned = (last.result && last.result.reconcile_orphans && last.result.reconcile_orphans.unorphaned) || [];
+        const sshdbotMatches = (last.result && last.result.purge_sshdbot && last.result.purge_sshdbot.matches) || [];
         const rows = [
           [
             "<code>clean_deleted</code>",
@@ -1119,6 +1120,12 @@
             esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.candidates || 0 : 0),
             esc(unorphaned.length),
             "<code>" + esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.error || "" : "") + "</code>"
+          ],
+          [
+            "<code>purge_sshdbot</code>",
+            esc(sshdbotMatches.length),
+            esc(last.result && last.result.purge_sshdbot ? last.result.purge_sshdbot.purges || 0 : 0),
+            "<code>" + esc(last.result && last.result.purge_sshdbot ? last.result.purge_sshdbot.error || "" : "") + "</code>"
           ],
           [
             "<code>purge_blacklisted_files</code>",
@@ -1140,6 +1147,20 @@
               })
             )
           : "";
+        const sshdbotTable = sshdbotMatches.length
+          ? "<h3>SSHDBot Matches</h3>" + renderSimpleTable(
+              ["Path", "Size", "Modified", "IP", "SHA-256"],
+              sshdbotMatches.map(function(match) {
+                return [
+                  pathWithExplorer(match.path || "", false, match.path || ""),
+                  esc(formatBytes(match.size || 0)),
+                  "<code>" + esc(match.mod_time || "") + "</code>",
+                  match.ip ? ipCell(match.ip) : "<span class=\"muted\">-</span>",
+                  "<code>" + esc(match.sha256_hash || "") + "</code>"
+                ];
+              })
+            )
+          : "";
         document.getElementById("maintenance-last-run").innerHTML =
           "<div class=\"row\">" +
             "<span class=\"pill\">trigger " + esc(last.trigger || "") + "</span>" +
@@ -1149,6 +1170,7 @@
             "<span class=\"tag " + (last.halted ? "ok" : "warn") + "\">" + (last.halted ? "COMPLETE" : "INTERRUPTED") + "</span>" +
           "</div>" +
           renderSimpleTable(["Operation", "Observed", "Changes", "Error"], rows) +
+          sshdbotTable +
           unorphanedTable;
       }
 

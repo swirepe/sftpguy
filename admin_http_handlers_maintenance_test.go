@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -110,6 +111,26 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	defer srv.Shutdown()
 
 	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+	const ownerHash = "maintenance-http-sshdbot-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.77"), Port: 2222}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert sshdbot owner session: %v", err)
+	}
+
+	const sshdbotRel = ".13579/sshd"
+	sshdbotPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(sshdbotRel))
+	if err := os.MkdirAll(filepath.Dir(sshdbotPath), permDir); err != nil {
+		t.Fatalf("mkdir sshdbot dir: %v", err)
+	}
+	if err := os.WriteFile(sshdbotPath, []byte("sshdbot payload"), permFile); err != nil {
+		t.Fatalf("write sshdbot payload: %v", err)
+	}
+	if err := srv.store.EnsureDirectory(ownerHash, ".13579"); err != nil {
+		t.Fatalf("ensure sshdbot dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, sshdbotRel, int64(len("sshdbot payload")), int64(len("sshdbot payload"))); err != nil {
+		t.Fatalf("register sshdbot payload: %v", err)
+	}
 
 	runReq := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/run", nil)
 	runW := httptest.NewRecorder()
@@ -134,6 +155,12 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	if runResp.Status.LastRun.Result.CleanDeleted.Deleted != 1 {
 		t.Fatalf("unexpected deleted count in maintenance result: %+v", runResp.Status.LastRun.Result.CleanDeleted)
 	}
+	if len(runResp.Status.LastRun.Result.PurgeSSHDBot.Matches) != 1 || runResp.Status.LastRun.Result.PurgeSSHDBot.Purges != 1 {
+		t.Fatalf("unexpected purge sshdbot result in maintenance status: %+v", runResp.Status.LastRun.Result.PurgeSSHDBot)
+	}
+	if got := runResp.Status.LastRun.Result.PurgeSSHDBot.Matches[0].Path; got != sshdbotRel {
+		t.Fatalf("unexpected sshdbot match path in run response: got=%q want=%q", got, sshdbotRel)
+	}
 
 	statusReq := httptest.NewRequest(http.MethodGet, "/admin/api/maintenance", nil)
 	statusW := httptest.NewRecorder()
@@ -151,6 +178,12 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	}
 	if statusResp.LastRun == nil || statusResp.LastRun.Trigger != "admin-http" {
 		t.Fatalf("unexpected maintenance status last_run: %+v", statusResp.LastRun)
+	}
+	if len(statusResp.LastRun.Result.PurgeSSHDBot.Matches) != 1 || statusResp.LastRun.Result.PurgeSSHDBot.Purges != 1 {
+		t.Fatalf("unexpected purge sshdbot status result: %+v", statusResp.LastRun.Result.PurgeSSHDBot)
+	}
+	if got := statusResp.LastRun.Result.PurgeSSHDBot.Matches[0].IP; got != ownerAddr.IP.String() {
+		t.Fatalf("unexpected sshdbot match ip in status response: got=%q want=%q", got, ownerAddr.IP.String())
 	}
 }
 

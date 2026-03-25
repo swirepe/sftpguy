@@ -531,6 +531,11 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
 		t.Fatalf("upsert owner session: %v", err)
 	}
+	const sshdbotOwnerHash = "maintenance-sshdbot-owner"
+	sshdbotAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.55"), Port: 2022}
+	if _, err := srv.store.UpsertUserSession(sshdbotOwnerHash, sshdbotAddr); err != nil {
+		t.Fatalf("upsert sshdbot owner session: %v", err)
+	}
 
 	if err := os.WriteFile(filepath.Join(srv.absUploadDir, "orphan.txt"), []byte("orphan"), permFile); err != nil {
 		t.Fatalf("write orphan file: %v", err)
@@ -553,6 +558,21 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 		t.Fatalf("reload bad file hashes: %v", err)
 	}
 
+	const sshdbotRel = ".24680/sshd"
+	sshdbotPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(sshdbotRel))
+	if err := os.MkdirAll(filepath.Dir(sshdbotPath), permDir); err != nil {
+		t.Fatalf("mkdir sshdbot dir: %v", err)
+	}
+	if err := os.WriteFile(sshdbotPath, []byte("sshdbot payload"), permFile); err != nil {
+		t.Fatalf("write sshdbot file: %v", err)
+	}
+	if err := srv.store.EnsureDirectory(sshdbotOwnerHash, ".24680"); err != nil {
+		t.Fatalf("ensure sshdbot dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(sshdbotOwnerHash, sshdbotOwnerHash, sshdbotRel, int64(len("sshdbot payload")), int64(len("sshdbot payload"))); err != nil {
+		t.Fatalf("register sshdbot file: %v", err)
+	}
+
 	halted, result := srv.RunMaintenancePass(context.Background())
 	if !halted {
 		t.Fatal("expected maintenance pass to complete")
@@ -561,14 +581,38 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 	if result.CleanDeleted.StaleRoots != 1 || result.CleanDeleted.Deleted != 1 {
 		t.Fatalf("unexpected cleanDeleted result: %+v", result.CleanDeleted)
 	}
-	if result.ReconcileOrphans.Candidates != 2 || len(result.ReconcileOrphans.Unorphaned) != 1 {
+	if result.ReconcileOrphans.Candidates != 4 || len(result.ReconcileOrphans.Unorphaned) != 1 {
 		t.Fatalf("unexpected reconcileOrphans result: %+v", result.ReconcileOrphans)
 	}
 	if got := result.ReconcileOrphans.Unorphaned[0].Path; got != "orphan.txt" {
 		t.Fatalf("unexpected unorphaned path: got=%q want=%q", got, "orphan.txt")
 	}
+	if len(result.PurgeSSHDBot.Matches) != 1 || result.PurgeSSHDBot.Purges != 1 || result.PurgeSSHDBot.OwnersBanned != 1 || result.PurgeSSHDBot.BlacklistUpdates != 1 {
+		t.Fatalf("unexpected purgeSSHDBot result: %+v", result.PurgeSSHDBot)
+	}
+	if got := result.PurgeSSHDBot.Matches[0].Path; got != sshdbotRel {
+		t.Fatalf("unexpected sshdbot match path: got=%q want=%q", got, sshdbotRel)
+	}
+	if got := result.PurgeSSHDBot.Matches[0].IP; got != sshdbotAddr.IP.String() {
+		t.Fatalf("unexpected sshdbot match ip: got=%q want=%q", got, sshdbotAddr.IP.String())
+	}
+	if result.PurgeSSHDBot.Matches[0].Size != int64(len("sshdbot payload")) {
+		t.Fatalf("unexpected sshdbot match size: got=%d want=%d", result.PurgeSSHDBot.Matches[0].Size, len("sshdbot payload"))
+	}
+	if result.PurgeSSHDBot.Matches[0].Sha256Hash == "" {
+		t.Fatal("expected sshdbot match sha256 hash to be populated")
+	}
+	if result.PurgeSSHDBot.Matches[0].ModTime.IsZero() {
+		t.Fatal("expected sshdbot match modtime to be populated")
+	}
 	if result.PurgeBlacklistedFiles.Matches != 1 || result.PurgeBlacklistedFiles.Purges != 1 || result.PurgeBlacklistedFiles.BlacklistUpdates != 1 {
 		t.Fatalf("unexpected purgeBlacklistedFiles result: %+v", result.PurgeBlacklistedFiles)
+	}
+	if _, err := os.Stat(sshdbotPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected sshdbot file to be removed, got err=%v", err)
+	}
+	if srv.store.FileExistsInDB(sshdbotRel) {
+		t.Fatalf("expected sshdbot file metadata to be removed for %s", sshdbotRel)
 	}
 }
 

@@ -27,6 +27,7 @@ type badFileMatch struct {
 type MaintenanceResult struct {
 	CleanDeleted          CleanDeletedResult          `json:"clean_deleted"`
 	ReconcileOrphans      ReconcileOrphansResult      `json:"reconcile_orphans"`
+	PurgeSSHDBot          PurgeSSHDBotResult          `json:"purge_sshdbot"`
 	PurgeBlacklistedFiles PurgeBlackListedFilesResult `json:"purge_blacklisted_files"`
 }
 
@@ -149,7 +150,7 @@ func (s *Server) runMaintenancePass(ctx context.Context, includeBadFilePurge boo
 	default:
 	}
 
-	s.PurgeSSHDBot()
+	mr.PurgeSSHDBot = s.PurgeSSHDBot()
 
 	select {
 	case <-ctx.Done():
@@ -541,14 +542,32 @@ func (s *Server) purgeMatchedBadFile(logger *slog.Logger, trigger string, match 
 }
 
 type PurgeSSHDBotResult struct {
+	Matches          []SSHDBotMatch `json:"matches"`
+	Purges           int64          `json:"purges"`
+	OwnersBanned     int64          `json:"owners_banned"`
+	BlacklistUpdates int64          `json:"blacklist_updates"`
+
 	Error string `json:"error,omitempty"`
 }
 
-func (s *Server) PurgeSSHDBot() {
+type SSHDBotMatch struct {
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	ModTime    time.Time `json:"mod_time"`
+	IP         string    `json:"ip"`
+	Sha256Hash string    `json:"sha256_hash"`
+}
+
+func (s *Server) PurgeSSHDBot() PurgeSSHDBotResult {
+	result := PurgeSSHDBotResult{}
 	logger := s.logger.WithGroup("maintenance").With("operation", "purge_sshdbot")
+	bannedOwners := make(map[string]struct{})
 	_ = filepath.WalkDir(s.absUploadDir, func(absPath string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			logger.Warn("failed to inspect path during bad file maintenance", "path", absPath, "err", walkErr)
+			if result.Error == "" {
+				result.Error = walkErr.Error()
+			}
 			return nil
 		}
 		if absPath == s.absUploadDir || d.IsDir() {
@@ -558,45 +577,114 @@ func (s *Server) PurgeSSHDBot() {
 		if !sshdUploadPathRegex.MatchString(absPath) {
 			return nil
 		}
+		match := SSHDBotMatch{
+			Path: absPath,
+		}
+		defer func() {
+			result.Matches = append(result.Matches, match)
+		}()
 
 		fInfo, err := os.Stat(absPath)
 		if err != nil {
-			return err
+			logger.Warn("failed to stat sshdbot candidate", "path", absPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+			return nil
 		}
 
 		relPath, err := filepath.Rel(s.absUploadDir, absPath)
 		if err != nil {
 			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
 			return nil
 		}
 		relPath = filepath.ToSlash(relPath)
+		match.Path = relPath
 
 		ownerHash, err := s.store.GetFileOwner(relPath)
 		if err != nil {
 			logger.Warn("failed to resolve owner for bad file", "path", relPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
 		}
 
 		ip := ""
 		if ownerHash != "" && ownerHash != systemOwner {
-			s.Ban(ownerHash)
+			if _, alreadyBanned := bannedOwners[ownerHash]; !alreadyBanned {
+				s.Ban(ownerHash)
+				bannedOwners[ownerHash] = struct{}{}
+			}
 			stats, err := s.store.GetUserStats(ownerHash)
 			if err != nil {
 				logger.Warn("failed to resolve owner address for bad file", "path", relPath, "owner", ownerHash, "err", err)
+				if result.Error == "" {
+					result.Error = err.Error()
+				}
 			} else {
 				ip = strings.TrimSpace(stats.LastAddress)
-				s.store.blacklist.AddExactIPWithComment(ip, fmt.Sprintf("[sshdbot] %s %s", time.Now(), absPath))
+				if ip != "" {
+					added, err := s.store.blacklist.AddExactIPWithComment(ip, fmt.Sprintf("[sshdbot] %s %s", time.Now(), absPath))
+					if err != nil {
+						logger.Warn("failed to blacklist sshdbot owner address", "path", relPath, "owner", ownerHash, "address", ip, "err", err)
+						if result.Error == "" {
+							result.Error = err.Error()
+						}
+					} else if added {
+						result.BlacklistUpdates++
+					}
+				}
 			}
 		}
 
-		hash, _ := s.store.badFileList.AddFile(absPath)
+		hash, err := s.store.badFileList.AddFile(absPath)
+		if err != nil {
+			logger.Warn("failed to add sshdbot hash to bad file list", "path", relPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+		}
+		match.IP = ip
+		match.Sha256Hash = hash
+		match.Size = fInfo.Size()
+		match.ModTime = fInfo.ModTime()
 		logger.Info("sshdbot activity detected", "path", absPath, "remote_addr", ip, "user", ownerHash,
 			"size", fInfo.Size(), "modtime", fInfo.ModTime(), "sha256", hash)
 
-		os.Remove(absPath)
-		os.Remove(filepath.Dir(absPath))
+		if err := os.Remove(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			logger.Warn("failed to remove sshdbot payload", "path", absPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+			return nil
+		}
+		result.Purges++
+		if err := s.store.DeletePath(relPath); err != nil {
+			logger.Warn("failed to remove sshdbot payload metadata", "path", relPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+		}
+
+		parentRel := filepath.ToSlash(filepath.Dir(relPath))
+		parentAbs := filepath.Dir(absPath)
+		if parentRel != "." {
+			if err := os.Remove(parentAbs); err == nil {
+				if err := s.store.DeletePath(parentRel); err != nil {
+					logger.Warn("failed to remove sshdbot parent metadata", "path", parentRel, "err", err)
+					if result.Error == "" {
+						result.Error = err.Error()
+					}
+				}
+			}
+		}
 		return nil
 	})
-
+	result.OwnersBanned = int64(len(bannedOwners))
+	return result
 }
 
 type MaintenanceRunSnapshot struct {
@@ -638,6 +726,10 @@ func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string, 
 		"clean_deleted.stale_roots", res.CleanDeleted.StaleRoots,
 		"reconcile_orphans.inserted", len(res.ReconcileOrphans.Unorphaned),
 		"reconcile_orphans.candidates", res.ReconcileOrphans.Candidates,
+		"purge_sshdbot.matches", len(res.PurgeSSHDBot.Matches),
+		"purge_sshdbot.purges", res.PurgeSSHDBot.Purges,
+		"purge_sshdbot.owners_banned", res.PurgeSSHDBot.OwnersBanned,
+		"purge_sshdbot.blacklist_updates", res.PurgeSSHDBot.BlacklistUpdates,
 		"purge_blacklisted_files.matches", res.PurgeBlacklistedFiles.Matches,
 		"purge_blacklisted_files.purges", res.PurgeBlacklistedFiles.Purges,
 		"purge_blacklisted_files.blacklist_updates", res.PurgeBlacklistedFiles.BlacklistUpdates,
