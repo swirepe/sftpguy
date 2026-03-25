@@ -2355,6 +2355,10 @@ func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) 
 
 		var files []os.FileInfo
 		for _, e := range entries {
+			if e.IsDir() && shouldHideListedDirectory(e.Name()) {
+				continue
+			}
+
 			fi, err := e.Info()
 			if err != nil {
 				continue
@@ -2373,6 +2377,15 @@ func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) 
 	}
 
 	return listerAt{h.newSftpFile(meta.fi, meta.rel)}, nil
+}
+
+func shouldHideListedDirectory(name string) bool {
+	switch name {
+	case "#recycle", "@eaDir":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *fsHandler) Lstat(r *sftp.Request) (sftp.ListerAt, error) {

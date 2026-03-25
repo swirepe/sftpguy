@@ -387,6 +387,10 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 	}
 	out := make([]entry, 0, len(des))
 	for _, de := range des {
+		if de.IsDir() && shouldHideListedDirectory(de.Name()) {
+			continue
+		}
+
 		info, err := de.Info()
 		if err != nil {
 			continue
@@ -415,7 +419,23 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 
 func countDirItems(path string) int64 {
 	des, _ := os.ReadDir(path)
-	return int64(len(des))
+	var count int64
+	for _, de := range des {
+		if de.IsDir() && shouldHideListedDirectory(de.Name()) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func shouldHideListedDirectory(name string) bool {
+	switch name {
+	case "#recycle", "@eaDir":
+		return true
+	default:
+		return false
+	}
 }
 
 func sortEntries(entries []entry, by, order string) {

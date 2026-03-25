@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -133,6 +134,39 @@ func TestHandleHeadPublicFileServesHeadersOnly(t *testing.T) {
 	}
 	if got := w.Body.String(); got != "" {
 		t.Fatalf("body = %q, want empty body", got)
+	}
+}
+
+func TestReadDirSkipsHiddenSystemDirectoriesAndCountsOnlyVisibleEntries(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustMkdir(t, filepath.Join(root, "#recycle"))
+	mustMkdir(t, filepath.Join(root, "@eaDir"))
+	mustMkdir(t, filepath.Join(root, "visible", "#recycle"))
+	mustMkdir(t, filepath.Join(root, "visible", "@eaDir"))
+	mustMkdir(t, filepath.Join(root, "visible", "nested"))
+	mustWriteFile(t, filepath.Join(root, "keep.txt"), "hello")
+
+	entries, err := readDir(root, "")
+	if err != nil {
+		t.Fatalf("readDir: %v", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	var visible entry
+	for _, ent := range entries {
+		names = append(names, ent.Name)
+		if ent.Name == "visible" {
+			visible = ent
+		}
+	}
+	slices.Sort(names)
+
+	want := []string{"keep.txt", "visible"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("entries = %v, want %v", names, want)
+	}
+	if visible.Size != 1 {
+		t.Fatalf("visible entry size = %d, want 1", visible.Size)
 	}
 }
 
