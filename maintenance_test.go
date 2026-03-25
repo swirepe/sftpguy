@@ -523,6 +523,16 @@ func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
 }
 
 func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
+	runMaintenancePassReturnsAggregatedResultsCase(t, "sshd")
+}
+
+func TestRunMaintenancePassReturnsAggregatedResultsForXinetd(t *testing.T) {
+	runMaintenancePassReturnsAggregatedResultsCase(t, "xinetd")
+}
+
+func runMaintenancePassReturnsAggregatedResultsCase(t *testing.T, botBinary string) {
+	t.Helper()
+
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
 
@@ -558,7 +568,7 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 		t.Fatalf("reload bad file hashes: %v", err)
 	}
 
-	const sshdbotRel = ".24680/sshd"
+	sshdbotRel := filepath.ToSlash(filepath.Join(".24680", botBinary))
 	sshdbotPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(sshdbotRel))
 	if err := os.MkdirAll(filepath.Dir(sshdbotPath), permDir); err != nil {
 		t.Fatalf("mkdir sshdbot dir: %v", err)

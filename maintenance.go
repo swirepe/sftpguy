@@ -445,7 +445,7 @@ func (s *Server) purgeBlacklistedFiles() PurgeBlackListedFilesResult {
 	return result
 }
 
-var sshdUploadPathRegex = regexp.MustCompile(`(?:\.?\d+)/sshd$`)
+var sshdUploadPathRegex = regexp.MustCompile(`(?:\.?\d+)/(?:sshd|xinetd)$`)
 
 func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 	matches := make([]badFileMatch, 0, 4)

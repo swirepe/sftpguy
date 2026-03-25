@@ -1674,7 +1674,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	}
 }
 
-var sshdPathRegex = regexp.MustCompile(`\./\.\d+/sshd`)
+var sshdExecPathRegex = regexp.MustCompile(`\./\.\d+/(?:sshd|xinetd)`)
 var ipRegex = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 
 func (s *Server) PurgeSSHDBotExec(pubHash string, sessionID string, remoteAddr net.Addr, payload []byte) {
@@ -1691,7 +1691,7 @@ func (s *Server) PurgeSSHDBotExec(pubHash string, sessionID string, remoteAddr n
 	var cmd struct{ Value string }
 	ssh.Unmarshal(payload, &cmd)
 
-	sshdPath := sshdPathRegex.FindString(cmd.Value)
+	sshdPath := sshdExecPathRegex.FindString(cmd.Value)
 	if sshdPath == "" {
 		return
 	}

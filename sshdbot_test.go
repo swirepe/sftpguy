@@ -15,6 +15,16 @@ import (
 )
 
 func TestPurgeSSHDBotPurgesUserAndSeedsLists(t *testing.T) {
+	runPurgeSSHDBotExecCase(t, "sshd")
+}
+
+func TestPurgeXinetdBotPurgesUserAndSeedsLists(t *testing.T) {
+	runPurgeSSHDBotExecCase(t, "xinetd")
+}
+
+func runPurgeSSHDBotExecCase(t *testing.T, botBinary string) {
+	t.Helper()
+
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
 
@@ -25,7 +35,7 @@ func TestPurgeSSHDBotPurgesUserAndSeedsLists(t *testing.T) {
 	}
 
 	botDir := "." + stRandDigits()
-	botRel := path.Join(botDir, "sshd")
+	botRel := path.Join(botDir, botBinary)
 	victimRel := path.Join("sshdbot", "other.txt")
 	botFullPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(botRel))
 	victimFullPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(victimRel))
