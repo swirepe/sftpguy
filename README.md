@@ -1,13 +1,18 @@
 # sftpguy
 
-`sftpguy` is an anonymous, share-first SFTP archive written in Go. It accepts whatever SSH identity material a client presents, derives a stable anonymous user ID from it, and uses simple archive rules to decide who can read, overwrite, rename, or delete files.
+`sftpguy` is an anonymous, share-first SFTP archive written in Go. It accepts whatever SSH identity material a client presents, derives a stable anonymous user ID from it, and grants download privileges based on contributions:
+
+* Anyone can login anonymously, upload files, and list directories
+* Downloads are enabled for a user once they have upload enough bytes (default 1mb)
+* Users can edit, rename, or delete only their own files
 
 It is designed for public or semi-public dropboxes and community archives, not for private user accounts.
+
 
 > [!WARNING]
 > This is not a traditional authenticated SFTP server.
 > 
-> By default, any SSH public key is accepted. Keyboard-interactive logins are also accepted and turned into anonymous identities, and `-noauth` can allow fully unauthenticated SSH sessions. Do not expose this to an untrusted network unless you actually want anonymous access and have added network controls, admin tokens, or IP restrictions. Do not use real user passwords with it.  Do not use it with data you care about.  You're going to get a lot of bots and garbage, but that's part of the fun.
+> By default, any SSH public key is accepted. Keyboard-interactive logins are also accepted and turned into anonymous identities, and `-noauth` can allow fully unauthenticated SSH sessions. Do not expose this to an untrusted network unless you actually want anonymous access and have added network controls, admin tokens, or IP restrictions. Do not use real user passwords with it.  Do not use it with data you care about.  **You're going to get a lot of bots and garbage**, but that's part of the fun.
 
 ## Try it
 
@@ -15,7 +20,7 @@ An instance is running at `ftp.neuroky.me`.  Connect to it with:
 
     sftp ftp.neuroky.me
 
-Or create a temporary public key:
+Or create a temporary public key, because it accepts all keys:
 
 ```bash
 TMPKEY=$(mktemp nkXXXXXXXX)
@@ -23,11 +28,22 @@ ssh-keygen -t ed25519 -N '' -f $TMPKEY
 sftp  -o "PreferredAuthentications=publickey" -i $TMPKEY ftp.neuroky.me
 ```
 
-Or if you want to use a password:
+Or if you want to use a password, because it accepts any user/password combination:
 
     sftp -o "PreferredAuthentications=keyboard-interactive" ftp.neuroky.me
 
 These are all different ways to access the same archive.  A web-based version (source at [cmd/explorer/main.go](cmd/explorer/main.go)) is running at [https://ftp.neuroky.me/](https://ftp.neuroky.me/).
+
+
+You may consider using a modern sftp client like [lftp,](https://lftp.yar.ru/) although you might not see the welcome banner. 
+
+## Is this AI slop?
+
+Yeah.
+
+Kinda.
+
+The core of the server was lovingly handcrafted by a human.  You can see this in [sftpguy.go](sftpguy.go) or, more succinctly, in [cmd/mini/mini.go](md/mini/mini.go).  The core of the admin and maintenance operations are handwritten.  There used be an admin TUI that I scrapped and replaced with a web interface.  The admin web interface is all machine-written, and behind a flag.
 
 
 ## What Makes It Different
