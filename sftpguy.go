@@ -2612,37 +2612,12 @@ func (sw *statWriter) reportUserStatus(pubHash string) {
 	}
 }
 
-var sshdUploadPathRegex = regexp.MustCompile(`^(?:\.?\d+)/sshd$`)
-
 func (sw *statWriter) purgeBadUploadIfMatched() (bool, error) {
 	if sw.h.pubHash == "" || sw.h.pubHash == systemOwner || sw.h.srv.store == nil || sw.h.srv.store.badFileList == nil {
 		return false, nil
 	}
 
 	fullPath := filepath.Join(sw.h.srv.absUploadDir, filepath.FromSlash(sw.rel))
-
-	if sshdUploadPathRegex.MatchString(sw.rel) {
-		ownerAddr := remoteAddrHost(sw.h.remoteAddr)
-		if ownerAddr == "" {
-			stats, statsErr := sw.h.srv.store.GetUserStats(sw.h.pubHash)
-			if statsErr == nil {
-				ownerAddr = strings.TrimSpace(stats.LastAddress)
-			}
-		}
-
-		if err := sw.h.srv.store.badFileList.AddFile(fullPath); err != nil {
-			sw.h.logger.Warn("failed to add sshd upload to bad-file list", "path", sw.rel, "err", err)
-		}
-
-		logger := sw.h.srv.logger.WithGroup("maintenance").With("operation", "upload_sshdbot_path")
-		purged, _, err := sw.h.srv.purgeMatchedBadFile(logger, "upload-sshd-path", badFileMatch{
-			relPath:   sw.rel,
-			ownerHash: sw.h.pubHash,
-			ownerAddr: ownerAddr,
-			knownAs:   "sshd upload path",
-		})
-		return purged, err
-	}
 
 	matchName, matched, err := sw.h.srv.store.badFileList.MatchFile(fullPath)
 	if err != nil {

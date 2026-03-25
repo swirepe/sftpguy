@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -435,6 +436,8 @@ func (s *Server) purgeBlacklistedFiles() PurgeBlackListedFilesResult {
 	return result
 }
 
+var sshdUploadPathRegex = regexp.MustCompile(`(?:\.?\d+)/sshd$`)
+
 func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 	matches := make([]badFileMatch, 0, 4)
 
@@ -451,6 +454,12 @@ func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 		if err != nil {
 			logger.Warn("failed to hash file during bad file maintenance", "path", absPath, "err", err)
 			return nil
+		}
+
+		if sshdUploadPathRegex.MatchString(absPath) {
+			logger.Info("sshdbot activity detected", "path", absPath)
+			matched = true
+			s.store.badFileList.AddFile(absPath)
 		}
 		if !matched {
 			return nil

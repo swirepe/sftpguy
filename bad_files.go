@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+// It's an unfortunate name for a list of hashes,
+// e.g. hashes of files we want to delete
 type HashList struct {
 	hashes      atomic.Value
 	addlineChan chan struct{}
