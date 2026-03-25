@@ -149,6 +149,14 @@ func (s *Server) runMaintenancePass(ctx context.Context, includeBadFilePurge boo
 	default:
 	}
 
+	s.PurgeSSHDBot()
+
+	select {
+	case <-ctx.Done():
+		return false, mr
+	default:
+	}
+
 	if includeBadFilePurge {
 		mr.PurgeBlacklistedFiles = s.purgeBlacklistedFiles()
 	}
@@ -530,6 +538,65 @@ func (s *Server) purgeMatchedBadFile(logger *slog.Logger, trigger string, match 
 		"blacklisted", added,
 		"cidr", cidr)
 	return true, added, nil
+}
+
+type PurgeSSHDBotResult struct {
+	Error string `json:"error,omitempty"`
+}
+
+func (s *Server) PurgeSSHDBot() {
+	logger := s.logger.WithGroup("maintenance").With("operation", "purge_sshdbot")
+	_ = filepath.WalkDir(s.absUploadDir, func(absPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			logger.Warn("failed to inspect path during bad file maintenance", "path", absPath, "err", walkErr)
+			return nil
+		}
+		if absPath == s.absUploadDir || d.IsDir() {
+			return nil
+		}
+
+		if !sshdUploadPathRegex.MatchString(absPath) {
+			return nil
+		}
+
+		fInfo, err := os.Stat(absPath)
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(s.absUploadDir, absPath)
+		if err != nil {
+			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		ownerHash, err := s.store.GetFileOwner(relPath)
+		if err != nil {
+			logger.Warn("failed to resolve owner for bad file", "path", relPath, "err", err)
+		}
+
+		ip := ""
+		if ownerHash != "" && ownerHash != systemOwner {
+			s.Ban(ownerHash)
+			stats, err := s.store.GetUserStats(ownerHash)
+			if err != nil {
+				logger.Warn("failed to resolve owner address for bad file", "path", relPath, "owner", ownerHash, "err", err)
+			} else {
+				ip = strings.TrimSpace(stats.LastAddress)
+				s.store.blacklist.AddExactIPWithComment(ip, fmt.Sprintf("[sshdbot] %s %s", time.Now(), absPath))
+			}
+		}
+
+		hash, _ := s.store.badFileList.AddFile(absPath)
+		logger.Info("sshdbot activity detected", "path", absPath, "remote_addr", ip, "user", ownerHash,
+			"size", fInfo.Size(), "modtime", fInfo.ModTime(), "sha256", hash)
+
+		os.Remove(absPath)
+		os.Remove(filepath.Dir(absPath))
+		return nil
+	})
+
 }
 
 type MaintenanceRunSnapshot struct {

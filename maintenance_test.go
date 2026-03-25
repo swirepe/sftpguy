@@ -108,7 +108,7 @@ func TestMaintenanceLoopSkipsBadFilePurge(t *testing.T) {
 	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
 		t.Fatalf("register bad file: %v", err)
 	}
-	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+	if _, err := srv.store.badFileList.AddFile(badPath); err != nil {
 		t.Fatalf("add bad file hash: %v", err)
 	}
 	if _, err := srv.store.badFileList.Reload(); err != nil {
@@ -399,7 +399,7 @@ func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
 		t.Fatalf("register other file: %v", err)
 	}
 
-	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+	if _, err := srv.store.badFileList.AddFile(badPath); err != nil {
 		t.Fatalf("add bad file hash: %v", err)
 	}
 	if _, err := srv.store.badFileList.Reload(); err != nil {
@@ -469,7 +469,7 @@ func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
 	if err := os.WriteFile(samplePath, []byte("malware payload"), permFile); err != nil {
 		t.Fatalf("write bad sample: %v", err)
 	}
-	if err := srv.store.badFileList.AddFile(samplePath); err != nil {
+	if _, err := srv.store.badFileList.AddFile(samplePath); err != nil {
 		t.Fatalf("add bad file hash: %v", err)
 	}
 	if _, err := srv.store.badFileList.Reload(); err != nil {
@@ -546,7 +546,7 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
 		t.Fatalf("register bad file: %v", err)
 	}
-	if err := srv.store.badFileList.AddFile(badPath); err != nil {
+	if _, err := srv.store.badFileList.AddFile(badPath); err != nil {
 		t.Fatalf("add bad file hash: %v", err)
 	}
 	if _, err := srv.store.badFileList.Reload(); err != nil {

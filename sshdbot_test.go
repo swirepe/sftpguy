@@ -61,7 +61,7 @@ func TestPurgeSSHDBotPurgesUserAndSeedsLists(t *testing.T) {
 	cmd := fmt.Sprintf("chmod +x ./%s;nohup ./%s %s %s &", botRel, botRel, callbackIPs[0], callbackIPs[1])
 	payload := ssh.Marshal(struct{ Value string }{Value: cmd})
 
-	srv.PurgeSSHDBot(ownerHash, "sess-sshdbot", remoteAddr, payload)
+	srv.PurgeSSHDBotExec(ownerHash, "sess-sshdbot", remoteAddr, payload)
 
 	if _, _, err := srv.store.blacklist.Reload(); err != nil {
 		t.Fatalf("reload blacklist: %v", err)

@@ -202,16 +202,16 @@ func (hl *HashList) MatchFile(absPath string) (string, bool, error) {
 	return name, exists, nil
 }
 
-func (hl *HashList) AddFile(absPath string) error {
+func (hl *HashList) AddFile(absPath string) (string, error) {
 	hash, err := hl.calculateSHA256(absPath)
 	if err != nil {
-		return fmt.Errorf("hash failed: %w", err)
+		return "", fmt.Errorf("hash failed: %w", err)
 	}
 
 	// Use the base name of the file (e.g., /home/user/Photo.scr -> Photo.scr)
 	filename := filepath.Base(absPath)
 
-	return hl.AddHash(hash, filename)
+	return hash, hl.AddHash(hash, filename)
 }
 
 func (hl *HashList) EnsureContent(content string) (int, error) {
