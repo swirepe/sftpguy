@@ -15,11 +15,12 @@
       fileSearch: { q: "", owner: "", results: [], total: 0, offset: 0, limit: 200 },
       audit: [],
       events: [],
-      authAttempts: [],
-      authCombos: [],
-      logCursorBefore: 0,
-      logHasMore: false,
-	      sessions: [],
+	      authAttempts: [],
+	      authCombos: [],
+	      systemLogs: { panics: [], panicCount: 0, scannedLines: 0, levels: [], hasMore: false },
+	      logCursorBefore: 0,
+	      logHasMore: false,
+		      sessions: [],
 	      uploads: [],
       banned: { hashes: [], ips: [] },
       actor: null,
@@ -317,18 +318,64 @@
       const shown = displayValue == null ? raw : String(displayValue);
       return "<code>" + esc(shown) + "</code>" + explorerLink(raw, isDirHint);
     }
-    function openPathButton(path, label) {
-      const raw = String(path == null ? "" : path);
-      const shown = String(label == null ? raw : label);
-      if (!raw) return esc(shown);
-      const enc = encodeURIComponent(raw);
-      return "<button onclick=\"openPath(decodeURIComponent('" + enc + "'))\">" + esc(shown) + "</button>";
-    }
-    function markBadButton(path, isDir) {
-      const raw = String(path == null ? "" : path);
-      if (!raw || isDir) return "";
-      const enc = encodeURIComponent(raw);
-      return "<button class=\"btn-danger tiny\" onclick=\"markBadFile(decodeURIComponent('" + enc + "'))\">Mark Bad</button>";
+	    function openPathButton(path, label) {
+	      const raw = String(path == null ? "" : path);
+	      const shown = String(label == null ? raw : label);
+	      if (!raw) return esc(shown);
+	      const enc = encodeURIComponent(raw);
+	      return "<button onclick=\"openPath(decodeURIComponent('" + enc + "'))\">" + esc(shown) + "</button>";
+	    }
+	    function firstLine(value) {
+	      const text = String(value == null ? "" : value).trim();
+	      if (!text) return "";
+	      const parts = text.split(/\r?\n/);
+	      return String(parts[0] || "").trim();
+	    }
+	    function renderLogDetails(summary, body, emptyLabel) {
+	      const summaryText = String(summary == null ? "" : summary).trim();
+	      const bodyText = String(body == null ? "" : body).trim();
+	      if (!summaryText && !bodyText) return "<span class=\"muted\">" + esc(emptyLabel || "-") + "</span>";
+	      if (!bodyText || bodyText === summaryText) return "<code>" + esc(summaryText || bodyText) + "</code>";
+	      return "<details class=\"log-details\"><summary><code>" + esc(summaryText || emptyLabel || "View") + "</code></summary><pre>" + esc(bodyText) + "</pre></details>";
+	    }
+	    function renderPanicStack(entry) {
+	      const stack = String((entry && entry.stack) || "").trim();
+	      const panicValue = String((entry && entry.panic) || "").trim();
+	      const preview = firstLine(stack) || panicValue || String((entry && entry.msg) || "").trim();
+	      return renderLogDetails(preview || "View stack", stack || panicValue, "No stack");
+	    }
+	    function renderRawLog(entry) {
+	      const raw = String((entry && entry.raw) || "").trim();
+	      const preview = firstLine(raw) || "View raw log";
+	      return renderLogDetails(preview, raw, "No raw log");
+	    }
+	    function renderPanicTableRows(entries) {
+	      return (entries || []).map(function(entry) {
+	        return {
+	          sort: {
+	            time: String(entry.time || ""),
+	            component: entry.component || "",
+	            panic: entry.panic || entry.msg || "",
+	            user: entry.user_id || "",
+	            ip: entry.ip || ""
+	          },
+	          cells: [
+	            "<code>" + esc(entry.time || "") + "</code>",
+	            entry.component ? "<code>" + esc(entry.component) + "</code>" : "<span class=\"muted\">-</span>",
+	            "<code>" + esc(entry.panic || entry.msg || "") + "</code>",
+	            entry.user_id ? ownerCell(entry.user_id) : "<span class=\"muted\">-</span>",
+	            entry.ip ? ipCell(entry.ip) : "<span class=\"muted\">-</span>",
+	            renderPanicStack(entry),
+	            renderRawLog(entry)
+	          ]
+	        };
+	      });
+	    }
+	    function markBadButton(path, isDir) {
+	      const raw = String(path == null ? "" : path);
+	      if (!raw || isDir) return "";
+	      const enc = encodeURIComponent(raw);
+	      return "<button class=\"btn-danger tiny\" onclick=\"markBadFile(decodeURIComponent('" + enc + "'))\">Mark Bad</button>";
     }
 
     function closeActorDrawer() {
@@ -467,29 +514,51 @@
       const topIPRows = (insight.top_ips || []).map(function(x) {
         return [ipCell(x.name), esc(x.count), esc(x.denied), "<button class=\"btn-danger tiny\" onclick=\"banIPDirect('" + esc(x.name) + "')\">Ban</button>"];
       });
-      const quickUploadRows = (state.summaryUploads || []).slice(0, 12).map(function(x) {
-        return [
-          "<code>" + esc(x.time || "") + "</code>",
-          ownerCell(x.user_id),
-          pathWithExplorer(x.path || "", false),
-          esc(formatBytes(x.delta || 0)),
-          sessionCell(x.session)
-        ];
-      });
+	      const quickUploadRows = (state.summaryUploads || []).slice(0, 12).map(function(x) {
+	        return [
+	          "<code>" + esc(x.time || "") + "</code>",
+	          ownerCell(x.user_id),
+	          pathWithExplorer(x.path || "", false),
+	          esc(formatBytes(x.delta || 0)),
+	          sessionCell(x.session)
+	        ];
+	      });
+	      const recentPanics = insight.recent_panics || [];
+	      const crashRows = renderPanicTableRows(recentPanics);
+	      const crashWatch = recentPanics.length
+	        ? renderSmartTable(
+	            "summary-panics",
+	            [
+	              {label:"Time", key:"time"},
+	              {label:"Component", key:"component"},
+	              {label:"Panic", key:"panic"},
+	              {label:"User", key:"user"},
+	              {label:"IP", key:"ip"},
+	              {label:"Stack", key:"panic"},
+	              {label:"Raw", key:"panic"}
+	            ],
+	            crashRows,
+	            "time",
+	            "desc"
+	          )
+	        : "<div class=\"muted\">No recent panic entries found in the process log.</div>";
 
-      document.getElementById("tab-summary").innerHTML =
-        "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span></div>" +
-        "<div class=\"grid\">" + entries.map(function(kv) {
+	      document.getElementById("tab-summary").innerHTML =
+	        "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span></div>" +
+	        "<div class=\"grid\">" + entries.map(function(kv) {
           return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
-        }).join("") + "</div>" +
-        "<h3>Activity</h3><div class=\"grid\">" + activity.map(function(kv) {
-          return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
-        }).join("") + "</div>" +
-        "<h3>Top Events</h3>" + renderSimpleTable(["Event", "Count"], topEventsRows) +
-        "<h3>Top Users</h3>" + renderSimpleTable(["User", "Events", "Denied"], topUsersRows) +
-        "<h3>Top IPs</h3>" + renderSimpleTable(["IP", "Events", "Denied", "Action"], topIPRows) +
-        "<h3>Recent Uploads (Quick View)</h3>" + renderSimpleTable(["Time", "User", "Path", "Delta", "Session"], quickUploadRows);
-    }
+	        }).join("") + "</div>" +
+	        "<h3>Activity</h3><div class=\"grid\">" + activity.map(function(kv) {
+	          return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
+	        }).join("") + "</div>" +
+	        "<h3>Crash Watch</h3>" +
+	        "<div class=\"row\"><span class=\"pill\">panic entries " + esc(insight.parsed_panics || 0) + "</span><span class=\"pill\">parsed log lines " + esc(insight.parsed_lines_considered || 0) + "</span><button class=\"tiny btn-danger\" onclick=\"switchTab('logs')\">Open Logs</button></div>" +
+	        crashWatch +
+	        "<h3>Top Events</h3>" + renderSimpleTable(["Event", "Count"], topEventsRows) +
+	        "<h3>Top Users</h3>" + renderSimpleTable(["User", "Events", "Denied"], topUsersRows) +
+	        "<h3>Top IPs</h3>" + renderSimpleTable(["IP", "Events", "Denied", "Action"], topIPRows) +
+	        "<h3>Recent Uploads (Quick View)</h3>" + renderSimpleTable(["Time", "User", "Path", "Delta", "Session"], quickUploadRows);
+	    }
 
     async function loadUsers() {
       const q = document.getElementById("user-q").value.trim();
@@ -729,18 +798,30 @@
       );
     }
 
-    async function loadLogs(opts) {
-	      opts = opts || {};
-	      const q = document.getElementById("log-q").value.trim();
-	      const before = Number(opts.before || 0);
-	      const d = await api(withRange("/admin/api/events?q=" + encodeURIComponent(q) + "&limit=600&before_id=" + encodeURIComponent(before)));
-	      state.events = d.events || [];
-	      state.lastEventID = d.last_id || (state.events.length ? state.events[0].id : 0);
-	      state.logCursorBefore = Number(d.next_before_id || 0);
-	      state.logHasMore = !!d.has_more;
-	      setTabCount("logs", state.events.length);
-	      renderLogs();
-	    }
+	    async function loadLogs(opts) {
+		      opts = opts || {};
+		      const q = document.getElementById("log-q").value.trim();
+		      const before = Number(opts.before || 0);
+		      const pair = await Promise.all([
+		        api(withRange("/admin/api/events?q=" + encodeURIComponent(q) + "&limit=600&before_id=" + encodeURIComponent(before))),
+		        api("/admin/api/system-log/parsed?panic_only=1&limit=40&q=" + encodeURIComponent(q))
+		      ]);
+		      const d = pair[0] || {};
+		      const panicLog = pair[1] || {};
+		      state.events = d.events || [];
+		      state.lastEventID = d.last_id || (state.events.length ? state.events[0].id : 0);
+		      state.logCursorBefore = Number(d.next_before_id || 0);
+		      state.logHasMore = !!d.has_more;
+		      state.systemLogs = {
+		        panics: panicLog.entries || [],
+		        panicCount: Number(panicLog.panic_count || 0),
+		        scannedLines: Number(panicLog.scanned_lines || 0),
+		        levels: panicLog.levels || [],
+		        hasMore: !!panicLog.has_more
+		      };
+		      setTabCount("logs", state.events.length);
+		      renderLogs();
+		    }
 	    async function loadOlderLogs() {
 	      if (!state.logHasMore || !state.logCursorBefore) {
 	        toast("No older log rows");
@@ -780,11 +861,33 @@
             pathWithExplorer(e.path || ""),
             "<button class=\"btn-danger tiny\" onclick=\"banIPDirect('" + esc(e.ip || "") + "')\">Ban IP</button>"
           ]
-        };
-      });
+	        };
+	      });
+	      const systemLogs = state.systemLogs || {};
+	      const panicRows = renderPanicTableRows(systemLogs.panics || []);
+	      const panicLevels = (systemLogs.levels || []).map(function(level) {
+	        return "<span class=\"pill\">" + esc(level.name || "") + " " + esc(level.count || 0) + "</span>";
+	      }).join("");
+	      const panicSection = panicRows.length
+	        ? renderSmartTable(
+	            "panic-logs",
+	            [
+	              {label:"Time", key:"time"},
+	              {label:"Component", key:"component"},
+	              {label:"Panic", key:"panic"},
+	              {label:"User", key:"user"},
+	              {label:"IP", key:"ip"},
+	              {label:"Stack", key:"panic"},
+	              {label:"Raw", key:"panic"}
+	            ],
+	            panicRows,
+	            "time",
+	            "desc"
+	          )
+	        : "<div class=\"muted\">No panic entries matched the current filter.</div>";
 	      document.getElementById("logs-out").innerHTML =
-	        "<div class=\"row\"><span class=\"pill\">last_event_id=" + esc(state.lastEventID || 0) + "</span><span class=\"pill\">next_before_id=" + esc(state.logCursorBefore || 0) + "</span><span class=\"pill\">" + (state.logHasMore ? "older rows available" : "end reached") + "</span></div>" +
-	        renderSmartTable(
+		        "<div class=\"row\"><span class=\"pill\">last_event_id=" + esc(state.lastEventID || 0) + "</span><span class=\"pill\">next_before_id=" + esc(state.logCursorBefore || 0) + "</span><span class=\"pill\">" + (state.logHasMore ? "older rows available" : "end reached") + "</span></div>" +
+		        renderSmartTable(
 	          "logs",
 	          [
             {label:"Time", key:"time"},
@@ -795,12 +898,15 @@
             {label:"Session", key:"session"},
             {label:"Path", key:"event"},
             {label:"Action", key:"id"}
-          ],
-          rows,
-          "time",
-          "desc"
-        );
-    }
+	          ],
+	          rows,
+	          "time",
+	          "desc"
+	        ) +
+	        "<h3>Server Panic Log</h3>" +
+	        "<div class=\"row\"><span class=\"pill\">panic matches " + esc(systemLogs.panicCount || 0) + "</span><span class=\"pill\">scanned log lines " + esc(systemLogs.scannedLines || 0) + "</span><span class=\"pill\">" + (systemLogs.hasMore ? "more panic entries exist" : "showing latest panic entries") + "</span>" + panicLevels + "</div>" +
+	        panicSection;
+	    }
 
     async function loadAuthAttempts() {
       const q = document.getElementById("auth-q").value.trim();

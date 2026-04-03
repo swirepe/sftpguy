@@ -56,6 +56,7 @@ func NewAdminKeyList(ctx context.Context, filepath string, logger *slog.Logger) 
 		const period = 30 * time.Second
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
+		defer recoverAndLogPanic(log, "admin key list reloader")
 
 		// var lastLoggedReload adminKeyReloadResult
 		// var hasLastLoggedReload bool

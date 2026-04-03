@@ -126,12 +126,12 @@
       <div id="audit-out"></div>
     </div>
 
-    <div class="card hidden" id="tab-logs">
-      <div class="row">
-        <input id="log-q" placeholder="filter events..." />
-        <button onclick="loadLogs()">Refresh</button>
-        <button onclick="loadOlderLogs()">Older</button>
-        <button onclick="loadNewestLogs()">Newest</button>
+	    <div class="card hidden" id="tab-logs">
+	      <div class="row">
+	        <input id="log-q" placeholder="filter events or panic logs..." />
+	        <button onclick="loadLogs()">Refresh</button>
+	        <button onclick="loadOlderLogs()">Older</button>
+	        <button onclick="loadNewestLogs()">Newest</button>
         <label><input id="logs-live" type="checkbox" onchange="toggleLogLive()" /> Live stream</label>
       </div>
       <div id="logs-out"></div>

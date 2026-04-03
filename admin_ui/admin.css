@@ -185,11 +185,24 @@
       opacity: 0; transform: translateY(8px); transition: all .2s ease;
       pointer-events: none;
     }
-    .toast.show { opacity: 1; transform: translateY(0); }
-    pre { margin: 0; white-space: pre-wrap; font-size: 12px; line-height: 1.4; color: var(--text); }
+	    .toast.show { opacity: 1; transform: translateY(0); }
+	    pre { margin: 0; white-space: pre-wrap; font-size: 12px; line-height: 1.4; color: var(--text); }
+	    .log-details summary {
+	      cursor: pointer;
+	      color: var(--accent);
+	    }
+	    .log-details pre {
+	      margin-top: 6px;
+	      max-height: 240px;
+	      overflow: auto;
+	      padding: 8px;
+	      border: 1px solid rgba(42,62,86,.55);
+	      border-radius: 8px;
+	      background: rgba(8,13,20,.7);
+	    }
 
-    @media (max-width: 900px) {
-      .timeline-item {
+	    @media (max-width: 900px) {
+	      .timeline-item {
         grid-template-columns: 52px 110px max-content 1fr;
       }
     }

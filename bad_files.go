@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,13 @@ type hashReloadResult struct {
 }
 
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var errZeroLengthBadFile = errors.New("zero-length files cannot be marked as bad")
+
+const emptyFileSHA256Hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+func isZeroLengthFileHash(hash string) bool {
+	return strings.EqualFold(strings.TrimSpace(hash), emptyFileSHA256Hex)
+}
 
 func newHashReloadResult(entries int, err error) hashReloadResult {
 	result := hashReloadResult{entries: entries}
@@ -71,6 +79,7 @@ func NewHashList(ctx context.Context, filepath string, logger *slog.Logger) *Has
 		const period = 30 * time.Second
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
+		defer recoverAndLogPanic(log, "hash list reloader")
 		var lastChanged = time.Now()
 
 		for {
@@ -108,6 +117,9 @@ func (hl *HashList) AddHash(hash, filename string) error {
 	hash, err := normalizeSHA256Hash(hash)
 	if err != nil {
 		return err
+	}
+	if isZeroLengthFileHash(hash) {
+		return errZeroLengthBadFile
 	}
 
 	if _, exists := hl.Lookup(hash); exists {
@@ -165,6 +177,10 @@ func (hl *HashList) Reload() (entries int, err error) {
 			hl.logger.Warn("skipping invalid bad file hash", "hash", parts[0])
 			continue
 		}
+		if isZeroLengthFileHash(hash) {
+			hl.logger.Warn("skipping zero-length bad file hash", "hash", hash)
+			continue
+		}
 		name := ""
 		if len(parts) > 1 {
 			name = strings.Join(parts[1:], " ")
@@ -178,6 +194,9 @@ func (hl *HashList) Reload() (entries int, err error) {
 }
 
 func (hl *HashList) Lookup(hash string) (string, bool) {
+	if isZeroLengthFileHash(hash) {
+		return "", false
+	}
 	val := hl.hashes.Load()
 	if val == nil {
 		return "", false
@@ -195,6 +214,9 @@ func (hl *HashList) Matches(hash string) bool {
 func (hl *HashList) MatchFile(absPath string) (string, bool, error) {
 	hash, err := hl.calculateSHA256(absPath)
 	if err != nil {
+		if errors.Is(err, errZeroLengthBadFile) {
+			return "", false, nil
+		}
 		return "", false, fmt.Errorf("hash failed: %w", err)
 	}
 
@@ -239,6 +261,9 @@ func (hl *HashList) EnsureContent(content string) (int, error) {
 		hash, err := normalizeSHA256Hash(hash)
 		if err != nil {
 			return len(pending), err
+		}
+		if isZeroLengthFileHash(hash) {
+			return len(pending), errZeroLengthBadFile
 		}
 		if _, exists := hl.Lookup(hash); exists {
 			continue
@@ -290,6 +315,14 @@ func (hl *HashList) calculateSHA256(absPath string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.Size() == 0 {
+		return "", errZeroLengthBadFile
+	}
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {

@@ -75,6 +75,7 @@ func NewIPList(ctx context.Context, filepath string, logger *slog.Logger) *IPLis
 		const period = 30 * time.Second
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
+		defer recoverAndLogPanic(log, "ip list reloader")
 		var lastChanged = time.Now()
 
 		for {

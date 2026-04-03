@@ -31,6 +31,23 @@ type MaintenanceResult struct {
 	PurgeBlacklistedFiles PurgeBlackListedFilesResult `json:"purge_blacklisted_files"`
 }
 
+const maintenanceSkippedRoot = "#recycle"
+
+func isMaintenanceSkippedRelPath(relPath string) bool {
+	relPath = strings.TrimSpace(relPath)
+	if relPath == "" {
+		return false
+	}
+
+	relPath = strings.TrimLeft(filepath.ToSlash(relPath), "/")
+	if relPath == "" || relPath == "." {
+		return false
+	}
+
+	relPath = path.Clean(relPath)
+	return relPath == maintenanceSkippedRoot || strings.HasPrefix(relPath, maintenanceSkippedRoot+"/")
+}
+
 func (s *Store) migrateLegacyIPBans() (migrated int, err error) {
 	if s == nil || s.db == nil || s.blacklist == nil {
 		return -1, nil
@@ -232,6 +249,9 @@ func (s *Server) cleanDeleted() CleanDeletedResult {
 			result.Error = err.Error()
 			return result
 		}
+		if isMaintenanceSkippedRelPath(relPath) {
+			continue
+		}
 
 		if hasDeletedAncestor(relPath, staleSet) {
 			continue
@@ -349,6 +369,12 @@ func (s *Server) reconcileOrphans() ReconcileOrphansResult {
 
 		rel, _ := filepath.Rel(s.absUploadDir, p)
 		rel = filepath.ToSlash(rel)
+		if isMaintenanceSkippedRelPath(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 
 		fi, err := d.Info()
 		if err != nil {
@@ -455,7 +481,23 @@ func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 			logger.Warn("failed to inspect path during bad file maintenance", "path", absPath, "err", walkErr)
 			return nil
 		}
-		if absPath == s.absUploadDir || d.IsDir() {
+		if absPath == s.absUploadDir {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(s.absUploadDir, absPath)
+		if err != nil {
+			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+		if isMaintenanceSkippedRelPath(relPath) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
 			return nil
 		}
 
@@ -473,13 +515,6 @@ func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 		if !matched {
 			return nil
 		}
-
-		relPath, err := filepath.Rel(s.absUploadDir, absPath)
-		if err != nil {
-			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
 
 		ownerHash, err := s.store.GetFileOwner(relPath)
 		if err != nil {
@@ -570,7 +605,26 @@ func (s *Server) PurgeSSHDBot() PurgeSSHDBotResult {
 			}
 			return nil
 		}
-		if absPath == s.absUploadDir || d.IsDir() {
+		if absPath == s.absUploadDir {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(s.absUploadDir, absPath)
+		if err != nil {
+			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
+			if result.Error == "" {
+				result.Error = err.Error()
+			}
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+		if isMaintenanceSkippedRelPath(relPath) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
 			return nil
 		}
 
@@ -593,15 +647,6 @@ func (s *Server) PurgeSSHDBot() PurgeSSHDBotResult {
 			return nil
 		}
 
-		relPath, err := filepath.Rel(s.absUploadDir, absPath)
-		if err != nil {
-			logger.Warn("failed to derive relative path for bad file", "path", absPath, "err", err)
-			if result.Error == "" {
-				result.Error = err.Error()
-			}
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
 		match.Path = relPath
 
 		ownerHash, err := s.store.GetFileOwner(relPath)

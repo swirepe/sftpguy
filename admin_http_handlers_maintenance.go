@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -181,6 +182,10 @@ func (s *Server) handleAdminMarkBadFile(w http.ResponseWriter, r *http.Request) 
 
 	hash, err := s.store.badFileList.calculateSHA256(fullPath)
 	if err != nil {
+		if errors.Is(err, errZeroLengthBadFile) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -250,7 +255,7 @@ func validateAdminBadFileContent(content string) (entries int, invalid []string)
 		}
 
 		parts := strings.Fields(line)
-		if len(parts) == 0 || !isValidSHA256Hash(parts[0]) {
+		if len(parts) == 0 || !isValidSHA256Hash(parts[0]) || isZeroLengthFileHash(parts[0]) {
 			invalid = append(invalid, line)
 			continue
 		}

@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -616,6 +617,12 @@ func warmCaches(root string, maxFiles int) {
 			go func() {
 				defer wg.Done()
 				defer func() { <-sem }()
+				defer func() {
+					if panicValue := recover(); panicValue != nil {
+						log.Printf("CACHE WARMUP: panic recovered; re-panicking: %v\n%s", panicValue, debug.Stack())
+						panic(panicValue)
+					}
+				}()
 				warmFilePreview(fPath, fInfo)
 			}()
 		}

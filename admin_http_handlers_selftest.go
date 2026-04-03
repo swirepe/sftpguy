@@ -68,6 +68,7 @@ func (s *Server) startAdminSelfTest() (adminSelfTestSnapshot, error) {
 	s.selfTestMu.Unlock()
 
 	go func() {
+		defer recoverAndLogPanic(s.logger.With("run_id", runID), "admin self test")
 		report := RunSelfTestWithReport(s, s.cfg, s.logger)
 		if report.StartedAt.IsZero() {
 			report.StartedAt = time.Now().UTC()

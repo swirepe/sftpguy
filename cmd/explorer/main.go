@@ -36,10 +36,12 @@ const (
 // ── globals ───────────────────────────────────────────────────────────────────
 
 var (
-	rootDir     string
-	maxFileSize int64
-	headerHTML  template.HTML
-	footerHTML  template.HTML
+	rootDir             string
+	maxFileSize         int64
+	headerHTML          template.HTML
+	footerHTML          template.HTML
+	errUploadBadRequest = errors.New("upload bad request")
+	errUploadFailed     = errors.New("upload failed")
 )
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -493,6 +495,27 @@ func buildCrumbs(relPath string) []crumb {
 
 func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
 	ip := clientIP(r)
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if !info.IsDir() {
+		log.Printf("[%s] UPLOAD REJECTED: target is not a directory: %q", ip, relPath)
+		http.Error(w, "Upload target must be a directory", http.StatusBadRequest)
+		return
+	}
+	if r.ContentLength > maxFileSize && r.ContentLength != -1 {
+		log.Printf("[%s] UPLOAD REJECTED: content length %d exceeds max %d", ip, r.ContentLength, maxFileSize)
+		http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -500,30 +523,51 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		return
 	}
 
-	var csrfValid bool
-	for {
-		part, err := mr.NextPart()
-		if err != nil {
-			log.Printf("[%s] UPLOAD REJECTED: no csrf", ip)
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		if part.FormName() == "csrf_token" {
-			tokenBytes, _ := io.ReadAll(io.LimitReader(part, 128))
-			csrfValid = validateCSRF(r, string(tokenBytes))
-			part.Close()
-			break
-		}
-		part.Close()
+	csrfPart, err := mr.NextPart()
+	if err == io.EOF {
+		log.Printf("[%s] UPLOAD REJECTED: missing csrf_token part", ip)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
 	}
-
-	if !csrfValid {
+	if err != nil {
+		log.Printf("[%s] UPLOAD REJECTED: invalid multipart before csrf: %v", ip, err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if csrfPart.FormName() != "csrf_token" {
+		log.Printf("[%s] UPLOAD REJECTED: first part is %q, expected csrf_token", ip, csrfPart.FormName())
+		csrfPart.Close()
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
-	if err := streamParts(mr, fullPath, ip); err != nil {
+	tokenBytes, err := io.ReadAll(io.LimitReader(csrfPart, 128))
+	csrfPart.Close()
+	if err != nil {
+		log.Printf("[%s] UPLOAD REJECTED: could not read CSRF token: %v", ip, err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if !validateCSRF(r, string(tokenBytes)) {
+		log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	savedCount, err := streamParts(mr, fullPath, ip)
+	if err != nil {
 		log.Printf("[%s] UPLOAD ERROR: %v", ip, err)
+		if errors.Is(err, errUploadBadRequest) {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "Upload failed", http.StatusInternalServerError)
+		return
+	}
+	if savedCount == 0 {
+		log.Printf("[%s] UPLOAD REJECTED: no files", ip)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -533,15 +577,27 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 	http.Redirect(w, r, "/"+filepath.ToSlash(relPath), http.StatusSeeOther)
 }
 
-func streamParts(mr *multipart.Reader, destDir, ip string) error {
+func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 	topRemap := map[string]string{}
+	createdTopDirs := []string{}
+	createdFiles := []string{}
+	savedCount := 0
+	cleanupCreatedPaths := func() {
+		for i := len(createdFiles) - 1; i >= 0; i-- {
+			_ = os.Remove(createdFiles[i])
+		}
+		for i := len(createdTopDirs) - 1; i >= 0; i-- {
+			_ = os.RemoveAll(createdTopDirs[i])
+		}
+	}
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
-			break
+			return savedCount, nil
 		}
 		if err != nil {
-			return err
+			cleanupCreatedPaths()
+			return savedCount, fmt.Errorf("%w: reading multipart: %v", errUploadBadRequest, err)
 		}
 
 		rawName := partFilename(part)
@@ -562,9 +618,11 @@ func streamParts(mr *multipart.Reader, destDir, ip string) error {
 				actual, err := atomicMkdirUnique(filepath.Join(destDir, topName))
 				if err != nil {
 					part.Close()
-					continue
+					cleanupCreatedPaths()
+					return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Join(destDir, topName), err)
 				}
 				topRemap[topName] = filepath.Base(actual)
+				createdTopDirs = append(createdTopDirs, actual)
 			}
 			finalRel = filepath.Join(topRemap[topName], segments[1])
 		} else {
@@ -573,18 +631,31 @@ func streamParts(mr *multipart.Reader, destDir, ip string) error {
 
 		destPath := filepath.Join(destDir, finalRel)
 		if !isUnderRoot(destPath) {
+			log.Printf("[%s] UPLOAD SKIP (traversal): %q", ip, rawName)
 			part.Close()
 			continue
 		}
 
-		os.MkdirAll(filepath.Dir(destPath), 0755)
-		if err := writeFileAtomic(part, destPath, !isNested); err != nil {
-			log.Printf("[%s] WRITE ERR: %v", ip, err)
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			part.Close()
+			cleanupCreatedPaths()
+			return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Dir(destPath), err)
 		}
-		log.Printf("[%s] WRITE %s", ip, finalRel)
+		writtenPath, err := writeFileAtomic(part, destPath, !isNested)
+		if err != nil {
+			part.Close()
+			cleanupCreatedPaths()
+			var pathErr *os.PathError
+			if errors.As(err, &pathErr) {
+				return savedCount, fmt.Errorf("%w: write %q: %v", errUploadFailed, finalRel, err)
+			}
+			return savedCount, fmt.Errorf("%w: write %q: %v", errUploadBadRequest, finalRel, err)
+		}
+		createdFiles = append(createdFiles, writtenPath)
+		log.Printf("[%s] WRITE %s", ip, filepath.ToSlash(strings.TrimPrefix(writtenPath, destDir+string(filepath.Separator))))
+		savedCount++
 		part.Close()
 	}
-	return nil
 }
 
 func partFilename(p *multipart.Part) string {
@@ -599,8 +670,9 @@ func partFilename(p *multipart.Part) string {
 	return name
 }
 
-func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (err error) {
+func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, err error) {
 	var f *os.File
+	finalPath = path
 	if !uniqueNaming {
 		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	} else {
@@ -609,11 +681,12 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (err error) {
 		stem := strings.TrimSuffix(base, ext)
 		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
 		for i := 1; i < 1000 && errors.Is(err, os.ErrExist); i++ {
-			f, err = os.OpenFile(filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext)), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+			finalPath = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+			f, err = os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
 		}
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() {
 		f.Close()
@@ -622,7 +695,7 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (err error) {
 		}
 	}()
 	_, err = io.Copy(f, r)
-	return err
+	return f.Name(), err
 }
 
 func atomicMkdirUnique(path string) (string, error) {
@@ -755,7 +828,9 @@ tr:hover td{background:#f6f8fa}
 .btn-secondary{ background:#f6f8fa; color:#24292f; border-color:#d0d7de; }
 .progress-wrapper { display: none; margin-top: 16px; background: #eaeef2; height: 18px; position: relative; border-radius: 4px; overflow: hidden; border:1px solid #d0d7de; }
 .progress-bar { height: 100%; background: #0969da; width: 0%; transition: width 0.1s; }
+.progress-bar.upload-error { background: #cf222e; }
 .progress-text { position: absolute; width:100%; text-align:center; font-size:11px; line-height:16px; font-weight:700; mix-blend-mode:multiply; }
+.progress-text.upload-error { color: #fff; mix-blend-mode: normal; }
 footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-size:12px; color:#57606a; }
 </style>
 </head>
@@ -848,9 +923,47 @@ const progressText = document.getElementById('progress-text');
 // Fixed: Externalized onclick handler to satisfy CSP
 folderBtn.addEventListener('click', () => folderInput.click());
 
+function setUploadControlsDisabled(disabled) {
+  submitBtn.disabled = disabled;
+  folderBtn.disabled = disabled;
+  fileInput.disabled = disabled;
+  folderInput.disabled = disabled;
+}
+
+function resetUploadProgress() {
+  progressBar.classList.remove('upload-error');
+  progressText.classList.remove('upload-error');
+  progressBar.style.width = '0%';
+  progressText.innerText = '0%';
+}
+
+function showUploadError(message) {
+  setUploadControlsDisabled(false);
+  progressWrapper.style.display = 'block';
+  progressBar.classList.add('upload-error');
+  progressText.classList.add('upload-error');
+  progressBar.style.width = '100%';
+  progressText.innerText = message;
+}
+
+function getUploadErrorMessage(xhr) {
+  const contentType = (xhr.getResponseHeader('Content-Type') || '').toLowerCase();
+  if (contentType.startsWith('text/plain')) {
+    const text = (xhr.responseText || '').trim().replace(/\s+/g, ' ');
+    if (text) return text;
+  }
+  if (xhr.status === 400) return 'Upload failed (bad request)';
+  if (xhr.status === 403) return 'Upload rejected';
+  if (xhr.status === 408 || xhr.status === 504) return 'Upload timed out';
+  if (xhr.status === 413) return 'Upload too large';
+  if (xhr.status) return 'Upload failed (HTTP ' + xhr.status + ')';
+  return 'Upload failed';
+}
+
 async function performUpload(files, paths = []) {
   if (!files || files.length === 0) return;
-  submitBtn.disabled = folderBtn.disabled = fileInput.disabled = true;
+  setUploadControlsDisabled(true);
+  resetUploadProgress();
   progressWrapper.style.display = 'block';
 
   const formData = new FormData();
@@ -869,7 +982,15 @@ async function performUpload(files, paths = []) {
       progressText.innerText = p + '%';
     }
   };
-  xhr.onload = () => { window.location.reload(); };
+  xhr.onload = () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      window.location.reload();
+      return;
+    }
+    showUploadError(getUploadErrorMessage(xhr));
+  };
+  xhr.onerror = () => showUploadError('Upload failed');
+  xhr.onabort = () => showUploadError('Upload canceled');
   xhr.send(formData);
 }
 
@@ -882,13 +1003,21 @@ document.addEventListener('drop', async (e) => {
   const items = e.dataTransfer.items;
   if (!items) return;
   const files = [], paths = [];
+  const readAllEntries = async (reader) => {
+    const entries = [];
+    while (true) {
+      const batch = await new Promise(res => reader.readEntries(res));
+      if (!batch.length) return entries;
+      entries.push(...batch);
+    }
+  };
   const traverse = async (item, path = "") => {
     if (item.isFile) {
       const f = await new Promise(res => item.file(res));
       files.push(f); paths.push(path + f.name);
     } else if (item.isDirectory) {
       const r = item.createReader();
-      const entries = await new Promise(res => r.readEntries(res));
+      const entries = await readAllEntries(r);
       for (const ent of entries) await traverse(ent, path + item.name + "/");
     }
   };

@@ -155,6 +155,19 @@ func formatUnix(ts int64) string {
 
 var kvPattern = regexp.MustCompile(`([A-Za-z0-9_.-]+)=("([^"\\]|\\.)*"|[^\s]+)`)
 
+type parsedSystemLogEntry struct {
+	Raw       string `json:"raw"`
+	Time      string `json:"time"`
+	Level     string `json:"level"`
+	Msg       string `json:"msg"`
+	UserID    string `json:"user_id"`
+	IP        string `json:"ip"`
+	Component string `json:"component"`
+	Panic     string `json:"panic"`
+	Stack     string `json:"stack"`
+	IsPanic   bool   `json:"is_panic"`
+}
+
 func parseLogKV(line string) map[string]string {
 	out := map[string]string{}
 	matches := kvPattern.FindAllStringSubmatch(line, -1)
@@ -172,6 +185,96 @@ func parseLogKV(line string) map[string]string {
 		out[key] = val
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func isPanicSystemLog(fields map[string]string, line string) bool {
+	msg := strings.ToLower(strings.TrimSpace(fields["msg"]))
+	panicValue := strings.TrimSpace(fields["panic"])
+	lowerLine := strings.ToLower(line)
+
+	if panicValue != "" {
+		return true
+	}
+	if strings.Contains(msg, "panic") || strings.Contains(msg, "fatal error") {
+		return true
+	}
+	if strings.Contains(lowerLine, "panic recovered; re-panicking") {
+		return true
+	}
+	if strings.Contains(lowerLine, "panic:") || strings.Contains(lowerLine, "fatal error:") {
+		return true
+	}
+	return false
+}
+
+func parseSystemLogEntry(line string) parsedSystemLogEntry {
+	fields := parseLogKV(line)
+	return parsedSystemLogEntry{
+		Raw:       line,
+		Time:      fields["time"],
+		Level:     strings.ToUpper(fields["level"]),
+		Msg:       fields["msg"],
+		UserID:    pickLogUser(fields),
+		IP:        pickLogIP(fields),
+		Component: firstNonEmpty(fields["component"], fields["scope"], fields["source"]),
+		Panic:     fields["panic"],
+		Stack:     fields["stack"],
+		IsPanic:   isPanicSystemLog(fields, line),
+	}
+}
+
+func readParsedSystemLog(filename string, limit int, filter string, panicOnly bool) ([]parsedSystemLogEntry, map[string]int, int, int, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	scanLimit := limit
+	if panicOnly {
+		if scanLimit < limit*12 {
+			scanLimit = limit * 12
+		}
+		if scanLimit < 300 {
+			scanLimit = 300
+		}
+		if scanLimit > 5000 {
+			scanLimit = 5000
+		}
+	}
+
+	lines, err := tailFile(filename, scanLimit, filter)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+
+	out := make([]parsedSystemLogEntry, 0, min(limit, len(lines)))
+	levelCount := map[string]int{}
+	panicCount := 0
+	for _, line := range lines {
+		entry := parseSystemLogEntry(line)
+		if entry.Level != "" {
+			levelCount[entry.Level]++
+		}
+		if entry.IsPanic {
+			panicCount++
+		}
+		if panicOnly && !entry.IsPanic {
+			continue
+		}
+		if len(out) >= limit {
+			continue
+		}
+		out = append(out, entry)
+	}
+
+	return out, levelCount, len(lines), panicCount, nil
 }
 
 func pickLogUser(fields map[string]string) string {

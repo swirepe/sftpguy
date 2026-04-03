@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -137,6 +140,328 @@ func TestHandleHeadPublicFileServesHeadersOnly(t *testing.T) {
 	}
 }
 
+func TestHandleUploadStoresFileAndSetsUnlockCookie(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-upload"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "report.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("replacement")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-upload"},
+	})
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Location"); got != "/" {
+		t.Fatalf("location = %q, want %q", got, "/")
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie == nil || cookie.Value != "true" {
+		t.Fatalf("expected unlock cookie, got %+v", cookie)
+	}
+	if got := mustReadFile(t, filepath.Join(root, "report.txt")); got != "replacement" {
+		t.Fatalf("uploaded file contents = %q, want %q", got, "replacement")
+	}
+}
+
+func TestHandleUploadRejectsWhenCSRFPartIsNotFirst(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		fw, err := writer.CreateFormFile("uploadFiles", "late.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("late")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+		if err := writer.WriteField("csrf_token", "csrf-late"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-late"},
+	})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+	if _, err := os.Stat(filepath.Join(root, "late.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected no uploaded file, stat err=%v", err)
+	}
+}
+
+func TestHandleUploadRejectsEmptyUploadAfterCSRF(t *testing.T) {
+	setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-empty"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-empty"},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+}
+
+func TestHandleUploadRejectsFileTarget(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustWriteFile(t, filepath.Join(root, "notes.txt"), "keep")
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-file-target"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "report.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("replacement")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/notes.txt", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-file-target"},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+	if got := mustReadFile(t, filepath.Join(root, "notes.txt")); got != "keep" {
+		t.Fatalf("target file contents = %q, want %q", got, "keep")
+	}
+}
+
+func TestHandleUploadRejectsMissingTargetDirectory(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-missing-target"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "report.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("replacement")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/missing", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-missing-target"},
+	})
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+	if _, err := os.Stat(filepath.Join(root, "missing")); !os.IsNotExist(err) {
+		t.Fatalf("expected missing target to remain absent, stat err=%v", err)
+	}
+}
+
+func TestHandleUploadRejectsOversizeContentLengthEarly(t *testing.T) {
+	setupExplorerTestRoot(t)
+	maxFileSize = 64
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-too-large"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "report.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte(strings.Repeat("x", 256))); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-too-large"},
+	})
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+}
+
+func TestHandleUploadDoesNotUnlockOnTruncatedMultipart(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-broken"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "broken.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("partial")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	cutoff := len(body) - 8
+	if cutoff < 1 {
+		t.Fatalf("multipart body unexpectedly short: %d", len(body))
+	}
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", &failingReader{
+		data:   body,
+		cutoff: cutoff,
+	}, contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-broken"},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+	if _, err := os.Stat(filepath.Join(root, "broken.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected partial file cleanup, stat err=%v", err)
+	}
+}
+
+func TestHandleUploadRollsBackEarlierFilesOnLaterFailure(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-rollback"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "good.txt")
+		if err != nil {
+			t.Fatalf("create first form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("good")); err != nil {
+			t.Fatalf("write first form file: %v", err)
+		}
+		fw, err = writer.CreateFormFile("uploadFiles", "broken.txt")
+		if err != nil {
+			t.Fatalf("create second form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("partial")); err != nil {
+			t.Fatalf("write second form file: %v", err)
+		}
+	})
+
+	cutoff := len(body) - 8
+	if cutoff < 1 {
+		t.Fatalf("multipart body unexpectedly short: %d", len(body))
+	}
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", &failingReader{
+		data:   body,
+		cutoff: cutoff,
+	}, contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-rollback"},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "good.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected rollback of earlier file, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "broken.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected rollback of failing file, stat err=%v", err)
+	}
+}
+
+func TestHandleUploadCleansUpEmptyNestedDirectoryOnFailure(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-nested-broken"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "album/one.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("partial")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	cutoff := len(body) - 8
+	if cutoff < 1 {
+		t.Fatalf("multipart body unexpectedly short: %d", len(body))
+	}
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", &failingReader{
+		data:   body,
+		cutoff: cutoff,
+	}, contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-nested-broken"},
+	})
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie != nil {
+		t.Fatalf("did not expect unlock cookie, got %+v", cookie)
+	}
+	if _, err := os.Stat(filepath.Join(root, "album")); !os.IsNotExist(err) {
+		t.Fatalf("expected empty nested directory cleanup, stat err=%v", err)
+	}
+}
+
+func TestHandleDirectoryListingIncludesUploadFailureScript(t *testing.T) {
+	setupExplorerTestRoot(t)
+
+	w := serveExplorerRequest(http.MethodGet, "/", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	body := w.Body.String()
+	if !strings.Contains(body, "xhr.onerror = () => showUploadError('Upload failed');") {
+		t.Fatalf("expected xhr error handling script, body=%s", body)
+	}
+	if !strings.Contains(body, "function getUploadErrorMessage(xhr) {") {
+		t.Fatalf("expected upload error message helper in script, body=%s", body)
+	}
+	if !strings.Contains(body, "const readAllEntries = async (reader) => {") {
+		t.Fatalf("expected readAllEntries helper in script, body=%s", body)
+	}
+}
+
 func TestReadDirSkipsHiddenSystemDirectoriesAndCountsOnlyVisibleEntries(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 	mustMkdir(t, filepath.Join(root, "#recycle"))
@@ -176,15 +501,18 @@ func setupExplorerTestRoot(t *testing.T) string {
 	oldRootDir := rootDir
 	oldHeaderHTML := headerHTML
 	oldFooterHTML := footerHTML
+	oldMaxFileSize := maxFileSize
 
 	rootDir = t.TempDir()
 	headerHTML = ""
 	footerHTML = ""
+	maxFileSize = 10 << 20
 
 	t.Cleanup(func() {
 		rootDir = oldRootDir
 		headerHTML = oldHeaderHTML
 		footerHTML = oldFooterHTML
+		maxFileSize = oldMaxFileSize
 	})
 
 	return rootDir
@@ -201,6 +529,50 @@ func serveExplorerRequest(method, target string, cookies []*http.Cookie) *httpte
 	return w
 }
 
+func serveExplorerBodyRequest(method, target string, body io.Reader, contentType string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, body)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+
+	w := httptest.NewRecorder()
+	handle(w, req, "test-nonce")
+	return w
+}
+
+func buildMultipartBody(t *testing.T, build func(*multipart.Writer)) ([]byte, string) {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	build(writer)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	return body.Bytes(), writer.FormDataContentType()
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
+}
+
+func mustReadFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file %s: %v", path, err)
+	}
+	return string(data)
+}
+
 func mustMkdir(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0755); err != nil {
@@ -214,4 +586,23 @@ func mustWriteFile(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
 		t.Fatalf("write file %s: %v", path, err)
 	}
+}
+
+type failingReader struct {
+	data   []byte
+	cutoff int
+	offset int
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if r.offset >= r.cutoff {
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	n := copy(p, r.data[r.offset:r.cutoff])
+	r.offset += n
+	if r.offset >= r.cutoff {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }

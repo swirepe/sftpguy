@@ -228,3 +228,120 @@ func TestNewServerMigratesLegacyIPBansToBlacklist(t *testing.T) {
 		t.Fatalf("unexpected migrated timestamp: got=%q comment=%q", got, comment)
 	}
 }
+
+func TestHandleAdminParsedSystemLogReturnsStructuredPanics(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	logLines := []byte(
+		"time=2026-03-26T15:01:02Z level=INFO msg=\"background tick\"\n" +
+			"time=2026-03-26T15:02:03Z level=ERROR msg=\"panic recovered; re-panicking\" component=\"ssh listener\" panic=\"boom\" stack=\"goroutine 1 [running]\\nmain.main()\" user.id=user123 remote_addr=203.0.113.25\n",
+	)
+	if err := os.WriteFile(srv.cfg.LogFile, logLines, permFile); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/system-log/parsed?panic_only=1&limit=5", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminParsedSystemLog(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/system-log/parsed status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Entries []struct {
+			Time      string `json:"time"`
+			Level     string `json:"level"`
+			Msg       string `json:"msg"`
+			UserID    string `json:"user_id"`
+			IP        string `json:"ip"`
+			Component string `json:"component"`
+			Panic     string `json:"panic"`
+			Stack     string `json:"stack"`
+			IsPanic   bool   `json:"is_panic"`
+		} `json:"entries"`
+		PanicCount  int  `json:"panic_count"`
+		ScannedRows int  `json:"scanned_lines"`
+		HasMore     bool `json:"has_more"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode parsed system log response: %v", err)
+	}
+	if resp.PanicCount != 1 {
+		t.Fatalf("expected panic_count=1, got %d", resp.PanicCount)
+	}
+	if resp.ScannedRows != 2 {
+		t.Fatalf("expected scanned_lines=2, got %d", resp.ScannedRows)
+	}
+	if resp.HasMore {
+		t.Fatal("expected has_more=false for single panic entry")
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("expected 1 parsed panic entry, got %d", len(resp.Entries))
+	}
+	if !resp.Entries[0].IsPanic {
+		t.Fatal("expected parsed entry to be marked as panic")
+	}
+	if resp.Entries[0].Component != "ssh listener" {
+		t.Fatalf("unexpected component: got=%q", resp.Entries[0].Component)
+	}
+	if resp.Entries[0].Panic != "boom" {
+		t.Fatalf("unexpected panic value: got=%q", resp.Entries[0].Panic)
+	}
+	if resp.Entries[0].UserID != "user123" {
+		t.Fatalf("unexpected user_id: got=%q", resp.Entries[0].UserID)
+	}
+	if resp.Entries[0].IP != "203.0.113.25" {
+		t.Fatalf("unexpected ip: got=%q", resp.Entries[0].IP)
+	}
+	if resp.Entries[0].Stack != "goroutine 1 [running]\nmain.main()" {
+		t.Fatalf("unexpected stack: got=%q", resp.Entries[0].Stack)
+	}
+}
+
+func TestHandleAdminInsightsIncludesRecentPanics(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	logLines := []byte(
+		"time=2026-03-26T15:01:02Z level=INFO msg=\"background tick\"\n" +
+			"time=2026-03-26T15:02:03Z level=ERROR msg=\"panic recovered; re-panicking\" component=\"maintenance loop\" panic=\"boom\" stack=\"goroutine 1 [running]\\nmain.main()\"\n",
+	)
+	if err := os.WriteFile(srv.cfg.LogFile, logLines, permFile); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/insights?range=24h", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminInsights(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/insights status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		ParsedPanics int `json:"parsed_panics"`
+		RecentPanics []struct {
+			Component string `json:"component"`
+			Panic     string `json:"panic"`
+			IsPanic   bool   `json:"is_panic"`
+		} `json:"recent_panics"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode insights response: %v", err)
+	}
+	if resp.ParsedPanics != 1 {
+		t.Fatalf("expected parsed_panics=1, got %d", resp.ParsedPanics)
+	}
+	if len(resp.RecentPanics) != 1 {
+		t.Fatalf("expected 1 recent panic, got %d", len(resp.RecentPanics))
+	}
+	if !resp.RecentPanics[0].IsPanic {
+		t.Fatal("expected recent panic entry to be marked as panic")
+	}
+	if resp.RecentPanics[0].Component != "maintenance loop" {
+		t.Fatalf("unexpected recent panic component: got=%q", resp.RecentPanics[0].Component)
+	}
+	if resp.RecentPanics[0].Panic != "boom" {
+		t.Fatalf("unexpected recent panic value: got=%q", resp.RecentPanics[0].Panic)
+	}
+}

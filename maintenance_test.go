@@ -58,6 +58,38 @@ func TestCleanDeletedRemovesMissingPaths(t *testing.T) {
 	}
 }
 
+func TestCleanDeletedSkipsRecycleEntries(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	if err := srv.store.EnsureDirectory(systemOwner, "#recycle"); err != nil {
+		t.Fatalf("ensure recycle dir: %v", err)
+	}
+	srv.store.RegisterFile("#recycle/orphaned.txt", systemOwner, 0, false)
+	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+
+	result := srv.cleanDeleted()
+
+	if srv.store.FileExistsInDB("gone.txt") {
+		t.Fatal("expected non-recycle stale file to be removed")
+	}
+	if !srv.store.FileExistsInDB("#recycle") {
+		t.Fatal("expected recycle directory record to remain")
+	}
+	if !srv.store.FileExistsInDB("#recycle/orphaned.txt") {
+		t.Fatal("expected recycle child record to remain")
+	}
+	if result.StaleRoots != 1 {
+		t.Fatalf("unexpected stale roots: got=%d want=%d", result.StaleRoots, 1)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("unexpected deleted rows: got=%d want=%d", result.Deleted, 1)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected cleanDeleted error: %s", result.Error)
+	}
+}
+
 func TestMaintenanceLoopRunsAndStopsOnShutdown(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	srv.startMaintenanceLoop(20 * time.Millisecond)
@@ -295,6 +327,45 @@ func TestUpdateFileWriteOwnerHintOverridesSystemOwnerRow(t *testing.T) {
 	}
 }
 
+func TestReconcileOrphansSkipsRecycleDirectory(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	visiblePath := filepath.Join(srv.absUploadDir, "visible.txt")
+	if err := os.WriteFile(visiblePath, []byte("visible"), permFile); err != nil {
+		t.Fatalf("write visible file: %v", err)
+	}
+
+	recyclePath := filepath.Join(srv.absUploadDir, "#recycle", "ignored.txt")
+	if err := os.MkdirAll(filepath.Dir(recyclePath), permDir); err != nil {
+		t.Fatalf("mkdir recycle dir: %v", err)
+	}
+	if err := os.WriteFile(recyclePath, []byte("ignored"), permFile); err != nil {
+		t.Fatalf("write recycle file: %v", err)
+	}
+
+	result := srv.reconcileOrphans()
+
+	if !srv.store.FileExistsInDB("visible.txt") {
+		t.Fatal("expected visible file to be reconciled")
+	}
+	if srv.store.FileExistsInDB("#recycle") {
+		t.Fatal("expected recycle directory to be skipped")
+	}
+	if srv.store.FileExistsInDB("#recycle/ignored.txt") {
+		t.Fatal("expected recycle child file to be skipped")
+	}
+	if result.Candidates != 1 {
+		t.Fatalf("unexpected candidate count: got=%d want=%d", result.Candidates, 1)
+	}
+	if len(result.Unorphaned) != 1 || result.Unorphaned[0].Path != "visible.txt" {
+		t.Fatalf("unexpected unorphaned result: %+v", result.Unorphaned)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected reconcileOrphans error: %s", result.Error)
+	}
+}
+
 func TestGetUserStatsHandlesNullLastAddress(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
@@ -455,6 +526,57 @@ func TestPurgeBlacklistedFilesPurgesOwnerAndBlacklistsRange(t *testing.T) {
 	}
 }
 
+func TestPurgeBlacklistedFilesSkipsRecycleDirectory(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "recycle-bad-file-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("203.0.113.29"), Port: 2222}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	const badRel = "#recycle/bad.bin"
+	badPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(badRel))
+	if err := os.MkdirAll(filepath.Dir(badPath), permDir); err != nil {
+		t.Fatalf("mkdir recycle dir: %v", err)
+	}
+	if err := os.WriteFile(badPath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad file: %v", err)
+	}
+
+	if err := srv.store.EnsureDirectory(ownerHash, "#recycle"); err != nil {
+		t.Fatalf("ensure recycle dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, badRel, int64(len("malware payload")), int64(len("malware payload"))); err != nil {
+		t.Fatalf("register bad file: %v", err)
+	}
+	if _, err := srv.store.badFileList.AddFile(badPath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+
+	result := srv.purgeBlacklistedFiles()
+
+	if _, err := os.Stat(badPath); err != nil {
+		t.Fatalf("expected recycle bad file to remain, got err=%v", err)
+	}
+	if !srv.store.FileExistsInDB("#recycle") || !srv.store.FileExistsInDB(badRel) {
+		t.Fatal("expected recycle records to remain in the database")
+	}
+	if srv.store.blacklist.Matches(ownerAddr.IP.String()) {
+		t.Fatal("expected recycle bad file owner to remain unblacklisted")
+	}
+	if result.Matches != 0 || result.Purges != 0 || result.OwnersPurged != 0 || result.BlacklistUpdates != 0 {
+		t.Fatalf("unexpected purgeBlacklistedFiles result: %+v", result)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected purgeBlacklistedFiles error: %s", result.Error)
+	}
+}
+
 func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
@@ -528,6 +650,57 @@ func TestRunMaintenancePassReturnsAggregatedResults(t *testing.T) {
 
 func TestRunMaintenancePassReturnsAggregatedResultsForXinetd(t *testing.T) {
 	runMaintenancePassReturnsAggregatedResultsCase(t, "xinetd")
+}
+
+func TestPurgeSSHDBotSkipsRecycleDirectory(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const ownerHash = "recycle-sshdbot-owner"
+	ownerAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.77"), Port: 2022}
+	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
+		t.Fatalf("upsert owner session: %v", err)
+	}
+
+	const botRel = "#recycle/.24680/sshd"
+	botPath := filepath.Join(srv.absUploadDir, filepath.FromSlash(botRel))
+	if err := os.MkdirAll(filepath.Dir(botPath), permDir); err != nil {
+		t.Fatalf("mkdir recycle sshdbot dir: %v", err)
+	}
+	if err := os.WriteFile(botPath, []byte("sshdbot payload"), permFile); err != nil {
+		t.Fatalf("write sshdbot payload: %v", err)
+	}
+
+	if err := srv.store.EnsureDirectory(ownerHash, "#recycle"); err != nil {
+		t.Fatalf("ensure recycle dir: %v", err)
+	}
+	if err := srv.store.EnsureDirectory(ownerHash, "#recycle/.24680"); err != nil {
+		t.Fatalf("ensure recycle sshdbot dir: %v", err)
+	}
+	if err := srv.store.UpdateFileWrite(ownerHash, ownerHash, botRel, int64(len("sshdbot payload")), int64(len("sshdbot payload"))); err != nil {
+		t.Fatalf("register sshdbot payload: %v", err)
+	}
+
+	result := srv.PurgeSSHDBot()
+
+	if len(result.Matches) != 0 || result.Purges != 0 || result.OwnersBanned != 0 || result.BlacklistUpdates != 0 {
+		t.Fatalf("unexpected purgeSSHDBot result: %+v", result)
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected purgeSSHDBot error: %s", result.Error)
+	}
+	if _, err := os.Stat(botPath); err != nil {
+		t.Fatalf("expected recycle sshdbot payload to remain, got err=%v", err)
+	}
+	if !srv.store.FileExistsInDB(botRel) {
+		t.Fatal("expected recycle sshdbot record to remain in the database")
+	}
+	if srv.store.IsBanned(ownerHash) {
+		t.Fatal("expected recycle sshdbot owner to remain unbanned")
+	}
+	if srv.store.blacklist.Matches(ownerAddr.IP.String()) {
+		t.Fatal("expected recycle sshdbot owner IP to remain unblacklisted")
+	}
 }
 
 func runMaintenancePassReturnsAggregatedResultsCase(t *testing.T, botBinary string) {

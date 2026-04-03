@@ -106,6 +106,36 @@ func TestHandleAdminBadFilesGetSaveAndMark(t *testing.T) {
 	}
 }
 
+func TestHandleAdminMarkBadFileRejectsZeroLengthFile(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const relPath = "empty.bin"
+	fullPath := filepath.Join(srv.absUploadDir, relPath)
+	if err := os.WriteFile(fullPath, nil, permFile); err != nil {
+		t.Fatalf("write empty upload file: %v", err)
+	}
+
+	markBody, _ := json.Marshal(map[string]any{"path": relPath})
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/maintenance/mark-bad", bytes.NewReader(markBody))
+	w := httptest.NewRecorder()
+	srv.handleAdminMarkBadFile(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("POST /admin/api/maintenance/mark-bad status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != errZeroLengthBadFile.Error() {
+		t.Fatalf("unexpected mark-bad error: got=%q want=%q", got, errZeroLengthBadFile.Error())
+	}
+
+	content, err := os.ReadFile(srv.store.badFilesPath)
+	if err != nil {
+		t.Fatalf("read bad files content: %v", err)
+	}
+	if len(content) != 0 {
+		t.Fatalf("expected empty bad files content after rejected mark-bad, got %q", string(content))
+	}
+}
+
 func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()

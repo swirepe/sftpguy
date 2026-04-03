@@ -51,6 +51,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -1281,6 +1282,7 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer recoverAndLogPanic(s.logger, "maintenance loop")
 
 		started, halted, _ := s.runTrackedMaintenancePass(s.ctx, "startup", false)
 		if !started || !halted {
@@ -1339,11 +1341,13 @@ func (s *Server) Listen() error {
 			conn = newThrottledConn(conn, shadowBanBytesPerSec)
 		}
 		s.wg.Add(1)
-		go func(c net.Conn) {
+		connLogger := s.logger.With("remote_addr", addr.String())
+		go func(c net.Conn, workerLogger *slog.Logger) {
 			defer s.wg.Done()
 			defer s.closeObservedConnection()
+			defer recoverAndLogPanic(workerLogger, "ssh connection worker")
 			s.handleSSH(c, sshConfig)
-		}(conn)
+		}(conn, connLogger)
 	}
 }
 
@@ -1566,7 +1570,10 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	)
 
 	logger.Info("login", "banned", isBanned)
-	go ssh.DiscardRequests(reqs)
+	go func() {
+		defer recoverAndLogPanic(logger, "ssh request discard")
+		ssh.DiscardRequests(reqs)
+	}()
 
 	for newCh := range chans {
 		if newCh.ChannelType() != "session" {
@@ -1575,7 +1582,10 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		}
 
 		ch, reqs, _ := newCh.Accept()
-		go s.handleChannel(ch, reqs, effectivePubHash, sessionID, stats, sConn, logger, isBanned, isAdminSFTP, sessionCounts)
+		go func(ch ssh.Channel, reqs <-chan *ssh.Request) {
+			defer recoverAndLogPanic(logger, "sftp channel")
+			s.handleChannel(ch, reqs, effectivePubHash, sessionID, stats, sConn, logger, isBanned, isAdminSFTP, sessionCounts)
+		}(ch, reqs)
 	}
 }
 
@@ -3191,6 +3201,27 @@ func appShort() string {
 	return strings.Split(AppVersion, "-")[0]
 }
 
+func logRecoveredPanic(logger *slog.Logger, component string, panicValue any) {
+	stack := debug.Stack()
+	if logger != nil {
+		logger.Error("panic recovered; re-panicking",
+			"component", component,
+			"panic", panicValue,
+			"stack", string(stack),
+		)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "panic recovered; re-panicking component=%s panic=%v\n%s", component, panicValue, stack)
+}
+
+func recoverAndLogPanic(logger *slog.Logger, component string) {
+	if panicValue := recover(); panicValue != nil {
+		logRecoveredPanic(logger, component, panicValue)
+		panic(panicValue)
+	}
+}
+
 const startupBanner = `
 ┏━┓┏━╸╺┳╸┏━┓┏━╸╻ ╻╻ ╻
 ┗━┓┣╸  ┃ ┣━┛┃╺┓┃ ┃┗┳┛
@@ -3212,8 +3243,13 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			logRecoveredPanic(logger, "main", panicValue)
+			_ = logFile.Close()
+			panic(panicValue)
+		}
 		logger.Info("execution complete", "uptime", time.Since(start))
-		logFile.Close()
+		_ = logFile.Close()
 	}()
 
 	srv, err := NewServer(cfg, logger)
@@ -3227,6 +3263,7 @@ func main() {
 
 	srv.startMaintenanceLoop(time.Hour)
 	go func() {
+		defer recoverAndLogPanic(logger, "ssh listener")
 		if err := srv.Listen(); err != nil {
 			logger.Error("ssh listener failed", "err", err)
 		}
@@ -3234,6 +3271,7 @@ func main() {
 
 	if cfg.AdminHTTP != "" {
 		go func() {
+			defer recoverAndLogPanic(logger, "admin http listener")
 			if err := srv.ListenAdminHTTP(); err != nil {
 				logger.Error("admin http listener failed", "err", err)
 			}
@@ -3242,6 +3280,7 @@ func main() {
 
 	if cfg.SelfTest || cfg.SelfTestContinue {
 		go func() {
+			defer recoverAndLogPanic(logger, "startup self test")
 			tStart := time.Now()
 			failures := RunSelfTest(srv, cfg, logger)
 			logger.Info("Self test complete", "failures", failures, "duration", time.Since(tStart))
@@ -3261,6 +3300,7 @@ func main() {
 	logger.Info("Shutdown signal received", "signal", sig.String())
 
 	go func() {
+		defer recoverAndLogPanic(logger, "forced-exit watcher")
 		<-sigChan
 		logger.Error("Forced exit: Terminating immediately")
 		os.Exit(1)

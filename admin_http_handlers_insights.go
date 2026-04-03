@@ -99,17 +99,24 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 	levelCount := map[string]int{}
 	userCount := map[string]int{}
 	ipCount := map[string]int{}
+	recentPanics := make([]parsedSystemLogEntry, 0, 6)
+	panicCount := 0
 	for _, line := range lines {
-		fields := parseLogKV(line)
-		level := strings.ToUpper(fields["level"])
-		if level != "" {
-			levelCount[level]++
+		entry := parseSystemLogEntry(line)
+		if entry.Level != "" {
+			levelCount[entry.Level]++
 		}
-		if user := pickLogUser(fields); user != "" {
-			userCount[user]++
+		if entry.UserID != "" {
+			userCount[entry.UserID]++
 		}
-		if ip := pickLogIP(fields); ip != "" {
-			ipCount[ip]++
+		if entry.IP != "" {
+			ipCount[entry.IP]++
+		}
+		if entry.IsPanic {
+			panicCount++
+			if len(recentPanics) < cap(recentPanics) {
+				recentPanics = append(recentPanics, entry)
+			}
 		}
 	}
 
@@ -139,6 +146,8 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		"parsed_users_recent":     mapCountPairs(userCount, 12),
 		"parsed_ips_recent":       mapCountPairs(ipCount, 12),
 		"parsed_lines_considered": len(lines),
+		"parsed_panics":           panicCount,
+		"recent_panics":           recentPanics,
 	})
 }
 
@@ -164,42 +173,20 @@ func (s *Server) handleAdminParsedSystemLog(w http.ResponseWriter, r *http.Reque
 	}
 	limit := parseIntQuery(r, "limit", 120, 10, 500)
 	filter := strings.TrimSpace(r.URL.Query().Get("q"))
-	lines, err := tailFile(s.cfg.LogFile, limit, filter)
+	panicOnly := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("panic_only")), "1") ||
+		strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("panic_only")), "true")
+	entries, levelCount, scannedLines, panicCount, err := readParsedSystemLog(s.cfg.LogFile, limit, filter, panicOnly)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	type parsedRow struct {
-		Raw    string `json:"raw"`
-		Time   string `json:"time"`
-		Level  string `json:"level"`
-		Msg    string `json:"msg"`
-		UserID string `json:"user_id"`
-		IP     string `json:"ip"`
-	}
-
-	out := make([]parsedRow, 0, len(lines))
-	levelCount := map[string]int{}
-	for _, line := range lines {
-		fields := parseLogKV(line)
-		row := parsedRow{
-			Raw:    line,
-			Time:   fields["time"],
-			Level:  strings.ToUpper(fields["level"]),
-			Msg:    fields["msg"],
-			UserID: pickLogUser(fields),
-			IP:     pickLogIP(fields),
-		}
-		if row.Level != "" {
-			levelCount[row.Level]++
-		}
-		out = append(out, row)
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"entries": out,
-		"levels":  mapCountPairs(levelCount, 10),
+		"entries":       entries,
+		"levels":        mapCountPairs(levelCount, 10),
+		"panic_count":   panicCount,
+		"scanned_lines": scannedLines,
+		"has_more":      panicCount > len(entries),
 	})
 }
 
