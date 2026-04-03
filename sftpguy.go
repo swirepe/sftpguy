@@ -1576,17 +1576,46 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	}()
 
 	for newCh := range chans {
-		if newCh.ChannelType() != "session" {
-			newCh.Reject(ssh.UnknownChannelType, "unknown channel type")
+		ch, reqs, ok := acceptSessionChannel(newCh, logger)
+		if !ok {
 			continue
 		}
 
-		ch, reqs, _ := newCh.Accept()
 		go func(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			defer recoverAndLogPanic(logger, "sftp channel")
 			s.handleChannel(ch, reqs, effectivePubHash, sessionID, stats, sConn, logger, isBanned, isAdminSFTP, sessionCounts)
 		}(ch, reqs)
 	}
+}
+
+func acceptSessionChannel(newCh ssh.NewChannel, logger *slog.Logger) (ssh.Channel, <-chan *ssh.Request, bool) {
+	if newCh.ChannelType() != "session" {
+		if err := newCh.Reject(ssh.UnknownChannelType, "unknown channel type"); err != nil && logger != nil {
+			logger.Warn("failed to reject unknown channel type", "channel_type", newCh.ChannelType(), "err", err)
+		}
+		return nil, nil, false
+	}
+
+	ch, reqs, err := newCh.Accept()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("failed to accept session channel", "err", err)
+		}
+		return nil, nil, false
+	}
+	if ch == nil || reqs == nil {
+		if logger != nil {
+			logger.Warn("session channel accept returned incomplete state", "has_channel", ch != nil, "has_requests", reqs != nil)
+		}
+		if ch != nil {
+			if err := ch.Close(); err != nil && logger != nil {
+				logger.Warn("failed to close incomplete session channel", "err", err)
+			}
+		}
+		return nil, nil, false
+	}
+
+	return ch, reqs, true
 }
 
 func (s *Server) handleChannel(ch ssh.Channel,
@@ -1599,13 +1628,31 @@ func (s *Server) handleChannel(ch ssh.Channel,
 	isBanned bool,
 	isAdmin bool,
 	counters *sessionCounters) {
+	if ch == nil {
+		if logger != nil {
+			logger.Warn("handleChannel called without ssh channel", "has_requests", reqs != nil)
+		}
+		return
+	}
 	defer ch.Close()
+	if reqs == nil {
+		if logger != nil {
+			logger.Warn("handleChannel called without request stream")
+		}
+		return
+	}
 
 	for req := range reqs {
 		s.logger.Debug("handleChannel", "req", req)
 		switch req.Type {
 		case "subsystem":
-			if string(req.Payload[4:]) == "sftp" {
+			var subsystem struct{ Value string }
+			if err := ssh.Unmarshal(req.Payload, &subsystem); err != nil {
+				logger.Warn("malformed subsystem request", "err", err)
+				req.Reply(false, nil)
+				continue
+			}
+			if subsystem.Value == "sftp" {
 				req.Reply(true, nil)
 				if isAdmin {
 					s.WelcomeAdmin(ch.Stderr(), sConn.Permissions.Extensions["pubkey-hash"])
@@ -1638,7 +1685,7 @@ func (s *Server) handleChannel(ch ssh.Channel,
 				server.Serve()
 				return
 			}
-			logger.Debug("rejected subsystem", "subsystem", req.Payload[4:])
+			logger.Debug("rejected subsystem", "subsystem", subsystem.Value)
 			req.Reply(false, nil)
 
 		case "env":
