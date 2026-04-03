@@ -3076,11 +3076,23 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	if cfg.QuietConsole {
 		cLvl = slog.LevelWarn
 	}
+	opts := &slog.HandlerOptions{Level: cLvl,
+		AddSource: true,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.SourceKey {
+				source, _ := a.Value.Any().(*slog.Source)
+				if source != nil {
+					source.File = filepath.Base(source.File)
+				}
+			}
+			return a
+		},
+	}
 	var handlers []slog.Handler
 
-	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cLvl})
+	var consoleHandler slog.Handler = slog.NewTextHandler(os.Stdout, opts)
 	if cfg.PrettyLog {
-		consoleHandler = newConsoleHandler(&slog.HandlerOptions{Level: cLvl})
+		consoleHandler = newConsoleHandler(opts)
 	}
 	handlers = append(handlers, consoleHandler)
 
@@ -3088,7 +3100,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-	handlers = append(handlers, slog.NewTextHandler(f, &slog.HandlerOptions{Level: cLvl}))
+	handlers = append(handlers, slog.NewTextHandler(f, opts))
 
 	sh, err := cfg.getSyslogHandler()
 	if err != nil {
