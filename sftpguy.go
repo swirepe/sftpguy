@@ -818,6 +818,63 @@ func (s *Store) FilesByOwner(pubHash string) ([]string, error) {
 	return paths, nil
 }
 
+type OwnedFilesSummary struct {
+	FileCount   int64
+	DirCount    int64
+	RecentFiles []string
+}
+
+func (s *Store) OwnedFilesSummary(pubHash string, limit int) (OwnedFilesSummary, error) {
+	if limit < 0 {
+		limit = 0
+	}
+
+	var summary OwnedFilesSummary
+	if err := s.db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE is_dir = 0),
+			COUNT(*) FILTER (WHERE is_dir = 1)
+		FROM files
+		WHERE owner_hash = ?`, pubHash).Scan(&summary.FileCount, &summary.DirCount); err != nil {
+		s.logger.Error("failed to summarize owned files", "err", err, "hash", pubHash)
+		return OwnedFilesSummary{}, err
+	}
+
+	if limit == 0 {
+		return summary, nil
+	}
+
+	// The files table does not store per-file timestamps yet, so rowid is the
+	// best available proxy for "most recently created/claimed".
+	rows, err := s.db.Query(`
+		SELECT path
+		FROM files
+		WHERE owner_hash = ? AND is_dir = 0
+		ORDER BY rowid DESC
+		LIMIT ?`, pubHash, limit)
+	if err != nil {
+		s.logger.Error("failed to query recent owned files", "err", err, "hash", pubHash, "limit", limit)
+		return OwnedFilesSummary{}, err
+	}
+	defer rows.Close()
+
+	summary.RecentFiles = make([]string, 0, limit)
+	for rows.Next() {
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			s.logger.Error("failed to scan recent owned file row", "err", err)
+			return OwnedFilesSummary{}, err
+		}
+		summary.RecentFiles = append(summary.RecentFiles, rel)
+	}
+
+	if err := rows.Err(); err != nil {
+		return OwnedFilesSummary{}, err
+	}
+
+	return summary, nil
+}
+
 func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr net.Addr, args ...any) {
 	ip := ""
 	port := 0
@@ -1849,16 +1906,18 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		fmt.Fprintf(w, "* The maximum permitted file size is %s\r\n", bold.Fmt(formatBytes(maxSize)))
 	}
 
-	files, err := s.store.FilesByOwner(hash)
-	if err == nil && len(files) > 0 {
-		var buffer bytes.Buffer
-		const maxToDisplay = 50
-		ownedDirs, shownCount := printGrid(&buffer, files, maxToDisplay)
-
-		fmt.Fprintf(w, "* You have created %d files, %d directories:\r\n", len(files)-ownedDirs, ownedDirs)
-		fmt.Fprintln(w, buffer.String())
-		if len(files) > shownCount {
-			fmt.Fprintf(w, "  ... and %d more items.\r\n", len(files)-shownCount)
+	const recentOwnedFilesLimit = 10
+	owned, err := s.store.OwnedFilesSummary(hash, recentOwnedFilesLimit)
+	if err == nil && (owned.FileCount > 0 || owned.DirCount > 0) {
+		fmt.Fprintf(w, "* You have created %d files, %d directories.\r\n", owned.FileCount, owned.DirCount)
+		if len(owned.RecentFiles) > 0 {
+			fmt.Fprintf(w, "* Your last %d owned files:\r\n", len(owned.RecentFiles))
+			for _, relPath := range owned.RecentFiles {
+				fmt.Fprintf(w, "  %s\r\n", bold.Fmt(relPath))
+			}
+			if olderFiles := owned.FileCount - int64(len(owned.RecentFiles)); olderFiles > 0 {
+				fmt.Fprintf(w, "  ... and %d older files.\r\n", olderFiles)
+			}
 		}
 	}
 
