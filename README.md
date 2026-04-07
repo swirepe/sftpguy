@@ -37,6 +37,10 @@ These are all different ways to access the same archive.  A web-based version (s
 
 You may consider using a modern sftp client like [lftp,](https://lftp.yar.ru/) although you might not see the welcome banner. 
 
+<img width="588" height="442" alt="screenshot-normal" src="https://github.com/user-attachments/assets/f8467036-6340-455a-9d10-65de60f0fb7b" />
+
+<img width="624" height="378" alt="screenshot-contributor" src="https://github.com/user-attachments/assets/1dc624d3-c9e2-499f-8fcf-c5a8d7ce6f65" />
+
 ## Is this AI slop?
 
 Yeah.
