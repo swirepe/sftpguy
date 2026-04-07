@@ -37,9 +37,24 @@ These are all different ways to access the same archive.  A web-based version (s
 
 You may consider using a modern sftp client like [lftp,](https://lftp.yar.ru/) although you might not see the welcome banner. 
 
+## Screenshots
+
+An sftp connection from a regular user:
+
 <img width="588" height="442" alt="screenshot-normal" src="https://github.com/user-attachments/assets/f8467036-6340-455a-9d10-65de60f0fb7b" />
 
+
+
+Contributors get a little [fortune](fortunes.txt), because they're special:
+
 <img width="624" height="378" alt="screenshot-contributor" src="https://github.com/user-attachments/assets/1dc624d3-c9e2-499f-8fcf-c5a8d7ce6f65" />
+
+
+
+The file explorer in the [admin console](admin_http_handlers_explorer.go) (admin tools added to the [deluxe explorer](cmd/explorer-deluxe)) : 
+
+<img width="1062" height="906" alt="screenshot-explorer" src="https://github.com/user-attachments/assets/2765bd9f-c97a-493f-a0c1-6836d1033f6e" />
+
 
 ## Is this AI slop?
 
