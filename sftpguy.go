@@ -121,10 +121,11 @@ const (
 	permReadOnly = 0444
 
 	// System defaults
-	defaultUID      = 1000
-	defaultGID      = 1000
-	unrestrictedUID = 1337
-	unrestrictedGID = 1337
+	defaultUID            = 1000
+	defaultGID            = 1000
+	unrestrictedUID       = 1337
+	unrestrictedGID       = 1337
+	badFileCheckQueueSize = 256
 
 	// Database defaults
 	sqliteBusyTimeoutMS = 1000
@@ -1194,6 +1195,13 @@ type Server struct {
 	shadowListMin    time.Duration
 	shadowListMax    time.Duration
 	startedAt        time.Time
+	badUploadChecks  chan badUploadCheck
+}
+
+type badUploadCheck struct {
+	relPath   string
+	ownerHash string
+	ownerAddr string
 }
 
 func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
@@ -1226,8 +1234,10 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		shadowListMin:    shadowListMinDefault,
 		shadowListMax:    shadowListMaxDefault,
 		startedAt:        time.Now(),
+		badUploadChecks:  make(chan badUploadCheck, badFileCheckQueueSize),
 	}
 	srv.metrics = newServerMetrics(srv)
+	srv.startBadUploadChecks()
 
 	if cfg.SelfTest || cfg.SelfTestContinue {
 		srv.shadowMutateMin = shadowMutateMinSelfTest
@@ -1347,6 +1357,122 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 		}
 		s.cleanAndReconcile(s.ctx, interval)
 	}()
+}
+
+func (s *Server) startBadUploadChecks() {
+	if s == nil {
+		return
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer recoverAndLogPanic(s.logger, "bad upload checker")
+
+		logger := s.logger.WithGroup("maintenance").With("operation", "upload_bad_file_async")
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case check := <-s.badUploadChecks:
+				s.processBadUploadCheck(logger, check)
+			}
+		}
+	}()
+}
+
+func (s *Server) enqueueBadUploadCheck(relPath, ownerHash, ownerAddr string) {
+	if s == nil || s.store == nil || s.store.badFileList == nil {
+		return
+	}
+
+	ownerHash = strings.TrimSpace(ownerHash)
+	relPath = strings.TrimPrefix(path.Clean("/"+strings.TrimSpace(relPath)), "/")
+	if ownerHash == "" || ownerHash == systemOwner || relPath == "" || relPath == "." {
+		return
+	}
+
+	select {
+	case <-s.ctx.Done():
+		return
+	case s.badUploadChecks <- badUploadCheck{
+		relPath:   relPath,
+		ownerHash: ownerHash,
+		ownerAddr: strings.TrimSpace(ownerAddr),
+	}:
+	default:
+		s.logger.Warn("bad upload check queue full; deferring to maintenance",
+			"path", relPath,
+			"owner", ownerHash,
+			"queued", len(s.badUploadChecks))
+	}
+}
+
+func (s *Server) processBadUploadCheck(logger *slog.Logger, check badUploadCheck) {
+	if s == nil || s.store == nil || s.store.badFileList == nil {
+		return
+	}
+
+	currentOwner, err := s.store.GetFileOwner(check.relPath)
+	if err != nil {
+		logger.Warn("failed to resolve owner for uploaded bad file check",
+			"path", check.relPath,
+			"owner", check.ownerHash,
+			"err", err)
+		return
+	}
+	if currentOwner == "" || currentOwner == systemOwner {
+		return
+	}
+	if check.ownerHash != "" && currentOwner != check.ownerHash {
+		logger.Debug("skipping async bad file check for replaced upload",
+			"path", check.relPath,
+			"expected_owner", check.ownerHash,
+			"current_owner", currentOwner)
+		return
+	}
+
+	fullPath := filepath.Join(s.absUploadDir, filepath.FromSlash(check.relPath))
+	matchName, matched, err := s.store.badFileList.MatchFile(fullPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		logger.Warn("failed to inspect uploaded file against bad-file list",
+			"path", check.relPath,
+			"owner", currentOwner,
+			"err", err)
+		return
+	}
+	if !matched {
+		return
+	}
+
+	ownerAddr := strings.TrimSpace(check.ownerAddr)
+	if ownerAddr == "" {
+		stats, statsErr := s.store.GetUserStats(currentOwner)
+		if statsErr != nil {
+			logger.Warn("failed to resolve owner address for uploaded bad file",
+				"path", check.relPath,
+				"owner", currentOwner,
+				"err", statsErr)
+		} else {
+			ownerAddr = strings.TrimSpace(stats.LastAddress)
+		}
+	}
+
+	if _, _, err := s.purgeMatchedBadFile(logger, "upload_async", badFileMatch{
+		relPath:   check.relPath,
+		ownerHash: currentOwner,
+		ownerAddr: ownerAddr,
+		knownAs:   matchName,
+	}); err != nil {
+		logger.Warn("failed to purge uploaded bad file asynchronously",
+			"path", check.relPath,
+			"owner", currentOwner,
+			"match", matchName,
+			"err", err)
+	}
 }
 
 func (s *Server) Listen() error {
@@ -2741,42 +2867,11 @@ func (sw *statWriter) reportUserStatus(pubHash string) {
 	}
 }
 
-func (sw *statWriter) purgeBadUploadIfMatched() (bool, error) {
-	if sw.h.pubHash == "" || sw.h.pubHash == systemOwner || sw.h.srv.store == nil || sw.h.srv.store.badFileList == nil {
-		return false, nil
+func (sw *statWriter) enqueueBadUploadCheck() {
+	if sw == nil || sw.h == nil || sw.h.srv == nil {
+		return
 	}
-
-	fullPath := filepath.Join(sw.h.srv.absUploadDir, filepath.FromSlash(sw.rel))
-
-	matchName, matched, err := sw.h.srv.store.badFileList.MatchFile(fullPath)
-	if err != nil {
-		return false, err
-	}
-	if !matched {
-		return false, nil
-	}
-
-	ownerAddr := remoteAddrHost(sw.h.remoteAddr)
-	if ownerAddr == "" {
-		stats, statsErr := sw.h.srv.store.GetUserStats(sw.h.pubHash)
-		if statsErr != nil {
-			sw.h.logger.Warn("failed to resolve owner address for uploaded bad file",
-				"path", sw.rel,
-				"owner", sw.h.pubHash,
-				"err", statsErr)
-		} else {
-			ownerAddr = strings.TrimSpace(stats.LastAddress)
-		}
-	}
-
-	logger := sw.h.srv.logger.WithGroup("maintenance").With("operation", "upload_bad_file")
-	purged, _, err := sw.h.srv.purgeMatchedBadFile(logger, "upload", badFileMatch{
-		relPath:   sw.rel,
-		ownerHash: sw.h.pubHash,
-		ownerAddr: ownerAddr,
-		knownAs:   matchName,
-	})
-	return purged, err
+	sw.h.srv.enqueueBadUploadCheck(sw.rel, sw.h.pubHash, remoteAddrHost(sw.h.remoteAddr))
 }
 
 func (sw *statWriter) Close() error {
@@ -2804,17 +2899,8 @@ func (sw *statWriter) Close() error {
 	}
 
 	sw.h.logUpload(sw.rel, size, delta)
-
-	purgedBadFile, err := sw.purgeBadUploadIfMatched()
-	if err != nil {
-		sw.h.logger.Warn("failed to inspect uploaded file against bad-file list",
-			"path", sw.rel,
-			"owner", sw.h.pubHash,
-			"err", err)
-	}
-	if !purgedBadFile {
-		go sw.reportUserStatus(sw.h.pubHash)
-	}
+	sw.enqueueBadUploadCheck()
+	go sw.reportUserStatus(sw.h.pubHash)
 
 	return nil
 }

@@ -24,6 +24,7 @@ type HashList struct {
 	logger      *slog.Logger
 	cancel      context.CancelFunc
 	filepath    string
+	hashFile    func(string) (string, error)
 	mu          sync.Mutex
 }
 
@@ -63,6 +64,7 @@ func NewHashList(ctx context.Context, filepath string, logger *slog.Logger) *Has
 		addlineChan: make(chan struct{}, 1),
 		cancel:      cancel,
 		filepath:    filepath,
+		hashFile:    defaultHashFileSHA256,
 	}
 
 	// Initial load
@@ -310,6 +312,13 @@ func (hl *HashList) EnsureContent(content string) (int, error) {
 
 // calculateSHA256 performs a streaming hash of a file to handle large files efficiently.
 func (hl *HashList) calculateSHA256(absPath string) (string, error) {
+	if hl != nil && hl.hashFile != nil {
+		return hl.hashFile(absPath)
+	}
+	return defaultHashFileSHA256(absPath)
+}
+
+func defaultHashFileSHA256(absPath string) (string, error) {
 	f, err := os.Open(absPath)
 	if err != nil {
 		return "", err

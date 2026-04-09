@@ -577,7 +577,7 @@ func TestPurgeBlacklistedFilesSkipsRecycleDirectory(t *testing.T) {
 	}
 }
 
-func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
+func TestFilewritePurgesBadUploadsAsynchronously(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()
 
@@ -597,6 +597,14 @@ func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
 	if _, err := srv.store.badFileList.Reload(); err != nil {
 		t.Fatalf("reload bad file hashes: %v", err)
 	}
+	originalHashFile := srv.store.badFileList.hashFile
+	srv.store.badFileList.hashFile = func(absPath string) (string, error) {
+		time.Sleep(250 * time.Millisecond)
+		return originalHashFile(absPath)
+	}
+	defer func() {
+		srv.store.badFileList.hashFile = originalHashFile
+	}()
 	if err := os.MkdirAll(filepath.Join(srv.absUploadDir, "live"), permDir); err != nil {
 		t.Fatalf("mkdir live dir: %v", err)
 	}
@@ -620,20 +628,21 @@ func TestFilewritePurgesBadUploadsImmediately(t *testing.T) {
 	if _, err := writer.WriteAt([]byte("malware payload"), 0); err != nil {
 		t.Fatalf("write upload payload: %v", err)
 	}
+	started := time.Now()
 	if err := writer.(io.Closer).Close(); err != nil {
 		t.Fatalf("close upload writer: %v", err)
 	}
+	if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+		t.Fatalf("expected upload close to return before async bad-file hash completed, took %s", elapsed)
+	}
 
 	badPath := filepath.Join(srv.absUploadDir, "live", "bad.bin")
-	if _, err := os.Stat(badPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected uploaded bad file to be purged, got err=%v", err)
-	}
-	if srv.store.FileExistsInDB("live/bad.bin") {
-		t.Fatal("expected uploaded bad file record to be removed")
-	}
-	if !srv.store.blacklist.Matches(ownerAddr.IP.String()) {
-		t.Fatal("expected uploaded bad file owner IP to be blacklisted")
-	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		_, err := os.Stat(badPath)
+		return errors.Is(err, os.ErrNotExist) &&
+			!srv.store.FileExistsInDB("live/bad.bin") &&
+			srv.store.blacklist.Matches(ownerAddr.IP.String())
+	}, "expected uploaded bad file to be purged asynchronously")
 
 	stats, err := srv.store.GetUserStats(ownerHash)
 	if err != nil {
