@@ -652,7 +652,11 @@ func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 			return savedCount, fmt.Errorf("%w: write %q: %v", errUploadBadRequest, finalRel, err)
 		}
 		createdFiles = append(createdFiles, writtenPath)
-		log.Printf("[%s] WRITE %s", ip, filepath.ToSlash(strings.TrimPrefix(writtenPath, destDir+string(filepath.Separator))))
+		writtenRel, err := filepath.Rel(rootDir, writtenPath)
+		if err != nil {
+			writtenRel = filepath.Base(writtenPath)
+		}
+		log.Printf("[%s] WRITE %s", ip, filepath.ToSlash(writtenRel))
 		savedCount++
 		part.Close()
 	}
