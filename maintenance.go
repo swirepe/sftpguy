@@ -501,7 +501,7 @@ func (s *Server) findBadFileMatches(logger *slog.Logger) []badFileMatch {
 			return nil
 		}
 
-		matchName, matched, err := s.store.badFileList.MatchFile(absPath)
+		matchName, matched, err := s.store.MatchBadFile(absPath)
 		if err != nil {
 			logger.Warn("failed to hash file during bad file maintenance", "path", absPath, "err", err)
 			return nil

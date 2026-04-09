@@ -388,6 +388,10 @@ func TestGetUserStatsHandlesNullLastAddress(t *testing.T) {
 }
 
 func newMaintenanceTestServer(t *testing.T) *Server {
+	return newMaintenanceTestServerWithConfig(t, nil)
+}
+
+func newMaintenanceTestServerWithConfig(t *testing.T, mutate func(*Config)) *Server {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -404,6 +408,9 @@ func newMaintenanceTestServer(t *testing.T) *Server {
 		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
 		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
 		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 
 	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {

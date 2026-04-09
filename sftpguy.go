@@ -397,6 +397,7 @@ type Store struct {
 	blacklist     *IPList
 	whitelist     *IPList
 	badFileList   *HashList
+	caidMatcher   *CAIDMatcher
 	adminKeys     *AdminKeyList
 	blacklistPath string
 	whitelistPath string
@@ -470,11 +471,21 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		}
 	}
 
+	var caidMatcher *CAIDMatcher
+	if caidDBPath := strings.TrimSpace(cfg.CAIDDBPath); caidDBPath != "" {
+		caidMatcher, err = NewCAIDMatcher(caidDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init CAID matcher: %w", err)
+		}
+		logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes)
+	}
+
 	store := &Store{db: db,
 		logger:        logger,
 		blacklist:     black,
 		whitelist:     white,
 		badFileList:   badFiles,
+		caidMatcher:   caidMatcher,
 		adminKeys:     adminKeys,
 		blacklistPath: blackPath,
 		whitelistPath: whitePath,
@@ -569,7 +580,7 @@ func (s *Store) Close() error {
 		s.badFileList.Stop()
 	}
 
-	return s.db.Close()
+	return errors.Join(closeDB(s.db), s.caidMatcher.Close())
 }
 
 func (s *Store) GetUserStats(hash string) (userStats, error) {
@@ -955,6 +966,7 @@ type Config struct {
 	WhitelistPath           string
 	AdminKeysPath           string
 	BadFilesPath            string
+	CAIDDBPath              string
 	EnablePrometheus        bool
 	PrometheusRoot          string
 }
@@ -995,6 +1007,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
 	EnvFlag(&cfg.BadFilesPath, "bad", "BAD_FILE", "bad_files.txt", "Text file of sha256 hashes and filenames that will trigger an automatic ban and purge.")
+	EnvFlag(&cfg.CAIDDBPath, "caid.db", "CAID_DB", "", "Optional CAID SQLite database used for size-first MD5/SHA1 bad-file matching.")
 
 	EnvFlag(&cfg.EnablePrometheus, "prometheus.enable", "ENABLE_PROMETHEUS", true, "Enable metric endpoint using promethus", "prom")
 	EnvFlag(&cfg.PrometheusRoot, "prometheus.root", "PROMETHEUS_ROOT", "/metrics", "Root path for the metrics endpoint", "prom.root")
@@ -1433,7 +1446,7 @@ func (s *Server) processBadUploadCheck(logger *slog.Logger, check badUploadCheck
 	}
 
 	fullPath := filepath.Join(s.absUploadDir, filepath.FromSlash(check.relPath))
-	matchName, matched, err := s.store.badFileList.MatchFile(fullPath)
+	matchName, matched, err := s.store.MatchBadFile(fullPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return
@@ -3317,6 +3330,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"admin.http.token.file", cfg.AdminHTTPTokenFile != "",
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
+		"caid_db", cfg.CAIDDBPath,
 		"upload_path", cfg.UploadDir,
 		"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
 		"max_dirs", cfg.MaxDirs,
