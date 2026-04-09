@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -29,15 +30,11 @@ func NewCAIDMatcher(dbPath string) (*CAIDMatcher, error) {
 		return nil, fmt.Errorf("stat CAID database: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", caidReadOnlyDSN(dbPath))
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d;", sqliteBusyTimeoutMS)); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 
 	hasSize, err := db.Prepare(`SELECT 1 FROM caid_hashes WHERE size = ? LIMIT 1`)
 	if err != nil {
@@ -70,6 +67,17 @@ func NewCAIDMatcher(dbPath string) (*CAIDMatcher, error) {
 		hasSize: hasSize,
 		exact:   exact,
 	}, nil
+}
+
+func caidReadOnlyDSN(dbPath string) string {
+	values := url.Values{}
+	values.Set("mode", "ro")
+	values.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMS))
+	return (&url.URL{
+		Scheme:   "file",
+		Path:     dbPath,
+		RawQuery: values.Encode(),
+	}).String()
 }
 
 func (m *CAIDMatcher) MatchFile(absPath string) (string, bool, error) {

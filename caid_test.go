@@ -160,6 +160,19 @@ func TestPurgeBlacklistedFilesPurgesCAIDMatches(t *testing.T) {
 	}
 }
 
+func TestNewCAIDMatcherOpensReadOnlyDatabase(t *testing.T) {
+	caidPath := createCAIDTestDB(t)
+	if err := os.Chmod(caidPath, 0400); err != nil {
+		t.Fatalf("chmod CAID db readonly: %v", err)
+	}
+
+	matcher, err := NewCAIDMatcher(caidPath)
+	if err != nil {
+		t.Fatalf("NewCAIDMatcher(readonly) error = %v, want nil", err)
+	}
+	defer matcher.Close()
+}
+
 func TestNewServerContinuesWhenCAIDDatabaseMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	var logBuf bytes.Buffer
