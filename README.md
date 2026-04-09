@@ -51,7 +51,7 @@ Contributors get a little [fortune](fortunes.txt), because they're special:
 
 
 
-The file explorer in the [admin console](admin_http_handlers_explorer.go) (admin tools added to the [deluxe explorer](cmd/explorer-deluxe)) : 
+The file explorer in the [admin console](internal/adminexplorer/explorer.go) (admin tools added to the [deluxe explorer](cmd/explorer-deluxe)) : 
 
 <img width="1062" height="906" alt="screenshot-explorer" src="https://github.com/user-attachments/assets/2765bd9f-c97a-493f-a0c1-6836d1033f6e" />
 
