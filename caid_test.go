@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -155,6 +157,45 @@ func TestPurgeBlacklistedFilesPurgesCAIDMatches(t *testing.T) {
 	}
 	if result.Error != "" {
 		t.Fatalf("unexpected purge error: %s", result.Error)
+	}
+}
+
+func TestNewServerContinuesWhenCAIDDatabaseMissing(t *testing.T) {
+	tmpDir := t.TempDir()
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	cfg := Config{
+		Name:          "sftpguy-caid-missing-test",
+		Port:          2222,
+		HostKeyFile:   filepath.Join(tmpDir, "host_key"),
+		DBPath:        filepath.Join(tmpDir, "sftp.db"),
+		LogFile:       filepath.Join(tmpDir, "sftp.log"),
+		UploadDir:     filepath.Join(tmpDir, "uploads"),
+		BlacklistPath: filepath.Join(tmpDir, "blacklist.txt"),
+		WhitelistPath: filepath.Join(tmpDir, "whitelist.txt"),
+		AdminKeysPath: filepath.Join(tmpDir, "admin_keys.txt"),
+		BadFilesPath:  filepath.Join(tmpDir, "bad_files.txt"),
+		CAIDDBPath:    filepath.Join(tmpDir, "missing-caid.db"),
+	}
+
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath, cfg.LogFile} {
+		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
+			t.Fatalf("write support file %s: %v", p, err)
+		}
+	}
+
+	srv, err := NewServer(cfg, logger)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v, want nil", err)
+	}
+	defer srv.Shutdown()
+
+	if srv.store.caidMatcher != nil {
+		t.Fatal("expected missing CAID database to leave matcher disabled")
+	}
+	if !strings.Contains(logBuf.String(), "failed to init CAID matcher; continuing without CAID database") {
+		t.Fatalf("expected warning log for missing CAID database, got %q", logBuf.String())
 	}
 }
 

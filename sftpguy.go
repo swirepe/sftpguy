@@ -475,9 +475,12 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	if caidDBPath := strings.TrimSpace(cfg.CAIDDBPath); caidDBPath != "" {
 		caidMatcher, err = NewCAIDMatcher(caidDBPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to init CAID matcher: %w", err)
+			logger.Warn("failed to init CAID matcher; continuing without CAID database",
+				"path", caidDBPath,
+				"err", err)
+		} else {
+			logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes)
 		}
-		logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes)
 	}
 
 	store := &Store{db: db,
