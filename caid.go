@@ -80,6 +80,13 @@ func caidReadOnlyDSN(dbPath string) string {
 	}).String()
 }
 
+func (m *CAIDMatcher) Count() (count int) {
+	_ = m.db.
+		QueryRow("SELECT COUNT(*) FROM caid_hashes WHERE size > ?", caidMinimumSizeBytes).
+		Scan(&count)
+	return
+}
+
 func (m *CAIDMatcher) MatchFile(absPath string) (string, bool, error) {
 	if m == nil {
 		return "", false, nil
