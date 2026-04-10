@@ -366,6 +366,54 @@ func TestReconcileOrphansSkipsRecycleDirectory(t *testing.T) {
 	}
 }
 
+func TestReconcileOrphansPurgesHashListedFiles(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const keepRel = "keep.txt"
+	const badRel = "bad-orphan.bin"
+
+	keepPath := filepath.Join(srv.absUploadDir, keepRel)
+	if err := os.WriteFile(keepPath, []byte("harmless"), permFile); err != nil {
+		t.Fatalf("write keep file: %v", err)
+	}
+
+	badPath := filepath.Join(srv.absUploadDir, badRel)
+	if err := os.WriteFile(badPath, []byte("malware payload"), permFile); err != nil {
+		t.Fatalf("write bad orphan: %v", err)
+	}
+	if _, err := srv.store.badFileList.AddFile(badPath); err != nil {
+		t.Fatalf("add bad file hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload bad file hashes: %v", err)
+	}
+
+	result := srv.reconcileOrphans()
+
+	if result.Candidates != 2 {
+		t.Fatalf("unexpected candidate count: got=%d want=%d", result.Candidates, 2)
+	}
+	if len(result.Unorphaned) != 1 || result.Unorphaned[0].Path != keepRel {
+		t.Fatalf("unexpected unorphaned result: %+v", result.Unorphaned)
+	}
+	if len(result.BadFiles) != 1 || result.BadFiles[0].Path != badRel {
+		t.Fatalf("unexpected bad_files result: %+v", result.BadFiles)
+	}
+	if _, err := os.Stat(badPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected bad orphan to be removed from disk, got err=%v", err)
+	}
+	if srv.store.FileExistsInDB(badRel) {
+		t.Fatal("expected bad orphan to be removed from the database")
+	}
+	if !srv.store.FileExistsInDB(keepRel) {
+		t.Fatal("expected non-bad orphan to remain registered")
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected reconcileOrphans error: %s", result.Error)
+	}
+}
+
 func TestGetUserStatsHandlesNullLastAddress(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
 	defer srv.Shutdown()

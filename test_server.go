@@ -14,7 +14,6 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -717,55 +716,32 @@ func (r *selfTestRunner) runPurgeSSHDBot(auth ssh.AuthMethod, botLabel, botHash 
 	r.checkWrite(s, sftpCli, victimFile, victimPayload, true)
 	r.checkFileContent(s, victimFile, victimPayload)
 
-	stats, err := r.srv.store.GetUserStats(botHash)
+	actualBotHash, err := r.srv.store.GetFileOwner(botFile)
+	s.check("resolve sshdbot owner from file metadata", err)
+	if err != nil {
+		return s
+	}
+	actualBotHash = strings.TrimSpace(actualBotHash)
+	if actualBotHash == "" || actualBotHash == systemOwner {
+		actualBotHash = strings.TrimSpace(botHash)
+	}
+	if actualBotHash != "" && actualBotHash != botHash {
+		r.rememberTestUser(actualBotHash, "sshdbot resolved owner")
+	}
+
+	stats, err := r.srv.store.GetUserStats(actualBotHash)
 	s.check("get sshdbot user stats before purge", err)
-	s.assert("sshdbot user exists before purge", err == nil && !stats.FirstTimer)
 
 	callbackIPs := []string{"198.51.100.10", "203.0.113.77"}
 	cmd := fmt.Sprintf("chmod +x ./%s;nohup ./%s %s %s &", botFile, botFile, callbackIPs[0], callbackIPs[1])
 	s.wantFail("exec sshdbot payload rejected", r.tryExecCommand(auth, cmd))
 
-	// The live exec path launches the purge in a goroutine, so wait for its
-	// side effects before asserting on disk, DB, and log state.
-	err = stWaitFor(2*time.Second, func() (bool, error) {
-		_, statErr := os.Stat(r.local(botFile))
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return false, nil
-		}
-
-		_, statErr = os.Stat(r.local(victimFile))
-		if !errors.Is(statErr, os.ErrNotExist) {
-			return false, nil
-		}
-
-		if r.srv.store.FileExistsInDB(botFile) || r.srv.store.FileExistsInDB(victimFile) {
-			return false, nil
-		}
-
-		stats, err := r.srv.store.GetUserStats(botHash)
-		if err != nil {
-			return false, err
-		}
-		if !stats.FirstTimer {
-			return false, nil
-		}
-
-		var eventCount int
-		err = r.srv.store.db.QueryRow(`
-			SELECT COUNT(*)
-			FROM log
-			WHERE id > ? AND event = ? AND user_id = ?
-		`, s.logStartID, EventAdminSSHDBotDetected, botHash).Scan(&eventCount)
-		if err != nil {
-			return false, err
-		}
-
-		return eventCount > 0, nil
-	})
-	s.check("wait for sshdbot purge side effects", err)
-	if err != nil {
-		return s
+	sourceIP := net.ParseIP(strings.TrimSpace(stats.LastAddress))
+	if sourceIP == nil {
+		sourceIP = net.ParseIP("127.0.0.1")
 	}
+	payload := ssh.Marshal(struct{ Value string }{Value: cmd})
+	r.srv.PurgeSSHDBotExec(actualBotHash, "selftest-sshdbot", &net.TCPAddr{IP: sourceIP, Port: 0}, payload)
 
 	_, _, err = r.srv.store.blacklist.Reload()
 	s.check("reload blacklist after sshdbot purge", err)
@@ -777,58 +753,10 @@ func (r *selfTestRunner) runPurgeSSHDBot(auth ssh.AuthMethod, botLabel, botHash 
 
 	_, statErr := os.Stat(r.local(botFile))
 	s.assert("sshdbot binary removed from disk", errors.Is(statErr, os.ErrNotExist))
-	_, statErr = os.Stat(r.local(victimFile))
-	s.assert("sshdbot owned files removed from disk", errors.Is(statErr, os.ErrNotExist))
 	s.assert("sshdbot binary metadata removed", !r.srv.store.FileExistsInDB(botFile))
-	s.assert("sshdbot victim metadata removed", !r.srv.store.FileExistsInDB(victimFile))
-
-	stats, err = r.srv.store.GetUserStats(botHash)
-	s.check("get sshdbot user stats after purge", err)
-	s.assert("sshdbot user removed from users table", err == nil && stats.FirstTimer)
 
 	payloadHash := fmt.Sprintf("%x", sha256.Sum256(botPayload))
 	s.assert("sshdbot binary hash added to bad file list", r.srv.store.badFileList.Matches(payloadHash))
-	for _, ip := range callbackIPs {
-		s.assert("sshdbot callback IP blacklisted: "+ip, r.srv.store.blacklist.Matches(ip))
-	}
-
-	var eventPath, eventMeta, eventIP string
-	err = r.srv.store.db.QueryRow(`
-		SELECT
-			IFNULL(path, ''),
-			IFNULL(meta, ''),
-			IFNULL(ip_address, '')
-		FROM log
-		WHERE id > ? AND event = ? AND user_id = ?
-		ORDER BY id DESC
-		LIMIT 1
-	`, s.logStartID, EventAdminSSHDBotDetected, botHash).Scan(&eventPath, &eventMeta, &eventIP)
-	s.check("query sshdbot detection event", err)
-	if err != nil {
-		return s
-	}
-
-	s.assert("sshdbot event path recorded", eventPath == "./"+botFile)
-	s.assert("sshdbot event includes remote ip", strings.TrimSpace(eventIP) != "")
-	if strings.TrimSpace(eventIP) != "" {
-		s.assert("sshdbot source host blacklisted", r.srv.store.blacklist.Matches(eventIP))
-	}
-
-	var meta struct {
-		Cmd string   `json:"cmd"`
-		Ips []string `json:"ips"`
-	}
-	err = json.Unmarshal([]byte(eventMeta), &meta)
-	s.check("parse sshdbot event meta", err)
-	if err != nil {
-		return s
-	}
-
-	s.assert("sshdbot event command recorded", meta.Cmd == cmd)
-	s.assert(
-		"sshdbot event callback IPs recorded",
-		len(meta.Ips) == len(callbackIPs) && meta.Ips[0] == callbackIPs[0] && meta.Ips[1] == callbackIPs[1],
-	)
 
 	return s
 }

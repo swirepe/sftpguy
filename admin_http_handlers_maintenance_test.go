@@ -141,6 +141,18 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	defer srv.Shutdown()
 
 	srv.store.RegisterFile("gone.txt", systemOwner, 0, false)
+	const orphanBadRel = "orphan-bad.bin"
+	orphanBadPath := filepath.Join(srv.absUploadDir, orphanBadRel)
+	if err := os.WriteFile(orphanBadPath, []byte("maintenance bad orphan"), permFile); err != nil {
+		t.Fatalf("write orphan bad file: %v", err)
+	}
+	if _, err := srv.store.badFileList.AddFile(orphanBadPath); err != nil {
+		t.Fatalf("add orphan bad hash: %v", err)
+	}
+	if _, err := srv.store.badFileList.Reload(); err != nil {
+		t.Fatalf("reload orphan bad hash: %v", err)
+	}
+
 	const ownerHash = "maintenance-http-sshdbot-owner"
 	ownerAddr := &net.TCPAddr{IP: net.ParseIP("198.51.100.77"), Port: 2222}
 	if _, err := srv.store.UpsertUserSession(ownerHash, ownerAddr); err != nil {
@@ -185,6 +197,12 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	if runResp.Status.LastRun.Result.CleanDeleted.Deleted != 1 {
 		t.Fatalf("unexpected deleted count in maintenance result: %+v", runResp.Status.LastRun.Result.CleanDeleted)
 	}
+	if len(runResp.Status.LastRun.Result.ReconcileOrphans.BadFiles) != 1 {
+		t.Fatalf("unexpected reconcile bad_files result: %+v", runResp.Status.LastRun.Result.ReconcileOrphans)
+	}
+	if got := runResp.Status.LastRun.Result.ReconcileOrphans.BadFiles[0].Path; got != orphanBadRel {
+		t.Fatalf("unexpected reconcile bad file path in run response: got=%q want=%q", got, orphanBadRel)
+	}
 	if len(runResp.Status.LastRun.Result.PurgeSSHDBot.Matches) != 1 || runResp.Status.LastRun.Result.PurgeSSHDBot.Purges != 1 {
 		t.Fatalf("unexpected purge sshdbot result in maintenance status: %+v", runResp.Status.LastRun.Result.PurgeSSHDBot)
 	}
@@ -209,11 +227,39 @@ func TestHandleAdminMaintenanceRunAndStatus(t *testing.T) {
 	if statusResp.LastRun == nil || statusResp.LastRun.Trigger != "admin-http" {
 		t.Fatalf("unexpected maintenance status last_run: %+v", statusResp.LastRun)
 	}
+	if len(statusResp.LastRun.Result.ReconcileOrphans.BadFiles) != 1 {
+		t.Fatalf("unexpected reconcile bad_files status result: %+v", statusResp.LastRun.Result.ReconcileOrphans)
+	}
+	if got := statusResp.LastRun.Result.ReconcileOrphans.BadFiles[0].Path; got != orphanBadRel {
+		t.Fatalf("unexpected reconcile bad file path in status response: got=%q want=%q", got, orphanBadRel)
+	}
 	if len(statusResp.LastRun.Result.PurgeSSHDBot.Matches) != 1 || statusResp.LastRun.Result.PurgeSSHDBot.Purges != 1 {
 		t.Fatalf("unexpected purge sshdbot status result: %+v", statusResp.LastRun.Result.PurgeSSHDBot)
 	}
 	if got := statusResp.LastRun.Result.PurgeSSHDBot.Matches[0].IP; got != ownerAddr.IP.String() {
 		t.Fatalf("unexpected sshdbot match ip in status response: got=%q want=%q", got, ownerAddr.IP.String())
+	}
+	if _, err := os.Stat(orphanBadPath); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan bad file to be removed from disk, got err=%v", err)
+	}
+
+	var metaJSON string
+	if err := srv.store.db.QueryRow(`
+		SELECT meta
+		FROM log
+		WHERE event = ?
+		ORDER BY id DESC
+		LIMIT 1
+	`, EventAdminMaintenance).Scan(&metaJSON); err != nil {
+		t.Fatalf("query admin maintenance event: %v", err)
+	}
+
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
+		t.Fatalf("decode admin maintenance event meta: %v", err)
+	}
+	if got := int(meta["orphans_bad_files"].(float64)); got != 1 {
+		t.Fatalf("unexpected admin maintenance orphans_bad_files meta: got=%d want=%d meta=%s", got, 1, metaJSON)
 	}
 }
 

@@ -1213,6 +1213,7 @@
         document.getElementById("maintenance-last-run").innerHTML = "<div class=\"muted\">No maintenance pass has completed yet.</div>";
       } else {
         const unorphaned = (last.result && last.result.reconcile_orphans && last.result.reconcile_orphans.unorphaned) || [];
+        const badOrphans = (last.result && last.result.reconcile_orphans && last.result.reconcile_orphans.bad_files) || [];
         const sshdbotMatches = (last.result && last.result.purge_sshdbot && last.result.purge_sshdbot.matches) || [];
         const rows = [
           [
@@ -1224,7 +1225,7 @@
           [
             "<code>reconcile_orphans</code>",
             esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.candidates || 0 : 0),
-            esc(unorphaned.length),
+            "<span class=\"pill\">kept " + esc(unorphaned.length) + "</span> <span class=\"pill\">bad " + esc(badOrphans.length) + "</span>",
             "<code>" + esc(last.result && last.result.reconcile_orphans ? last.result.reconcile_orphans.error || "" : "") + "</code>"
           ],
           [
@@ -1253,6 +1254,19 @@
               })
             )
           : "";
+        const badOrphansTable = badOrphans.length
+          ? "<h3>Purged Bad Orphans</h3>" + renderSimpleTable(
+              ["Path", "Owner", "Size", "Type"],
+              badOrphans.map(function(file) {
+                return [
+                  "<code>" + esc(file.path || "") + "</code>",
+                  ownerCell(file.owner_hash || "-"),
+                  esc(formatBytes(file.size || 0)),
+                  file.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag warn\">FILE</span>"
+                ];
+              })
+            )
+          : "";
         const sshdbotTable = sshdbotMatches.length
           ? "<h3>SSHDBot Matches</h3>" + renderSimpleTable(
               ["Path", "Size", "Modified", "IP", "SHA-256"],
@@ -1276,6 +1290,7 @@
             "<span class=\"tag " + (last.halted ? "ok" : "warn") + "\">" + (last.halted ? "COMPLETE" : "INTERRUPTED") + "</span>" +
           "</div>" +
           renderSimpleTable(["Operation", "Observed", "Changes", "Error"], rows) +
+          badOrphansTable +
           sshdbotTable +
           unorphanedTable;
       }

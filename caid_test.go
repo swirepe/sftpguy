@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -37,8 +38,60 @@ func TestStoreMatchBadFileMatchesCAIDDatabase(t *testing.T) {
 	if !matched {
 		t.Fatal("expected CAID-backed file to match")
 	}
-	if matchName != "caid:exe (category 7)" {
-		t.Fatalf("unexpected CAID match name: got=%q want=%q", matchName, "caid:exe (category 7)")
+	if want := formatCAIDMatchLabel("exe", 7, sha1Hex); matchName != want {
+		t.Fatalf("unexpected CAID match name: got=%q want=%q", matchName, want)
+	}
+}
+
+func TestReconcileOrphansPurgesCAIDMatches(t *testing.T) {
+	caidPath := createCAIDTestDB(t)
+	srv := newMaintenanceTestServerWithConfig(t, func(cfg *Config) {
+		cfg.CAIDDBPath = caidPath
+	})
+	defer srv.Shutdown()
+
+	const keepRel = "keep.txt"
+	const badRel = "caid-orphan.bin"
+
+	keepPath := filepath.Join(srv.absUploadDir, keepRel)
+	if err := os.WriteFile(keepPath, []byte("harmless"), permFile); err != nil {
+		t.Fatalf("write keep file: %v", err)
+	}
+
+	badPath := filepath.Join(srv.absUploadDir, badRel)
+	badContent := []byte(strings.Repeat("caid orphan payload", 128))
+	if err := os.WriteFile(badPath, badContent, permFile); err != nil {
+		t.Fatalf("write bad orphan: %v", err)
+	}
+
+	md5Hex, sha1Hex, err := hashFileMD5SHA1(badPath)
+	if err != nil {
+		t.Fatalf("hash bad orphan: %v", err)
+	}
+	insertCAIDRow(t, caidPath, "exe", md5Hex, sha1Hex, int64(len(badContent)), 9)
+
+	result := srv.reconcileOrphans()
+
+	if result.Candidates != 2 {
+		t.Fatalf("unexpected candidate count: got=%d want=%d", result.Candidates, 2)
+	}
+	if len(result.Unorphaned) != 1 || result.Unorphaned[0].Path != keepRel {
+		t.Fatalf("unexpected unorphaned result: %+v", result.Unorphaned)
+	}
+	if len(result.BadFiles) != 1 || result.BadFiles[0].Path != badRel {
+		t.Fatalf("unexpected bad_files result: %+v", result.BadFiles)
+	}
+	if _, err := os.Stat(badPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected CAID orphan to be removed from disk, got err=%v", err)
+	}
+	if srv.store.FileExistsInDB(badRel) {
+		t.Fatal("expected CAID orphan to be removed from the database")
+	}
+	if !srv.store.FileExistsInDB(keepRel) {
+		t.Fatal("expected non-bad orphan to remain registered")
+	}
+	if result.Error != "" {
+		t.Fatalf("unexpected reconcileOrphans error: %s", result.Error)
 	}
 }
 

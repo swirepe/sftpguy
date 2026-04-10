@@ -49,6 +49,7 @@ func (s *Server) handleAdminMaintenanceRun(w http.ResponseWriter, r *http.Reques
 		"halted", halted,
 		"clean_deleted", res.CleanDeleted.Deleted,
 		"orphans_inserted", len(res.ReconcileOrphans.Unorphaned),
+		"orphans_bad_files", len(res.ReconcileOrphans.BadFiles),
 		"sshdbot_matches", len(res.PurgeSSHDBot.Matches),
 		"sshdbot_purges", res.PurgeSSHDBot.Purges,
 		"sshdbot_owners_banned", res.PurgeSSHDBot.OwnersBanned,
