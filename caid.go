@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"strings"
 )
@@ -30,11 +29,11 @@ func NewCAIDMatcher(dbPath string) (*CAIDMatcher, error) {
 		return nil, fmt.Errorf("stat CAID database: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", caidReadOnlyDSN(dbPath))
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(10)
 
 	hasSize, err := db.Prepare(`SELECT 1 FROM caid_hashes WHERE size = ? LIMIT 1`)
 	if err != nil {
@@ -67,17 +66,6 @@ func NewCAIDMatcher(dbPath string) (*CAIDMatcher, error) {
 		hasSize: hasSize,
 		exact:   exact,
 	}, nil
-}
-
-func caidReadOnlyDSN(dbPath string) string {
-	values := url.Values{}
-	values.Set("mode", "ro")
-	values.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMS))
-	return (&url.URL{
-		Scheme:   "file",
-		Path:     dbPath,
-		RawQuery: values.Encode(),
-	}).String()
 }
 
 func (m *CAIDMatcher) Count() (count int) {
@@ -123,7 +111,7 @@ func (m *CAIDMatcher) MatchFile(absPath string) (string, bool, error) {
 	case err != nil:
 		return "", false, err
 	default:
-		return formatCAIDMatchLabel(fileType, category), true, nil
+		return formatCAIDMatchLabel(fileType, category, sha1Hex), true, nil
 	}
 }
 
@@ -152,17 +140,17 @@ func closeDB(db *sql.DB) error {
 	return db.Close()
 }
 
-func formatCAIDMatchLabel(fileType string, category int) string {
+func formatCAIDMatchLabel(fileType string, category int, sha1Hex string) string {
 	fileType = strings.TrimSpace(fileType)
 	switch {
 	case fileType != "" && category != 0:
-		return fmt.Sprintf("caid:%s (category %d)", fileType, category)
+		return fmt.Sprintf("caid:%s (category %d):sha1-%s", fileType, category, sha1Hex)
 	case fileType != "":
-		return "caid:" + fileType
+		return fmt.Sprintf("caid:%s:sha1-%s", fileType, sha1Hex)
 	case category != 0:
-		return fmt.Sprintf("caid:category %d", category)
+		return fmt.Sprintf("caid:category %d:sha1-%s", category, sha1Hex)
 	default:
-		return "caid"
+		return fmt.Sprintf("caid:%s", sha1Hex)
 	}
 }
 

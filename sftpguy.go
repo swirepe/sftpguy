@@ -479,7 +479,7 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 				"path", caidDBPath,
 				"err", err)
 		} else {
-			logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes, "count", caidMatcher.Count())
+			logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes, "entries", caidMatcher.Count())
 		}
 	}
 

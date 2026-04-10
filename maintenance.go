@@ -337,6 +337,7 @@ type ReconcileOrphansResult struct {
 	SystemFiles       int64        `json:"system_files"`
 	Candidates        int64        `json:"candidates"`
 	Unorphaned        []FileRecord `json:"unorphaned"`
+	BadFiles          []FileRecord `json:"bad_files"`
 	Error             string       `json:"error,omitempty"`
 }
 
@@ -401,10 +402,30 @@ func (s *Server) reconcileOrphans() ReconcileOrphansResult {
 		if err != nil {
 			logger.Error("failed to batch reconcile files", "duration", time.Since(start), "error", err)
 			result.Error = err.Error()
-		} else if len(newFiles) > 0 {
-			result.Unorphaned = newFiles
-			logger.Info("reconciled orphan files", "new_count", len(newFiles), "duration", time.Since(start))
 		}
+
+		for _, f := range newFiles {
+			full := filepath.Join(s.absUploadDir, filepath.FromSlash(f.Path))
+			label, bad, _ := s.store.MatchBadFile(full)
+			if bad {
+				result.BadFiles = append(result.BadFiles, f)
+				if err := s.PurgeByFile(f.Path); err != nil {
+					logger.Error("failed to remove bad file", "path", f.Path, "label", label, "error", err)
+				} else {
+					logger.Info("unreconciled bad file", "path", f.Path, "label", label)
+				}
+			} else {
+				result.Unorphaned = append(result.Unorphaned, f)
+			}
+		}
+		if len(newFiles) > 0 {
+			logger.Info("reconciled orphan files",
+				"new_count", len(newFiles),
+				"unorphaned", len(result.Unorphaned),
+				"bad_files", result.BadFiles,
+				"duration", time.Since(start))
+		}
+
 	}
 	return result
 }
@@ -771,6 +792,7 @@ func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string, 
 		"clean_deleted.stale_roots", res.CleanDeleted.StaleRoots,
 		"reconcile_orphans.inserted", len(res.ReconcileOrphans.Unorphaned),
 		"reconcile_orphans.candidates", res.ReconcileOrphans.Candidates,
+		"reconcile_orphans.bad_files", len(res.ReconcileOrphans.BadFiles),
 		"purge_sshdbot.matches", len(res.PurgeSSHDBot.Matches),
 		"purge_sshdbot.purges", res.PurgeSSHDBot.Purges,
 		"purge_sshdbot.owners_banned", res.PurgeSSHDBot.OwnersBanned,
