@@ -65,13 +65,14 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
+	"sftpguy/caid"
 )
 
 //go:generate go run . -update-version
 //go:embed VERSION
 //go:embed go.mod go.sum
 //go:embed README.md fortunes.txt bad_files.txt
-//go:embed admin_ui internal cmd
+//go:embed admin_ui internal cmd caid
 //go:embed *.go
 var embeddedSource embed.FS
 
@@ -397,7 +398,7 @@ type Store struct {
 	blacklist     *IPList
 	whitelist     *IPList
 	badFileList   *HashList
-	caidMatcher   *CAIDMatcher
+	caidMatcher   *caid.Matcher
 	adminKeys     *AdminKeyList
 	blacklistPath string
 	whitelistPath string
@@ -471,15 +472,15 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		}
 	}
 
-	var caidMatcher *CAIDMatcher
+	var caidMatcher *caid.Matcher
 	if caidDBPath := strings.TrimSpace(cfg.CAIDDBPath); caidDBPath != "" {
-		caidMatcher, err = NewCAIDMatcher(caidDBPath)
+		caidMatcher, err = caid.NewMatcher(caidDBPath)
 		if err != nil {
 			logger.Warn("failed to init CAID matcher; continuing without CAID database",
 				"path", caidDBPath,
 				"err", err)
 		} else {
-			logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caidMinimumSizeBytes, "entries", caidMatcher.Count())
+			logger.Info("loaded CAID matcher", "path", caidDBPath, "minimum_size", caid.MinimumSizeBytes, "entries", caidMatcher.Count())
 		}
 	}
 

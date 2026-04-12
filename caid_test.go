@@ -2,14 +2,21 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"sftpguy/caid"
 )
 
 func TestStoreMatchBadFileMatchesCAIDDatabase(t *testing.T) {
@@ -25,7 +32,7 @@ func TestStoreMatchBadFileMatchesCAIDDatabase(t *testing.T) {
 		t.Fatalf("write CAID candidate: %v", err)
 	}
 
-	md5Hex, sha1Hex, err := hashFileMD5SHA1(fullPath)
+	md5Hex, sha1Hex, err := testHashFileMD5SHA1(fullPath)
 	if err != nil {
 		t.Fatalf("hash CAID candidate: %v", err)
 	}
@@ -38,7 +45,7 @@ func TestStoreMatchBadFileMatchesCAIDDatabase(t *testing.T) {
 	if !matched {
 		t.Fatal("expected CAID-backed file to match")
 	}
-	if want := formatCAIDMatchLabel("exe", 7, sha1Hex); matchName != want {
+	if want := fmt.Sprintf("caid:exe (category %d):sha1-%s", 7, sha1Hex); matchName != want {
 		t.Fatalf("unexpected CAID match name: got=%q want=%q", matchName, want)
 	}
 }
@@ -64,7 +71,7 @@ func TestReconcileOrphansPurgesCAIDMatches(t *testing.T) {
 		t.Fatalf("write bad orphan: %v", err)
 	}
 
-	md5Hex, sha1Hex, err := hashFileMD5SHA1(badPath)
+	md5Hex, sha1Hex, err := testHashFileMD5SHA1(badPath)
 	if err != nil {
 		t.Fatalf("hash bad orphan: %v", err)
 	}
@@ -108,7 +115,7 @@ func TestStoreMatchBadFileSkipsCAIDForSmallFilesButKeepsHashList(t *testing.T) {
 		t.Fatalf("write small candidate: %v", err)
 	}
 
-	md5Hex, sha1Hex, err := hashFileMD5SHA1(fullPath)
+	md5Hex, sha1Hex, err := testHashFileMD5SHA1(fullPath)
 	if err != nil {
 		t.Fatalf("hash small candidate: %v", err)
 	}
@@ -184,7 +191,7 @@ func TestPurgeBlacklistedFilesPurgesCAIDMatches(t *testing.T) {
 		t.Fatalf("register other file: %v", err)
 	}
 
-	md5Hex, sha1Hex, err := hashFileMD5SHA1(badPath)
+	md5Hex, sha1Hex, err := testHashFileMD5SHA1(badPath)
 	if err != nil {
 		t.Fatalf("hash bad file: %v", err)
 	}
@@ -213,15 +220,15 @@ func TestPurgeBlacklistedFilesPurgesCAIDMatches(t *testing.T) {
 	}
 }
 
-func TestNewCAIDMatcherOpensReadOnlyDatabase(t *testing.T) {
+func TestCAIDNewMatcherOpensReadOnlyDatabase(t *testing.T) {
 	caidPath := createCAIDTestDB(t)
 	if err := os.Chmod(caidPath, 0400); err != nil {
 		t.Fatalf("chmod CAID db readonly: %v", err)
 	}
 
-	matcher, err := NewCAIDMatcher(caidPath)
+	matcher, err := caid.NewMatcher(caidPath)
 	if err != nil {
-		t.Fatalf("NewCAIDMatcher(readonly) error = %v, want nil", err)
+		t.Fatalf("caid.NewMatcher(readonly) error = %v, want nil", err)
 	}
 	defer matcher.Close()
 }
@@ -308,4 +315,21 @@ func insertCAIDRow(t *testing.T, dbPath, fileType, md5Hex, sha1Hex string, size 
 	); err != nil {
 		t.Fatalf("insert CAID row: %v", err)
 	}
+}
+
+func testHashFileMD5SHA1(path string) (string, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+
+	hMD5 := md5.New()
+	hSHA1 := sha1.New()
+
+	if _, err := io.Copy(io.MultiWriter(hMD5, hSHA1), f); err != nil {
+		return "", "", err
+	}
+
+	return hex.EncodeToString(hMD5.Sum(nil)), hex.EncodeToString(hSHA1.Sum(nil)), nil
 }
