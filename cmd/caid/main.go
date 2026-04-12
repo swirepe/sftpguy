@@ -89,10 +89,11 @@ func run(args []string, logger *log.Logger, stderr io.Writer) error {
 		label := match.FormatLabel()
 		if verbose {
 			logger.Printf(
-				"match path=%q label=%q size=%d modtime=%q filetype=%q category=%d md5=%q sha1=%q",
+				"match path=%q label=%q size=%d allzero=%t modtime=%q filetype=%q category=%d md5=%q sha1=%q",
 				relPath,
 				label,
 				match.Size,
+				match.IsAllZero,
 				match.Info.ModTime().UTC().Format(time.RFC3339Nano),
 				match.FileType,
 				match.Category,

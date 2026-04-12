@@ -3,6 +3,7 @@ package caid
 import (
 	"crypto/md5"
 	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -78,12 +79,13 @@ func (m *Matcher) Count() (count int) {
 }
 
 type Match struct {
-	Info     os.FileInfo
-	Size     int64
-	Md5Hex   string
-	Sha1Hex  string
-	FileType string
-	Category int
+	Info      os.FileInfo
+	Size      int64
+	IsAllZero bool
+	Md5Hex    string
+	Sha1Hex   string
+	FileType  string
+	Category  int
 }
 
 func (m *Matcher) MatchFile(absPath string) (Match, bool, error) {
@@ -112,10 +114,13 @@ func (m *Matcher) MatchFile(absPath string) (Match, bool, error) {
 		return match, false, err
 	}
 
-	match.Md5Hex, match.Sha1Hex, err = hashFileMD5SHA1(absPath)
+	sums, err := sumFile(absPath)
 	if err != nil {
 		return match, false, err
 	}
+	match.Md5Hex = sums.Md5Hex
+	match.Sha1Hex = sums.Sha1Hex
+	match.IsAllZero = sums.IsAllZero
 
 	err = m.exact.QueryRow(info.Size(), match.Md5Hex, match.Sha1Hex).Scan(&match.FileType, &match.Category)
 	switch {
@@ -176,19 +181,58 @@ func (m Match) FormatLabel() string {
 	}
 }
 
-func hashFileMD5SHA1(absPath string) (string, string, error) {
+type Sums struct {
+	Md5Hex    string
+	Sha1Hex   string
+	Sha256Hex string
+	IsAllZero bool
+}
+
+func sumFile(absPath string) (Sums, error) {
 	f, err := os.Open(absPath)
 	if err != nil {
-		return "", "", err
+		return Sums{}, err
 	}
 	defer f.Close()
 
 	hMD5 := md5.New()
 	hSHA1 := sha1.New()
+	hSHA256 := sha256.New()
+	allZero := zeroDetector{isAllZero: true}
 
-	if _, err := io.Copy(io.MultiWriter(hMD5, hSHA1), f); err != nil {
-		return "", "", err
+	if _, err := io.Copy(io.MultiWriter(hMD5, hSHA1, hSHA256, &allZero), f); err != nil {
+		return Sums{}, err
 	}
 
-	return hex.EncodeToString(hMD5.Sum(nil)), hex.EncodeToString(hSHA1.Sum(nil)), nil
+	return Sums{
+		Md5Hex:    hex.EncodeToString(hMD5.Sum(nil)),
+		Sha1Hex:   hex.EncodeToString(hSHA1.Sum(nil)),
+		Sha256Hex: hex.EncodeToString(hSHA256.Sum(nil)),
+		IsAllZero: allZero.isAllZero,
+	}, nil
+}
+
+func hashFileMD5SHA1(absPath string) (string, string, error) {
+	sums, err := sumFile(absPath)
+	if err != nil {
+		return "", "", err
+	}
+	return sums.Md5Hex, sums.Sha1Hex, nil
+}
+
+type zeroDetector struct {
+	isAllZero bool
+}
+
+func (z *zeroDetector) Write(p []byte) (int, error) {
+	if !z.isAllZero {
+		return len(p), nil
+	}
+	for _, b := range p {
+		if b != 0 {
+			z.isAllZero = false
+			break
+		}
+	}
+	return len(p), nil
 }

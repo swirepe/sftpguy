@@ -87,6 +87,7 @@ func TestRunVerboseLogsMatchDetails(t *testing.T) {
 				`match path="nested/match.bin"`,
 				`label="caid:exe (category 9):sha1-` + sha1Hex + `"`,
 				`size=1920`,
+				`allzero=false`,
 				`modtime="2026-01-02T03:04:05Z"`,
 				`filetype="exe"`,
 				`category=9`,
@@ -98,6 +99,40 @@ func TestRunVerboseLogsMatchDetails(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunVerboseLogsZeroFileFlag(t *testing.T) {
+	dbPath := createCAIDTestDB(t)
+
+	root := t.TempDir()
+	matchedPath := writeMatchCandidateBytes(t, root, "nested/zeros.bin", bytes.Repeat([]byte{0}, 2048))
+
+	md5Hex, sha1Hex, err := hashFileMD5SHA1(matchedPath)
+	if err != nil {
+		t.Fatalf("hash matched path: %v", err)
+	}
+	insertCAIDRow(t, dbPath, "blob", md5Hex, sha1Hex, 2048, 7)
+
+	var logBuf bytes.Buffer
+	logger := newTestLogger(&logBuf)
+
+	if err := run([]string{"--verbose", dbPath, root}, logger, &logBuf); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	out := logBuf.String()
+	for _, want := range []string{
+		`match path="nested/zeros.bin"`,
+		`allzero=true`,
+		`filetype="blob"`,
+		`category=7`,
+		`md5="` + md5Hex + `"`,
+		`sha1="` + sha1Hex + `"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in verbose output, got %q", want, out)
+		}
 	}
 }
 
@@ -149,11 +184,17 @@ func insertCAIDRow(t *testing.T, dbPath, fileType, md5Hex, sha1Hex string, size 
 func writeMatchCandidate(t *testing.T, root, relPath, content string) string {
 	t.Helper()
 
+	return writeMatchCandidateBytes(t, root, relPath, []byte(content))
+}
+
+func writeMatchCandidateBytes(t *testing.T, root, relPath string, content []byte) string {
+	t.Helper()
+
 	fullPath := filepath.Join(root, filepath.FromSlash(relPath))
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		t.Fatalf("mkdir candidate parent: %v", err)
 	}
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(fullPath, content, 0644); err != nil {
 		t.Fatalf("write candidate: %v", err)
 	}
 	return fullPath
