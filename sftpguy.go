@@ -60,19 +60,20 @@ import (
 	"syscall"
 	"time"
 
+	"sftpguy/caid"
+
 	"github.com/charmbracelet/log"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
 	_ "modernc.org/sqlite"
-	"sftpguy/caid"
 )
 
 //go:generate go run . -update-version
 //go:embed VERSION
 //go:embed go.mod go.sum
 //go:embed README.md fortunes.txt bad_files.txt
-//go:embed admin_ui internal cmd caid
+//go:embed admin_ui internal cmd caid spec
 //go:embed *.go
 var embeddedSource embed.FS
 

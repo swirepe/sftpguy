@@ -133,19 +133,66 @@ func generateNonce() string {
 }
 
 func clientIP(r *http.Request) string {
-	// immediate connection IP (the proxy)
-	proxyIP, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		proxyIP = r.RemoteAddr
+	peer := remoteIP(r)
+	if peer == "" {
+		return r.RemoteAddr
+	}
+	if !isTrustedProxy(peer) {
+		return peer
 	}
 
+	forwarded := forwardedClientIP(r)
+	if forwarded == "" || forwarded == peer {
+		return peer
+	}
+	if isLoopbackIP(peer) {
+		return forwarded
+	}
+	return fmt.Sprintf("%s via %s", forwarded, peer)
+}
+
+func remoteIP(r *http.Request) string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
+
+func forwardedClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
-		clientIP := strings.TrimSpace(ips[0])
-		return fmt.Sprintf("%s -> %s", clientIP, proxyIP)
+		if len(ips) > 0 {
+			if ip := normalizeIP(strings.TrimSpace(ips[0])); ip != "" {
+				return ip
+			}
+		}
 	}
+	if ip := normalizeIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != "" {
+		return ip
+	}
+	return ""
+}
 
-	return proxyIP
+func isTrustedProxy(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast()
+}
+
+func isLoopbackIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
+}
+
+func normalizeIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ""
+	}
+	return parsed.String()
 }
 
 // ── routing ───────────────────────────────────────────────────────────────────
@@ -525,17 +572,21 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if !validateCSRF(r) {
-		log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
+	}
+	if !validateCSRFHeader(r) {
+		if ok, handled := validateMultipartCSRF(w, r, mr, ip); !ok {
+			if handled {
+				return
+			}
+			log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	savedCount, err := streamParts(mr, fullPath, ip)
@@ -710,13 +761,47 @@ func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	return token
 }
 
-func validateCSRF(r *http.Request) bool {
+func validateCSRFHeader(r *http.Request) bool {
 	c, err := r.Cookie(cookieCSRF)
 	if err != nil || c.Value == "" {
 		return false
 	}
 	token := strings.TrimSpace(r.Header.Get(headerCSRF))
 	return token != "" && token == c.Value
+}
+
+func validateCSRFValue(r *http.Request, token string) bool {
+	c, err := r.Cookie(cookieCSRF)
+	return err == nil && c.Value != "" && token != "" && token == c.Value
+}
+
+func validateMultipartCSRF(w http.ResponseWriter, r *http.Request, mr *multipart.Reader, ip string) (ok bool, handled bool) {
+	csrfPart, err := mr.NextPart()
+	if err == io.EOF {
+		log.Printf("[%s] UPLOAD REJECTED: missing csrf_token part", ip)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false, true
+	}
+	if err != nil {
+		log.Printf("[%s] UPLOAD REJECTED: invalid multipart before csrf: %v", ip, err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return false, true
+	}
+	if csrfPart.FormName() != "csrf_token" {
+		log.Printf("[%s] UPLOAD REJECTED: first part is %q, expected csrf_token", ip, csrfPart.FormName())
+		csrfPart.Close()
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false, true
+	}
+
+	tokenBytes, err := io.ReadAll(io.LimitReader(csrfPart, 128))
+	csrfPart.Close()
+	if err != nil {
+		log.Printf("[%s] UPLOAD REJECTED: could not read CSRF token: %v", ip, err)
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return false, true
+	}
+	return validateCSRFValue(r, string(tokenBytes)), false
 }
 
 func isUnlocked(r *http.Request) bool {
@@ -960,6 +1045,7 @@ async function performUpload(files, paths = []) {
 
   const formData = new FormData();
   const csrfToken = document.getElementById('csrf_token').value;
+  formData.append('csrf_token', csrfToken);
   for (let i = 0; i < files.length; i++) {
     const path = paths[i] || files[i].webkitRelativePath || files[i].name;
     formData.append('uploadFiles', files[i], path);
@@ -982,9 +1068,32 @@ async function performUpload(files, paths = []) {
     }
     showUploadError(getUploadErrorMessage(xhr));
   };
-  xhr.onerror = () => showUploadError('Upload failed');
+  xhr.onerror = () => {
+    if (files === fileInput.files || files === folderInput.files) {
+      retryWithStandardSubmit(files === folderInput.files ? 'folder' : 'files');
+      return;
+    }
+    showUploadError('Upload failed');
+  };
   xhr.onabort = () => showUploadError('Upload canceled');
   xhr.send(formData);
+}
+
+function retryWithStandardSubmit(source) {
+  const activeInput = source === 'folder' ? folderInput : fileInput;
+  const inactiveInput = source === 'folder' ? fileInput : folderInput;
+  if (!activeInput.files || activeInput.files.length === 0) {
+    showUploadError('Upload failed');
+    return;
+  }
+  setUploadControlsDisabled(false);
+  inactiveInput.value = '';
+  progressWrapper.style.display = 'block';
+  progressBar.classList.remove('upload-error');
+  progressText.classList.remove('upload-error');
+  progressBar.style.width = '100%';
+  progressText.innerText = 'Retrying...';
+  HTMLFormElement.prototype.submit.call(form);
 }
 
 form.addEventListener('submit', (e) => { e.preventDefault(); performUpload(fileInput.files); });

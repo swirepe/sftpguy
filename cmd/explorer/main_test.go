@@ -140,6 +140,71 @@ func TestHandleHeadPublicFileServesHeadersOnly(t *testing.T) {
 	}
 }
 
+func TestClientIPFormatting(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    http.Header
+		want       string
+	}{
+		{
+			name:       "direct client without proxy headers",
+			remoteAddr: "98.159.36.136:12345",
+			want:       "98.159.36.136",
+		},
+		{
+			name:       "loopback proxy omits peer",
+			remoteAddr: "127.0.0.1:9112",
+			headers: http.Header{
+				"X-Forwarded-For": []string{"98.159.36.136, 127.0.0.1"},
+				"X-Real-IP":       []string{"98.159.36.136"},
+			},
+			want: "98.159.36.136",
+		},
+		{
+			name:       "private proxy keeps informative hop",
+			remoteAddr: "10.0.0.5:443",
+			headers: http.Header{
+				"X-Forwarded-For": []string{"98.159.36.136, 10.0.0.5"},
+			},
+			want: "98.159.36.136 via 10.0.0.5",
+		},
+		{
+			name:       "untrusted peer ignores forwarded headers",
+			remoteAddr: "203.0.113.7:443",
+			headers: http.Header{
+				"X-Forwarded-For": []string{"98.159.36.136"},
+				"X-Real-IP":       []string{"98.159.36.136"},
+			},
+			want: "203.0.113.7",
+		},
+		{
+			name:       "real ip falls back when xff missing",
+			remoteAddr: "[::1]:443",
+			headers: http.Header{
+				"X-Real-IP": []string{"98.159.36.136"},
+			},
+			want: "98.159.36.136",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			for name, values := range tt.headers {
+				for _, value := range values {
+					req.Header.Add(name, value)
+				}
+			}
+
+			if got := clientIP(req); got != tt.want {
+				t.Fatalf("clientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandleUploadStoresFileAndSetsUnlockCookie(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 
@@ -168,6 +233,37 @@ func TestHandleUploadStoresFileAndSetsUnlockCookie(t *testing.T) {
 	}
 	if got := mustReadFile(t, filepath.Join(root, "report.txt")); got != "replacement" {
 		t.Fatalf("uploaded file contents = %q, want %q", got, "replacement")
+	}
+}
+
+func TestHandleUploadAcceptsMultipartCSRFWithoutHeader(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		if err := writer.WriteField("csrf_token", "csrf-form"); err != nil {
+			t.Fatalf("write csrf field: %v", err)
+		}
+		fw, err := writer.CreateFormFile("uploadFiles", "form.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("native")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-form"},
+	}, nil)
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if cookie := findCookie(w.Result().Cookies(), cookieUnlock); cookie == nil || cookie.Value != "true" {
+		t.Fatalf("expected unlock cookie, got %+v", cookie)
+	}
+	if got := mustReadFile(t, filepath.Join(root, "form.txt")); got != "native" {
+		t.Fatalf("uploaded file contents = %q, want %q", got, "native")
 	}
 }
 
@@ -202,7 +298,7 @@ func TestHandleUploadAcceptsLateMultipartCSRFFieldWithHeader(t *testing.T) {
 	}
 }
 
-func TestHandleUploadRejectsMissingCSRFHeader(t *testing.T) {
+func TestHandleUploadRejectsMissingCSRFHeaderAndField(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 
 	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
@@ -454,14 +550,23 @@ func TestHandleDirectoryListingIncludesUploadFailureScript(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, "xhr.onerror = () => showUploadError('Upload failed');") {
+	if !strings.Contains(body, "xhr.onerror = () => {") {
 		t.Fatalf("expected xhr error handling script, body=%s", body)
 	}
 	if !strings.Contains(body, "function getUploadErrorMessage(xhr) {") {
 		t.Fatalf("expected upload error message helper in script, body=%s", body)
 	}
+	if !strings.Contains(body, "formData.append('csrf_token', csrfToken);") {
+		t.Fatalf("expected multipart csrf field in script, body=%s", body)
+	}
 	if !strings.Contains(body, "xhr.setRequestHeader('X-CSRF-Token', csrfToken);") {
 		t.Fatalf("expected xhr csrf header in script, body=%s", body)
+	}
+	if !strings.Contains(body, "function retryWithStandardSubmit(source) {") {
+		t.Fatalf("expected standard submit fallback helper in script, body=%s", body)
+	}
+	if !strings.Contains(body, "HTMLFormElement.prototype.submit.call(form);") {
+		t.Fatalf("expected standard submit fallback call in script, body=%s", body)
 	}
 	if !strings.Contains(body, "const readAllEntries = async (reader) => {") {
 		t.Fatalf("expected readAllEntries helper in script, body=%s", body)
