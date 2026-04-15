@@ -9,13 +9,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
 )
 
 const MinimumSizeBytes int64 = 1024
+
+const (
+	defaultMaxOpenConns = 10
+	matcherCacheSizeKB  = 128 * 1024
+	matcherMmapSize     = 256 << 20
+)
+
+type MatcherOptions struct {
+	MaxOpenConns int
+}
 
 type Matcher struct {
 	db      *sql.DB
@@ -24,6 +36,11 @@ type Matcher struct {
 }
 
 func NewMatcher(dbPath string) (*Matcher, error) {
+	return NewMatcherWithOptions(dbPath, MatcherOptions{})
+}
+
+// NewMatcherWithOptions opens a CAID matcher with read-oriented SQLite settings.
+func NewMatcherWithOptions(dbPath string, opts MatcherOptions) (*Matcher, error) {
 	dbPath = strings.TrimSpace(dbPath)
 	if dbPath == "" {
 		return nil, fmt.Errorf("empty CAID database path")
@@ -32,11 +49,17 @@ func NewMatcher(dbPath string) (*Matcher, error) {
 		return nil, fmt.Errorf("stat CAID database: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := matcherDSN(dbPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(10)
+	maxOpenConns := opts.MaxOpenConns
+	if maxOpenConns <= 0 {
+		maxOpenConns = defaultMaxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
 
 	hasSize, err := db.Prepare(`SELECT 1 FROM caid_hashes WHERE size = ? LIMIT 1`)
 	if err != nil {
@@ -47,7 +70,7 @@ func NewMatcher(dbPath string) (*Matcher, error) {
 	exact, err := db.Prepare(`
 		SELECT filetype, category
 		FROM caid_hashes
-		WHERE size = ? AND md5 = ? COLLATE NOCASE AND sha1 = ? COLLATE NOCASE
+		WHERE size = ? AND md5 = ? AND sha1 = ?
 		LIMIT 1
 	`)
 	if err != nil {
@@ -69,6 +92,22 @@ func NewMatcher(dbPath string) (*Matcher, error) {
 		hasSize: hasSize,
 		exact:   exact,
 	}, nil
+}
+
+func matcherDSN(dbPath string) string {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	query.Add("_pragma", "query_only=on")
+	query.Add("_pragma", fmt.Sprintf("cache_size=%d", -matcherCacheSizeKB))
+	query.Add("_pragma", "temp_store=memory")
+	query.Add("_pragma", fmt.Sprintf("mmap_size=%d", matcherMmapSize))
+
+	u := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(dbPath),
+		RawQuery: query.Encode(),
+	}
+	return u.String()
 }
 
 func (m *Matcher) Count() (count int) {

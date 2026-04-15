@@ -31,6 +31,7 @@ var appSrc string
 const (
 	cookieUnlock = "explorer_unlocked"
 	cookieCSRF   = "explorer_csrf"
+	headerCSRF   = "X-CSRF-Token"
 )
 
 // ── globals ───────────────────────────────────────────────────────────────────
@@ -115,7 +116,11 @@ func logMiddleware(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 
-	log.Printf("[%s] %s %s %s", clientIP(r), r.Method, r.URL.Path, r.URL.RawQuery)
+	locked := "L"
+	if isUnlocked(r) {
+		locked = "U"
+	}
+	log.Printf("[%s][%s] %s %s %s", clientIP(r), locked, r.Method, r.URL.Path, r.URL.RawQuery)
 
 	// Pass nonce through request context or just handle it directly
 	handle(w, r, nonce)
@@ -128,14 +133,19 @@ func generateNonce() string {
 }
 
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.SplitN(xff, ",", 2)[0]
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	// immediate connection IP (the proxy)
+	proxyIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		proxyIP = r.RemoteAddr
 	}
-	return ip
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		clientIP := strings.TrimSpace(ips[0])
+		return fmt.Sprintf("%s -> %s", clientIP, proxyIP)
+	}
+
+	return proxyIP
 }
 
 // ── routing ───────────────────────────────────────────────────────────────────
@@ -515,42 +525,16 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if !validateCSRF(r) {
+		log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-
-	csrfPart, err := mr.NextPart()
-	if err == io.EOF {
-		log.Printf("[%s] UPLOAD REJECTED: missing csrf_token part", ip)
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-	if err != nil {
-		log.Printf("[%s] UPLOAD REJECTED: invalid multipart before csrf: %v", ip, err)
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-	if csrfPart.FormName() != "csrf_token" {
-		log.Printf("[%s] UPLOAD REJECTED: first part is %q, expected csrf_token", ip, csrfPart.FormName())
-		csrfPart.Close()
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	tokenBytes, err := io.ReadAll(io.LimitReader(csrfPart, 128))
-	csrfPart.Close()
-	if err != nil {
-		log.Printf("[%s] UPLOAD REJECTED: could not read CSRF token: %v", ip, err)
-		http.Error(w, "Bad request", http.StatusBadRequest)
-		return
-	}
-	if !validateCSRF(r, string(tokenBytes)) {
-		log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
-		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -726,9 +710,13 @@ func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	return token
 }
 
-func validateCSRF(r *http.Request, formToken string) bool {
+func validateCSRF(r *http.Request) bool {
 	c, err := r.Cookie(cookieCSRF)
-	return err == nil && c.Value != "" && formToken == c.Value
+	if err != nil || c.Value == "" {
+		return false
+	}
+	token := strings.TrimSpace(r.Header.Get(headerCSRF))
+	return token != "" && token == c.Value
 }
 
 func isUnlocked(r *http.Request) bool {
@@ -971,7 +959,7 @@ async function performUpload(files, paths = []) {
   progressWrapper.style.display = 'block';
 
   const formData = new FormData();
-  formData.append('csrf_token', document.getElementById('csrf_token').value);
+  const csrfToken = document.getElementById('csrf_token').value;
   for (let i = 0; i < files.length; i++) {
     const path = paths[i] || files[i].webkitRelativePath || files[i].name;
     formData.append('uploadFiles', files[i], path);
@@ -979,6 +967,7 @@ async function performUpload(files, paths = []) {
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', form.action, true);
+  xhr.setRequestHeader('X-CSRF-Token', csrfToken);
   xhr.upload.onprogress = (e) => {
     if (e.lengthComputable) {
       const p = Math.round((e.loaded / e.total) * 100);

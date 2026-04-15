@@ -293,6 +293,7 @@ func createCAIDTestDB(t *testing.T) string {
 		CREATE INDEX IF NOT EXISTS idx_caid_hashes_md5 ON caid_hashes(md5);
 		CREATE INDEX IF NOT EXISTS idx_caid_hashes_sha1 ON caid_hashes(sha1);
 		CREATE INDEX IF NOT EXISTS idx_caid_hashes_size ON caid_hashes(size);
+		CREATE INDEX IF NOT EXISTS idx_caid_hashes_size_md5_sha1 ON caid_hashes(size, md5, sha1);
 	`); err != nil {
 		t.Fatalf("create CAID schema: %v", err)
 	}
