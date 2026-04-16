@@ -53,7 +53,7 @@ const (
 
 	DefaultBasePath        = "/admin/explorer"
 	defaultMaxUploadBytes  = 1_000 << 20
-	defaultWarmCacheMax    = 20_000
+	defaultWarmCacheMax    = 0
 	defaultDeleteAPIPath   = "/admin/api/explorer/delete"
 	defaultBanOwnerAPIPath = "/admin/api/explorer/ban-owner"
 	defaultMarkBadAPIPath  = "/admin/api/maintenance/mark-bad"
@@ -498,7 +498,7 @@ func New(cfg Config) (*Explorer, error) {
 	if cfg.MaxUploadBytes <= 0 {
 		cfg.MaxUploadBytes = defaultMaxUploadBytes
 	}
-	if cfg.WarmCacheMax <= 0 {
+	if cfg.WarmCacheMax < 0 {
 		cfg.WarmCacheMax = defaultWarmCacheMax
 	}
 
@@ -519,7 +519,9 @@ func New(cfg Config) (*Explorer, error) {
 	ownerFilesURLFunc = cfg.OwnerFilesURL
 	ownerDetailsURLFn = cfg.OwnerDetailsURL
 
-	go warmCaches(rootDir, cfg.WarmCacheMax)
+	if cfg.WarmCacheMax > 0 {
+		go warmCaches(rootDir, cfg.WarmCacheMax)
+	}
 	return &Explorer{basePath: basePath}, nil
 }
 

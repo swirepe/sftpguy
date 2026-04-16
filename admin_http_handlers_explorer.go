@@ -30,6 +30,7 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 		BasePath:       adminexplorer.DefaultBasePath,
 		EmbedAssets:    false,
 		MaxUploadBytes: s.cfg.MaxFileSize,
+		WarmCacheMax:   s.cfg.AdminExplorerWarmMax,
 		LookupFileDetails: func(relPath string) (adminexplorer.FileDetails, error) {
 			meta, err := s.store.GetFileAdminMeta(relPath)
 			if err != nil {

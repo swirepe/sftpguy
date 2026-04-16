@@ -149,6 +149,7 @@ Run `go run . -h` for the full list. The flags most operators care about are:
 | `-admin.http` | Bind address for the web admin console, for example `127.0.0.1:8080`. |
 | `-admin.http.token` | Static bearer token for admin HTTP auth. |
 | `-admin.http.token.file` | Load or generate the admin bearer token from a file. |
+| `-admin.explorer.warm.max` | Number of files to prewarm into admin explorer caches on first use. Default: `0` (disabled). |
 | `-admin.sftp` | Enable system-owner SFTP logins for approved admin keys. |
 | `-admin.keys` | File containing admin public keys or SHA-256 key hashes. |
 | `-blacklist` / `-whitelist` | IP list files used for blocking and trusted ranges. |
@@ -170,6 +171,7 @@ Examples:
 - `DB_PATH` or `SFTP_DB_PATH`
 - `ARCHIVE_NAME` or `SFTP_ARCHIVE_NAME`
 - `ADMIN_HTTP` or `SFTP_ADMIN_HTTP`
+- `ADMIN_EXPLORER_WARM_CACHE_MAX` or `SFTP_ADMIN_EXPLORER_WARM_CACHE_MAX`
 
 Flags still win if you set both.
 

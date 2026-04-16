@@ -944,6 +944,7 @@ type Config struct {
 	AdminHTTP               string
 	AdminHTTPToken          string
 	AdminHTTPTokenFile      string
+	AdminExplorerWarmMax    int
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -986,6 +987,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
 	EnvFlag(&cfg.AdminHTTPTokenFile, "admin.http.token.file", "ADMIN_HTTP_TOKEN_FILE", "", "Optional file to load admin bearer token from; generates one when file is missing or empty")
+	EnvFlag(&cfg.AdminExplorerWarmMax, "admin.explorer.warm.max", "ADMIN_EXPLORER_WARM_CACHE_MAX", 0, "Number of files to warm into admin explorer caches on first use (0 disables)")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -1137,6 +1139,9 @@ func (c Config) Validate() error {
 		if _, _, err := net.SplitHostPort(c.AdminHTTP); err != nil {
 			return fmt.Errorf("admin.http must be host:port, got %q: %w", c.AdminHTTP, err)
 		}
+	}
+	if c.AdminExplorerWarmMax < 0 {
+		return fmt.Errorf("admin.explorer.warm.max must be >= 0")
 	}
 	if c.Name == "" || c.HostKeyFile == "" || c.DBPath == "" || c.UploadDir == "" {
 		return errors.New("required configuration fields missing")
@@ -3333,6 +3338,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
 		"admin.http.token.file", cfg.AdminHTTPTokenFile != "",
+		"admin.explorer.warm.max", cfg.AdminExplorerWarmMax,
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"caid_db", cfg.CAIDDBPath,
