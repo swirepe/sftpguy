@@ -71,6 +71,8 @@ type metricsReaderAt struct {
 	closer    io.Closer
 	h         *fsHandler
 	direction string
+	startedAt time.Time
+	onClose   func(int64, time.Duration)
 	bytesRead atomic.Int64
 	closeOnce sync.Once
 	closeErr  error
@@ -671,11 +673,13 @@ func (h *fsHandler) observeDenied(kind EventKind) {
 	h.srv.metrics.observeDenied(kind, h.isAdmin, h.isBanned)
 }
 
-func newMetricsReaderAt(reader io.ReaderAt, h *fsHandler, direction string) *metricsReaderAt {
+func newMetricsReaderAt(reader io.ReaderAt, h *fsHandler, direction string, onClose func(int64, time.Duration)) *metricsReaderAt {
 	m := &metricsReaderAt{
 		reader:    reader,
 		h:         h,
 		direction: direction,
+		startedAt: time.Now(),
+		onClose:   onClose,
 	}
 	if closer, ok := reader.(io.Closer); ok {
 		m.closer = closer
@@ -694,9 +698,14 @@ func (m *metricsReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 func (m *metricsReaderAt) Close() error {
 	m.closeOnce.Do(func() {
-		m.h.observeTransferComplete(m.direction, m.bytesRead.Load())
+		bytesRead := m.bytesRead.Load()
+		duration := time.Since(m.startedAt)
+		m.h.observeTransferComplete(m.direction, bytesRead)
 		if m.closer != nil {
 			m.closeErr = m.closer.Close()
+		}
+		if m.onClose != nil {
+			m.onClose(bytesRead, duration)
 		}
 	})
 	return m.closeErr

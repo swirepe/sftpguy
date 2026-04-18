@@ -688,6 +688,43 @@ func TestReadDirSkipsHiddenSystemDirectoriesAndCountsOnlyVisibleEntries(t *testi
 	}
 }
 
+func TestRotationAwareLogWriterReopensAfterRenameRotation(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "explorer.log")
+
+	writer, err := newRotationAwareLogWriter(logPath)
+	if err != nil {
+		t.Fatalf("newRotationAwareLogWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close log writer: %v", err)
+		}
+	})
+
+	if _, err := writer.Write([]byte("before rotation\n")); err != nil {
+		t.Fatalf("write before rotation: %v", err)
+	}
+
+	rotatedPath := filepath.Join(filepath.Dir(logPath), "explorer.log.1")
+	if err := os.Rename(logPath, rotatedPath); err != nil {
+		t.Fatalf("rotate log file: %v", err)
+	}
+	if err := os.WriteFile(logPath, nil, 0644); err != nil {
+		t.Fatalf("create replacement log file: %v", err)
+	}
+
+	if _, err := writer.Write([]byte("after rotation\n")); err != nil {
+		t.Fatalf("write after rotation: %v", err)
+	}
+
+	if got := mustReadFile(t, rotatedPath); got != "before rotation\n" {
+		t.Fatalf("rotated file contents = %q, want %q", got, "before rotation\n")
+	}
+	if got := mustReadFile(t, logPath); got != "after rotation\n" {
+		t.Fatalf("replacement file contents = %q, want %q", got, "after rotation\n")
+	}
+}
+
 func setupExplorerTestRoot(t *testing.T) string {
 	t.Helper()
 

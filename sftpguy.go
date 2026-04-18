@@ -61,6 +61,7 @@ import (
 	"time"
 
 	"sftpguy/caid"
+	"sftpguy/internal/logutil"
 
 	"github.com/charmbracelet/log"
 	"github.com/pkg/sftp"
@@ -2418,22 +2419,40 @@ func (h *fsHandler) logLogin(stats userStats) {
 	)
 }
 
-func (h *fsHandler) logDownload(meta *pathMeta) {
-	h.bumpDownload(meta.fi.Size())
-	h.logger.Info("download", "path", meta.rel, "size", meta.fi.Size())
-	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
-		"path", meta.rel,
-		"size", meta.fi.Size(),
+func (h *fsHandler) logDownload(rel string, transferred int64, duration time.Duration) {
+	h.bumpDownload(transferred)
+	h.logger.Info("download",
+		"path", rel,
+		"size", transferred,
+		"duration", duration,
+		"avg", formatTransferRate(transferred, duration),
 	)
+	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
+		"path", rel,
+		"size", transferred,
+		"duration_ms", duration.Milliseconds(),
+		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
+	)
+	_ = h.srv.store.RecordDownload(h.pubHash, rel, transferred)
 }
 
-func (h *fsHandler) logUpload(rel string, size, delta int64) {
+func (h *fsHandler) logUpload(rel string, size, delta, transferred int64, duration time.Duration) {
 	h.bumpUpload(delta)
-	h.logger.Info("upload", "path", rel, "size", size, "delta", delta)
+	h.logger.Info("upload",
+		"path", rel,
+		"size", size,
+		"delta", delta,
+		"transferred", transferred,
+		"duration", duration,
+		"avg", formatTransferRate(transferred, duration),
+	)
 	h.srv.store.LogEvent(EventUpload, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", rel,
 		"size", size,
 		"delta", delta,
+		"transferred", transferred,
+		"duration_ms", duration.Milliseconds(),
+		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
 	)
 }
 
@@ -2479,10 +2498,9 @@ func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	if err != nil {
 		return nil, err
 	}
-	h.logDownload(meta)
-	h.srv.store.RecordDownload(h.pubHash, meta.rel, meta.fi.Size())
-
-	reader = newMetricsReaderAt(f, h, "download")
+	reader = newMetricsReaderAt(f, h, "download", func(bytesRead int64, duration time.Duration) {
+		h.logDownload(meta.rel, bytesRead, duration)
+	})
 
 	// SHADOW BAN: throttle reads
 	if h.isBanned && h.readLimiter != nil {
@@ -2568,6 +2586,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 		ownerHint:  ownerHint,
 		oldSize:    oldSize,
 		appendMode: appendMode,
+		startedAt:  time.Now(),
 	}
 	return writer, nil
 }
@@ -2842,6 +2861,7 @@ type statWriter struct {
 	ownerHint  string
 	oldSize    int64
 	appendMode bool
+	startedAt  time.Time
 	written    atomic.Int64
 }
 
@@ -2903,6 +2923,7 @@ func (sw *statWriter) Close() error {
 	}
 	delta := size - sw.oldSize
 	bytesWritten := sw.written.Load()
+	duration := time.Since(sw.startedAt)
 	dbErr := sw.h.srv.store.UpdateFileWrite(sw.h.pubHash, sw.ownerHint, sw.rel, size, delta)
 	if dbErr != nil {
 		sw.h.logger.Error("failed to persist upload metadata", "path", sw.rel, "err", dbErr)
@@ -2920,7 +2941,7 @@ func (sw *statWriter) Close() error {
 		return closeErr
 	}
 
-	sw.h.logUpload(sw.rel, size, delta)
+	sw.h.logUpload(sw.rel, size, delta, bytesWritten, duration)
 	sw.enqueueBadUploadCheck()
 	go sw.reportUserStatus(sw.h.pubHash)
 
@@ -3018,6 +3039,36 @@ func formatBytes(b int64) string {
 	}
 	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
+
+func formatTransferRate(bytes int64, duration time.Duration) string {
+	if duration <= 0 {
+		return "n/a"
+	}
+	if bytes <= 0 {
+		return "0 B/s"
+	}
+	return fmt.Sprintf("%s/s", formatBytesFloat(float64(bytes)/duration.Seconds()))
+}
+
+func averageBytesPerSecond(bytes int64, duration time.Duration) int64 {
+	if duration <= 0 || bytes <= 0 {
+		return 0
+	}
+	return int64(float64(bytes)/duration.Seconds() + 0.5)
+}
+
+func formatBytesFloat(b float64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%.0f B", b)
+	}
+	div, exp := 1024.0, 0
+	for n := b / 1024; n >= 1024 && exp < len("KMGTPE")-1; n /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", b/div, "KMGTPE"[exp])
+}
+
 func getEnv(key string) (string, bool) {
 	if val, ok := os.LookupEnv(envPrefix + key); ok {
 		return val, true
@@ -3281,7 +3332,7 @@ func newConsoleHandler(opts *slog.HandlerOptions) *PrettyHandler {
 	}
 }
 
-func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
+func setupLogger(cfg Config) (*slog.Logger, *logutil.FileWriter, error) {
 	lvl := slog.LevelInfo
 	if cfg.Debug {
 		lvl = slog.LevelDebug
@@ -3310,7 +3361,7 @@ func setupLogger(cfg Config) (*slog.Logger, *os.File, error) {
 	}
 	handlers = append(handlers, consoleHandler)
 
-	f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, permLogFile)
+	f, err := logutil.NewFileWriter(cfg.LogFile, permLogFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 	}
@@ -3486,8 +3537,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	sigChan := make(chan os.Signal, 2)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	sigChan := make(chan os.Signal, 4)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	srv.startMaintenanceLoop(time.Hour)
 	go func() {
@@ -3524,13 +3575,13 @@ func main() {
 		}()
 	}
 
-	sig := <-sigChan
+	sig := nextShutdownSignal(sigChan, logger, logFile)
 	logger.Info("Shutdown signal received", "signal", sig.String())
 
 	go func() {
 		defer recoverAndLogPanic(logger, "forced-exit watcher")
-		<-sigChan
-		logger.Error("Forced exit: Terminating immediately")
+		sig := nextShutdownSignal(sigChan, logger, logFile)
+		logger.Error("Forced exit: Terminating immediately", "signal", sig.String())
 		os.Exit(1)
 	}()
 
