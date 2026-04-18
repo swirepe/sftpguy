@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -93,6 +94,41 @@ func TestHandlePublicFileServesWithoutUnlock(t *testing.T) {
 	}
 	if got := w.Body.String(); got != "hello world" {
 		t.Fatalf("body = %q, want %q", got, "hello world")
+	}
+}
+
+func TestHandlePublicFileReadLogIncludesTransferStats(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustWriteFile(t, filepath.Join(root, "public", "hello.txt"), "hello world")
+
+	var logBuf bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+
+	w := serveExplorerRequest(http.MethodGet, "/public/hello.txt", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /public/hello.txt status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	line := logBuf.String()
+	if !strings.Contains(line, "READ public/hello.txt duration=") {
+		t.Fatalf("log line missing duration, got %q", line)
+	}
+	if !strings.Contains(line, "size=11 B") {
+		t.Fatalf("log line missing size, got %q", line)
+	}
+	if !regexp.MustCompile(`avg=(?:n/a|[0-9.]+ [KMGTPE]?B/s)`).MatchString(line) {
+		t.Fatalf("log line missing avg transfer rate, got %q", line)
 	}
 }
 
@@ -233,6 +269,52 @@ func TestHandleUploadStoresFileAndSetsUnlockCookie(t *testing.T) {
 	}
 	if got := mustReadFile(t, filepath.Join(root, "report.txt")); got != "replacement" {
 		t.Fatalf("uploaded file contents = %q, want %q", got, "replacement")
+	}
+}
+
+func TestHandleUploadWriteLogIncludesTransferStats(t *testing.T) {
+	setupExplorerTestRoot(t)
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		fw, err := writer.CreateFormFile("uploadFiles", "report.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte("replacement")); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	var logBuf bytes.Buffer
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-upload"},
+	}, csrfHeaders("csrf-upload"))
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	line := logBuf.String()
+	if !strings.Contains(line, "WRITE report.txt duration=") {
+		t.Fatalf("log line missing duration, got %q", line)
+	}
+	if !strings.Contains(line, "size=11 B") {
+		t.Fatalf("log line missing size, got %q", line)
+	}
+	if !regexp.MustCompile(`avg=(?:0 B/s|[0-9.]+ [KMGTPE]?B/s)`).MatchString(line) {
+		t.Fatalf("log line missing avg transfer rate, got %q", line)
 	}
 }
 

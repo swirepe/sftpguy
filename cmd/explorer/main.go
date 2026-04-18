@@ -291,8 +291,11 @@ func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.
 		return
 	}
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
-	http.ServeFile(w, r, fullPath)
-	log.Printf("[%s] READ %s", clientIP(r), relPath)
+	start := time.Now()
+	tw := &transferLogWriter{ResponseWriter: w}
+	http.ServeFile(tw, r, fullPath)
+	duration := time.Since(start)
+	log.Printf("[%s] READ %s duration=%s size=%s avg=%s", clientIP(r), relPath, duration, fmtBytes(tw.bytes), fmtTransferRate(tw.bytes, duration))
 }
 
 // ── directory listing ─────────────────────────────────────────────────────────
@@ -676,7 +679,7 @@ func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 			cleanupCreatedPaths()
 			return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Dir(destPath), err)
 		}
-		writtenPath, err := writeFileAtomic(part, destPath, !isNested)
+		writtenPath, bytesWritten, duration, err := writeFileAtomic(part, destPath, !isNested)
 		if err != nil {
 			part.Close()
 			cleanupCreatedPaths()
@@ -691,7 +694,7 @@ func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 		if err != nil {
 			writtenRel = filepath.Base(writtenPath)
 		}
-		log.Printf("[%s] WRITE %s", ip, filepath.ToSlash(writtenRel))
+		log.Printf("[%s] WRITE %s duration=%s size=%s avg=%s", ip, filepath.ToSlash(writtenRel), duration, fmtBytes(bytesWritten), fmtTransferRate(bytesWritten, duration))
 		savedCount++
 		part.Close()
 	}
@@ -709,7 +712,7 @@ func partFilename(p *multipart.Part) string {
 	return name
 }
 
-func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, err error) {
+func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, bytesWritten int64, duration time.Duration, err error) {
 	var f *os.File
 	finalPath = path
 	if !uniqueNaming {
@@ -725,7 +728,7 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath str
 		}
 	}
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
 	defer func() {
 		f.Close()
@@ -733,8 +736,10 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath str
 			os.Remove(f.Name())
 		}
 	}()
-	_, err = io.Copy(f, r)
-	return f.Name(), err
+	start := time.Now()
+	bytesWritten, err = io.Copy(f, r)
+	duration = time.Since(start)
+	return f.Name(), bytesWritten, duration, err
 }
 
 func atomicMkdirUnique(path string) (string, error) {
@@ -828,6 +833,49 @@ func fmtBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func fmtTransferRate(bytes int64, duration time.Duration) string {
+	if duration <= 0 {
+		return "n/a"
+	}
+	if bytes <= 0 {
+		return "0 B/s"
+	}
+	return fmt.Sprintf("%s/s", fmtBytesFloat(float64(bytes)/duration.Seconds()))
+}
+
+func fmtBytesFloat(b float64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%.0f B", b)
+	}
+	div, exp := 1024.0, 0
+	for n := b / 1024; n >= 1024 && exp < len("KMGTPE")-1; n /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", b/div, "KMGTPE"[exp])
+}
+
+type transferLogWriter struct {
+	http.ResponseWriter
+	bytes int64
+}
+
+func (w *transferLogWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *transferLogWriter) ReadFrom(r io.Reader) (int64, error) {
+	n, err := io.Copy(w.ResponseWriter, r)
+	w.bytes += n
+	return n, err
+}
+
+func (w *transferLogWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // ── template ──────────────────────────────────────────────────────────────────

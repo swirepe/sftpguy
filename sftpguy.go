@@ -100,7 +100,6 @@ fe80::/10 # IPv6 link-local
 var defaultUnrestrictedPaths = []string{
 	"README.txt",
 	"RULES.txt",
-	"LICENSE.txt",
 	"public/",
 }
 
