@@ -22,6 +22,7 @@
 	      logHasMore: false,
 		      sessions: [],
 	      uploads: [],
+      downloadsView: { q: "", summary: {}, files: [], downloaders: [], recent: [], window: {} },
       banned: { hashes: [], ips: [] },
       actor: null,
       sessionTimeline: null,
@@ -1142,6 +1143,161 @@
       );
     }
 
+    async function loadDownloads() {
+      const q = document.getElementById("downloads-q").value.trim();
+      const d = await api(withRange("/admin/api/downloads?q=" + encodeURIComponent(q) + "&file_limit=800&downloader_limit=300&recent_limit=400"));
+      state.downloadsView = {
+        q: d.q || q,
+        summary: d.summary || {},
+        files: d.files || [],
+        downloaders: d.downloaders || [],
+        recent: d.recent || [],
+        window: d.window || {}
+      };
+      setTabCount("downloads", state.downloadsView.files.length);
+      renderDownloads();
+    }
+    function renderDownloads() {
+      const d = state.downloadsView || {};
+      const summary = d.summary || {};
+      const win = d.window || {};
+      const filterPill = d.q ? ("<span class=\"pill\">filter=<code>" + esc(d.q) + "</code></span>") : "";
+      const summaryGrid = [
+        ["Range Downloads", summary.range_downloads || 0],
+        ["Range Unique Files", summary.range_unique_files || 0],
+        ["Range Unique Users", summary.range_unique_users || 0],
+        ["Range Unique IPs", summary.range_unique_ips || 0],
+        ["Files Ever Downloaded", summary.files_ever_downloaded || 0],
+        ["All-Time Downloads", summary.all_time_downloads || 0]
+      ].map(function(kv) {
+        return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
+      }).join("");
+
+      const fileRows = (d.files || []).map(function(f) {
+        return {
+          sort: {
+            path: f.path || "",
+            owner: f.owner || "",
+            downloads_total: Number(f.downloads_total || 0),
+            downloads_in_range: Number(f.downloads_in_range || 0),
+            last_download_at: Number(f.last_download_at || 0),
+            last_downloader: f.last_downloader || "",
+            last_ip: f.last_ip || "",
+            size: Number(f.size || 0)
+          },
+          cells: [
+            pathWithExplorer(f.path || "", false),
+            ownerCell(f.owner || "-"),
+            esc(f.downloads_total || 0),
+            "<div>" + esc(f.downloads_in_range || 0) + "</div><div class=\"muted\">users " + esc(f.unique_users_in_range || 0) + " · ips " + esc(f.unique_ips_in_range || 0) + "</div>",
+            f.last_download_time ? "<code>" + esc(f.last_download_time) + "</code>" : "<span class=\"muted\">-</span>",
+            ownerCell(f.last_downloader || "-"),
+            ipCell(f.last_ip || ""),
+            esc(f.size_human || formatBytes(f.size || 0))
+          ]
+        };
+      });
+
+      const downloaderRows = (d.downloaders || []).map(function(row) {
+        return {
+          sort: {
+            user_id: row.user_id || "",
+            download_count: Number(row.download_count || 0),
+            unique_files: Number(row.unique_files || 0),
+            unique_ips: Number(row.unique_ips || 0),
+            last_download_at: Number(row.last_download_at || 0),
+            last_ip: row.last_ip || ""
+          },
+          cells: [
+            ownerCell(row.user_id || "-"),
+            esc(row.download_count || 0),
+            esc(row.unique_files || 0),
+            esc(row.unique_ips || 0),
+            row.last_download ? "<code>" + esc(row.last_download) + "</code>" : "<span class=\"muted\">-</span>",
+            ipCell(row.last_ip || "")
+          ]
+        };
+      });
+
+      const recentRows = (d.recent || []).map(function(row) {
+        return {
+          sort: {
+            time: Number(row.timestamp || 0),
+            user_id: row.user_id || "",
+            ip: row.ip || "",
+            path: row.path || "",
+            size: Number(row.size || 0),
+            duration_ms: Number(row.duration_ms || 0),
+            avg_bytes_per_sec: Number(row.avg_bytes_per_sec || 0),
+            session: row.session || ""
+          },
+          cells: [
+            "<code>" + esc(row.time || "") + "</code>",
+            ownerCell(row.user_id),
+            ipCell(row.ip),
+            pathWithExplorer(row.path || "", false),
+            esc(formatBytes(row.size || 0)),
+            esc(formatMs(row.duration_ms || 0)),
+            esc(formatBytes(row.avg_bytes_per_sec || 0) + "/s"),
+            sessionCell(row.session)
+          ]
+        };
+      });
+
+      document.getElementById("downloads-out").innerHTML =
+        "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span>" + filterPill + "</div>" +
+        "<div class=\"grid\">" + summaryGrid + "</div>" +
+        "<h3>Top Files</h3>" +
+        renderSmartTable(
+          "downloads-files",
+          [
+            {label:"Path", key:"path"},
+            {label:"Owner", key:"owner"},
+            {label:"All Time", key:"downloads_total"},
+            {label:"In Range", key:"downloads_in_range"},
+            {label:"Last Download", key:"last_download_at"},
+            {label:"Last User", key:"last_downloader"},
+            {label:"Last IP", key:"last_ip"},
+            {label:"Size", key:"size"}
+          ],
+          fileRows,
+          "downloads_total",
+          "desc"
+        ) +
+        "<h3>Top Downloaders</h3>" +
+        renderSmartTable(
+          "downloads-users",
+          [
+            {label:"User", key:"user_id"},
+            {label:"Downloads", key:"download_count"},
+            {label:"Unique Files", key:"unique_files"},
+            {label:"Unique IPs", key:"unique_ips"},
+            {label:"Last Download", key:"last_download_at"},
+            {label:"Last IP", key:"last_ip"}
+          ],
+          downloaderRows,
+          "download_count",
+          "desc"
+        ) +
+        "<h3>Recent Downloads</h3>" +
+        renderSmartTable(
+          "downloads-recent",
+          [
+            {label:"Time", key:"time"},
+            {label:"User", key:"user_id"},
+            {label:"IP", key:"ip"},
+            {label:"Path", key:"path"},
+            {label:"Size", key:"size"},
+            {label:"Duration", key:"duration_ms"},
+            {label:"Rate", key:"avg_bytes_per_sec"},
+            {label:"Session", key:"session"}
+          ],
+          recentRows,
+          "time",
+          "desc"
+        );
+    }
+
     async function loadBanned() {
       const d = await api("/admin/api/banned");
       state.banned = { hashes: d.hashes || [], ips: d.ips || [] };
@@ -1869,6 +2025,7 @@
       if (state.activeTab === "auth") renderAuthAttempts();
       if (state.activeTab === "sessions") renderSessions();
       if (state.activeTab === "uploads") renderUploads();
+      if (state.activeTab === "downloads") renderDownloads();
       if (state.activeTab === "banned") renderBanned();
       if (state.activeTab === "selftest") renderSelfTest();
       if (state.activeTab === "logins") renderOneTimeLogins();
@@ -1880,7 +2037,7 @@
 
     async function refreshAll() {
       try {
-        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadBanned(), loadSelfTest()]);
+        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadDownloads(), loadBanned(), loadSelfTest()]);
         if (state.activeTab === "logins") {
           await loadOneTimeLogins();
         }
@@ -1920,6 +2077,7 @@
             state.activeTab === "auth" ? loadAuthAttempts :
             state.activeTab === "sessions" ? loadSessions :
           state.activeTab === "uploads" ? loadUploads :
+          state.activeTab === "downloads" ? loadDownloads :
           state.activeTab === "banned" ? loadBanned :
           state.activeTab === "selftest" ? loadSelfTest :
           state.activeTab === "logins" ? loadOneTimeLogins :
@@ -1937,7 +2095,7 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
+      ["summary","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
@@ -1951,6 +2109,7 @@
         name === "auth" ? loadAuthAttempts :
         name === "sessions" ? loadSessions :
         name === "uploads" ? loadUploads :
+        name === "downloads" ? loadDownloads :
         name === "banned" ? loadBanned :
         name === "selftest" ? loadSelfTest :
         name === "logins" ? loadOneTimeLogins :
@@ -1964,8 +2123,8 @@
     });
 
     window.addEventListener("keydown", function(e) {
-      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","=","]"].includes(e.key)) {
-        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"logins","=":"iplists","]":"maintenance"};
+      if (e.altKey && ["1","2","3","4","5","6","7","8","9","0","-","=","]","["].includes(e.key)) {
+        const map = {"1":"summary","2":"users","3":"files","4":"audit","5":"logs","6":"auth","7":"sessions","8":"uploads","9":"banned","0":"selftest","-":"logins","=":"iplists","]":"maintenance","[":"downloads"};
         switchTab(map[e.key]);
       }
       if (e.key === "Escape") {
@@ -1993,7 +2152,7 @@
           await searchFilesByOwner(startup.owner);
           return;
         }
-        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
+        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
           switchTab(startup.tab);
           if (startup.tab === "files" && startup.q) {
             document.getElementById("files-q").value = startup.q;

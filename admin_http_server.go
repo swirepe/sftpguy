@@ -60,6 +60,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		Sessions:         d.srv.handleAdminSessions,
 		SessionTimeline:  d.srv.handleAdminSessionTimeline,
 		RecentUploads:    d.srv.handleAdminRecentUploads,
+		Downloads:        d.srv.handleAdminDownloads,
 		Actor:            d.srv.handleAdminActor,
 		SystemLog:        d.srv.handleAdminSystemLog,
 		ParsedSystemLog:  d.srv.handleAdminParsedSystemLog,

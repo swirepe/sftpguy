@@ -48,6 +48,7 @@ type RouteHandlers struct {
 	Sessions         http.HandlerFunc
 	SessionTimeline  http.HandlerFunc
 	RecentUploads    http.HandlerFunc
+	Downloads        http.HandlerFunc
 	Actor            http.HandlerFunc
 	SystemLog        http.HandlerFunc
 	ParsedSystemLog  http.HandlerFunc
@@ -138,6 +139,7 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/api/sessions", cfg, handlers.Sessions)
 	register(mux, "/admin/api/sessions/", cfg, handlers.SessionTimeline)
 	register(mux, "/admin/api/uploads/recent", cfg, handlers.RecentUploads)
+	register(mux, "/admin/api/downloads", cfg, handlers.Downloads)
 	register(mux, "/admin/api/actor", cfg, handlers.Actor)
 	register(mux, "/admin/api/system-log", cfg, handlers.SystemLog)
 	register(mux, "/admin/api/system-log/parsed", cfg, handlers.ParsedSystemLog)

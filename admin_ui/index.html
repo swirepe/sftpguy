@@ -15,7 +15,7 @@
         <a class="nav-link" href="/admin/stats/">Open Stats</a>
       </div>
       <div class="muted" id="status">loading...</div>
-      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=,]</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
+      <div class="muted">Shortcuts: <span class="kbd">Alt+1..0,-,=,], [</span> switch tabs, <span class="kbd">Shift+R</span> refresh all, <span class="kbd">Shift+L</span> toggle live logs, <span class="kbd">Esc</span> close drawers</div>
     </div>
 
     <div class="card">
@@ -78,6 +78,7 @@
         <button class="tab" data-tab="auth">Auth</button>
         <button class="tab" data-tab="sessions">Sessions</button>
         <button class="tab" data-tab="uploads">Uploads</button>
+        <button class="tab" data-tab="downloads">Downloads</button>
         <button class="tab" data-tab="banned">Banned</button>
         <button class="tab" data-tab="selftest">Self Test</button>
         <button class="tab" data-tab="logins">Login URLs</button>
@@ -159,6 +160,14 @@
         <button onclick="loadUploads()">Refresh</button>
       </div>
       <div id="uploads-out"></div>
+    </div>
+
+    <div class="card hidden" id="tab-downloads">
+      <div class="row">
+        <input id="downloads-q" placeholder="filter path/user/ip/session..." />
+        <button onclick="loadDownloads()">Refresh</button>
+      </div>
+      <div id="downloads-out"></div>
     </div>
 
     <div class="card hidden" id="tab-banned">
