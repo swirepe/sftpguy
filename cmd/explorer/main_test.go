@@ -97,6 +97,20 @@ func TestHandlePublicFileServesWithoutUnlock(t *testing.T) {
 	}
 }
 
+func TestHandleFaviconServesWithoutUnlock(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustWriteFile(t, filepath.Join(root, "favicon.ico"), "icon")
+
+	w := serveExplorerRequest(http.MethodGet, "/favicon.ico", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /favicon.ico status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); got != "icon" {
+		t.Fatalf("body = %q, want %q", got, "icon")
+	}
+}
+
 func TestHandlePublicFileReadLogIncludesTransferStats(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 	mustWriteFile(t, filepath.Join(root, "public", "hello.txt"), "hello world")

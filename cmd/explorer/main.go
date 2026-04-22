@@ -926,7 +926,7 @@ func isUnlocked(r *http.Request) bool {
 }
 
 func isPublicPath(fullPath string) bool {
-	if strings.HasSuffix(fullPath, "/robots.txt") {
+	if strings.HasSuffix(fullPath, "/robots.txt") || strings.HasSuffix(fullPath, "/favicon.ico") {
 		return true
 	}
 
@@ -998,6 +998,7 @@ const pageHTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
 <title>{{.Title}}</title>
 <style>
 *,*::before,*::after{box-sizing:border-box}
