@@ -20,9 +20,10 @@
 	      systemLogs: { panics: [], panicCount: 0, scannedLines: 0, levels: [], hasMore: false },
 	      logCursorBefore: 0,
 	      logHasMore: false,
-		      sessions: [],
+      sessions: [],
 	      uploads: [],
-      downloadsView: { q: "", summary: {}, files: [], downloaders: [], recent: [], window: {} },
+      downloadsSelectedPath: "",
+      downloadsView: { q: "", summary: {}, files: [], downloaders: [], recent: [], selected_path: "", selected_file: null, selected_history: [], window: {} },
       banned: { hashes: [], ips: [] },
       actor: null,
       sessionTimeline: null,
@@ -378,6 +379,36 @@
 	      const enc = encodeURIComponent(raw);
 	      return "<button class=\"btn-danger tiny\" onclick=\"markBadFile(decodeURIComponent('" + enc + "'))\">Mark Bad</button>";
     }
+    function downloadHistoryButton(path, active, label) {
+      const rel = normalizeExplorerPath(path);
+      if (!rel) return "";
+      const enc = encodeURIComponent(rel);
+      const text = String(label == null ? (active ? "Viewing" : "History") : label);
+      const klass = active ? "btn-live tiny" : "tiny";
+      return "<button class=\"" + klass + "\" onclick=\"openDownloadHistory(decodeURIComponent('" + enc + "'))\">" + esc(text) + "</button>";
+    }
+    function fileDownloadsCell(path, downloads, isDir) {
+      if (isDir) return "<span class=\"muted\">-</span>";
+      const count = Number(downloads || 0);
+      const rel = normalizeExplorerPath(path);
+      const active = !!rel && rel === normalizeExplorerPath(state.downloadsSelectedPath || "");
+      const button = count > 0 ? (" " + downloadHistoryButton(rel, active, "View")) : "";
+      return "<div>" + esc(count) + button + "</div>";
+    }
+    async function openDownloadHistory(path) {
+      const rel = normalizeExplorerPath(path);
+      if (!rel) return;
+      state.downloadsSelectedPath = rel;
+      if (state.activeTab !== "downloads") {
+        switchTab("downloads");
+        return;
+      }
+      await loadDownloads(rel);
+    }
+    async function clearDownloadHistorySelection() {
+      state.downloadsSelectedPath = "";
+      await loadDownloads("");
+    }
 
     function closeActorDrawer() {
       state.actor = null;
@@ -637,7 +668,7 @@
 	            cells: [
 	              (e.is_dir ? (openPathButton(e.path, "Open") + " ") : "") + pathWithExplorer(e.path || "", !!e.is_dir, e.is_dir ? ((e.path || "") + "/") : (e.path || "")),
 	              ownerCell(e.owner || "-"),
-	              e.is_dir ? "<span class=\"muted\">-</span>" : esc(e.downloads || 0),
+	              fileDownloadsCell(e.path || "", e.downloads || 0, !!e.is_dir),
 	              esc(e.size_human || formatBytes(e.size || 0)),
 	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
 	              markBadButton(e.path || "", !!e.is_dir)
@@ -678,7 +709,7 @@
               ? (openPathButton(e.path, (e.name || "") + "/") + explorerLink(e.path || "", true))
               : (esc(e.name || "") + explorerLink(e.path || "", false)),
             ownerCell(e.owner || "-"),
-            e.is_dir ? "<span class=\"muted\">-</span>" : esc(e.downloads || 0),
+            fileDownloadsCell(e.path || "", e.downloads || 0, !!e.is_dir),
             esc(e.size_human || formatBytes(e.size || 0)),
             e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
             markBadButton(e.path || "", !!e.is_dir)
@@ -1143,15 +1174,31 @@
       );
     }
 
-    async function loadDownloads() {
+    async function loadDownloads(selectedPath) {
+      if (selectedPath !== undefined) {
+        state.downloadsSelectedPath = normalizeExplorerPath(selectedPath);
+      }
       const q = document.getElementById("downloads-q").value.trim();
-      const d = await api(withRange("/admin/api/downloads?q=" + encodeURIComponent(q) + "&file_limit=800&downloader_limit=300&recent_limit=400"));
+      const params = new URLSearchParams();
+      params.set("q", q);
+      params.set("file_limit", "800");
+      params.set("downloader_limit", "300");
+      params.set("recent_limit", "400");
+      params.set("download_history_limit", "400");
+      if (state.downloadsSelectedPath) {
+        params.set("path", state.downloadsSelectedPath);
+      }
+      const d = await api(withRange("/admin/api/downloads?" + params.toString()));
+      state.downloadsSelectedPath = normalizeExplorerPath((d && d.selected_path) || state.downloadsSelectedPath || "");
       state.downloadsView = {
         q: d.q || q,
         summary: d.summary || {},
         files: d.files || [],
         downloaders: d.downloaders || [],
         recent: d.recent || [],
+        selected_path: state.downloadsSelectedPath,
+        selected_file: d.selected_file || null,
+        selected_history: d.selected_history || [],
         window: d.window || {}
       };
       setTabCount("downloads", state.downloadsView.files.length);
@@ -1161,6 +1208,8 @@
       const d = state.downloadsView || {};
       const summary = d.summary || {};
       const win = d.window || {};
+      const selectedPath = normalizeExplorerPath((d && d.selected_path) || state.downloadsSelectedPath || "");
+      const selectedFile = d.selected_file || null;
       const filterPill = d.q ? ("<span class=\"pill\">filter=<code>" + esc(d.q) + "</code></span>") : "";
       const summaryGrid = [
         ["Range Downloads", summary.range_downloads || 0],
@@ -1177,6 +1226,7 @@
         return {
           sort: {
             path: f.path || "",
+            history: f.path || "",
             owner: f.owner || "",
             downloads_total: Number(f.downloads_total || 0),
             downloads_in_range: Number(f.downloads_in_range || 0),
@@ -1187,6 +1237,7 @@
           },
           cells: [
             pathWithExplorer(f.path || "", false),
+            downloadHistoryButton(f.path || "", normalizeExplorerPath(f.path || "") === selectedPath, normalizeExplorerPath(f.path || "") === selectedPath ? "Viewing" : "Open"),
             ownerCell(f.owner || "-"),
             esc(f.downloads_total || 0),
             "<div>" + esc(f.downloads_in_range || 0) + "</div><div class=\"muted\">users " + esc(f.unique_users_in_range || 0) + " · ips " + esc(f.unique_ips_in_range || 0) + "</div>",
@@ -1244,14 +1295,74 @@
         };
       });
 
+      const selectedHistoryRows = (d.selected_history || []).map(function(row) {
+        return {
+          sort: {
+            time: Number(row.timestamp || 0),
+            user_id: row.user_id || "",
+            ip: row.ip || "",
+            size: Number(row.size || 0),
+            duration_ms: Number(row.duration_ms || 0),
+            avg_bytes_per_sec: Number(row.avg_bytes_per_sec || 0),
+            session: row.session || ""
+          },
+          cells: [
+            "<code>" + esc(row.time || "") + "</code>",
+            ownerCell(row.user_id),
+            ipCell(row.ip),
+            esc(formatBytes(row.size || 0)),
+            esc(formatMs(row.duration_ms || 0)),
+            esc(formatBytes(row.avg_bytes_per_sec || 0) + "/s"),
+            sessionCell(row.session)
+          ]
+        };
+      });
+
+      let selectedHistoryBlock = "";
+      if (selectedPath) {
+        const selectedEnc = encodeURIComponent(selectedPath);
+        const lastDownloadText = selectedFile && selectedFile.last_download_time ? "<code>" + esc(selectedFile.last_download_time) + "</code>" : "<code>-</code>";
+        const lastUserText = selectedFile ? ownerCell(selectedFile.last_downloader || "-") : "<code>-</code>";
+        const lastIPText = selectedFile && selectedFile.last_ip ? ipCell(selectedFile.last_ip) : "<code>-</code>";
+        selectedHistoryBlock =
+          "<h3>Selected File History</h3>" +
+          "<div class=\"row\"><span class=\"pill\">File</span>" + pathWithExplorer(selectedPath, false) +
+            "<button class=\"tiny\" onclick=\"copyText(decodeURIComponent('" + selectedEnc + "'))\">Copy Path</button>" +
+            "<button class=\"tiny\" onclick=\"clearDownloadHistorySelection()\">Clear</button></div>" +
+          "<div class=\"row\"><span class=\"pill\">Owner</span>" + ownerCell((selectedFile && selectedFile.owner) || "-") +
+            "<span class=\"pill\">Size " + esc((selectedFile && (selectedFile.size_human || formatBytes(selectedFile.size || 0))) || "0 B") + "</span>" +
+            "<span class=\"pill\">All Time " + esc((selectedFile && selectedFile.downloads_total) || 0) + "</span>" +
+            "<span class=\"pill\">In Window " + esc((selectedFile && selectedFile.downloads_in_range) || 0) + "</span>" +
+            "<span class=\"pill\">Users " + esc((selectedFile && selectedFile.unique_users_in_range) || 0) + "</span>" +
+            "<span class=\"pill\">IPs " + esc((selectedFile && selectedFile.unique_ips_in_range) || 0) + "</span></div>" +
+          "<div class=\"muted\">Last download " + lastDownloadText + " by " + lastUserText + " from " + lastIPText + ". Window " + esc(win.label || state.timeRange) + ".</div>" +
+          renderSmartTable(
+            "downloads-selected-history",
+            [
+              {label:"Time", key:"time"},
+              {label:"User", key:"user_id"},
+              {label:"IP", key:"ip"},
+              {label:"Size", key:"size"},
+              {label:"Duration", key:"duration_ms"},
+              {label:"Rate", key:"avg_bytes_per_sec"},
+              {label:"Session", key:"session"}
+            ],
+            selectedHistoryRows,
+            "time",
+            "desc"
+          );
+      }
+
       document.getElementById("downloads-out").innerHTML =
         "<div class=\"row\"><span class=\"pill\">Window " + esc(win.label || state.timeRange) + "</span>" + filterPill + "</div>" +
         "<div class=\"grid\">" + summaryGrid + "</div>" +
+        selectedHistoryBlock +
         "<h3>Top Files</h3>" +
         renderSmartTable(
           "downloads-files",
           [
             {label:"Path", key:"path"},
+            {label:"History", key:"history"},
             {label:"Owner", key:"owner"},
             {label:"All Time", key:"downloads_total"},
             {label:"In Range", key:"downloads_in_range"},
