@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
@@ -10,7 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -44,9 +45,55 @@ var (
 	maxFileSize         int64
 	headerHTML          template.HTML
 	footerHTML          template.HTML
+	logger              = newExplorerLogger(os.Stderr)
 	errUploadBadRequest = errors.New("upload bad request")
 	errUploadFailed     = errors.New("upload failed")
 )
+
+// conditionalSourceHandler wraps an slog.Handler to hide source files on lower log levels.
+type conditionalSourceHandler struct {
+	slog.Handler
+}
+
+func (h conditionalSourceHandler) Handle(ctx context.Context, r slog.Record) error {
+	// If the log level is lower than WARN (e.g., INFO, DEBUG), zero out the Program Counter.
+	// This prevents the inner TextHandler's `AddSource: true` from extracting the file/line.
+	if r.Level < slog.LevelWarn {
+		r.PC = 0
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h conditionalSourceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return conditionalSourceHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+// WithGroup ensures that when logger.WithGroup() is called, our wrapper isn't lost.
+func (h conditionalSourceHandler) WithGroup(name string) slog.Handler {
+	return conditionalSourceHandler{Handler: h.Handler.WithGroup(name)}
+}
+
+func newExplorerLogger(out io.Writer) *slog.Logger {
+	innerHandler := slog.NewTextHandler(out, &slog.HandlerOptions{
+		AddSource: true,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.SourceKey {
+				source, _ := a.Value.Any().(*slog.Source)
+				if source == nil || source.File == "" {
+					return slog.Attr{} // drop it entirely
+				}
+				source.File = filepath.Base(source.File)
+			}
+			return a
+		},
+	})
+	return slog.New(conditionalSourceHandler{Handler: innerHandler})
+}
+
+func fatalLog(msg string, args ...any) {
+	logger.Error(msg, args...)
+	os.Exit(1)
+}
 
 type rotationAwareLogWriter struct {
 	path string
@@ -147,10 +194,10 @@ func watchLogReopenSignals(logFile *rotationAwareLogWriter) {
 	go func() {
 		for sig := range sigChan {
 			if err := logFile.Reopen(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to reopen log file after %s: %v\n", sig.String(), err)
+				logger.Error("failed to reopen log file", "signal", sig.String(), "err", err)
 				continue
 			}
-			log.Printf("reopened log file after signal %s", sig.String())
+			logger.Info("reopened log file", "signal", sig.String())
 		}
 	}()
 }
@@ -181,41 +228,64 @@ func main() {
 	if headerPath != "" {
 		b, err := os.ReadFile(headerPath)
 		if err != nil {
-			log.Fatalf("read header file %q: %v", headerPath, err)
+			fatalLog("read header file", "path", headerPath, "err", err)
 		}
 		headerHTML = template.HTML(b)
 	}
 	if footerPath != "" {
 		b, err := os.ReadFile(footerPath)
 		if err != nil {
-			log.Fatalf("read footer file %q: %v", footerPath, err)
+			fatalLog("read footer file", "path", footerPath, "err", err)
 		}
 		footerHTML = template.HTML(b)
 	}
 
 	lf, err := newRotationAwareLogWriter(logPath)
 	if err != nil {
-		log.Fatalf("open log: %v", err)
+		fatalLog("open log", "err", err)
 	}
-	log.SetOutput(io.MultiWriter(os.Stdout, lf))
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+	defer lf.Close()
+	logger = newExplorerLogger(io.MultiWriter(os.Stdout, lf))
 	watchLogReopenSignals(lf)
 
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
-		log.Fatalf("resolve root: %v", err)
+		fatalLog("resolve root", "err", err)
 	}
 	rootDir = abs
 
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
-		log.Fatalf("create root: %v", err)
+		fatalLog("create root", "path", rootDir, "err", err)
 	}
 
-	log.Printf("serving %s on :%s (max %d MB per upload)", rootDir, port, maxSizeMB)
-	log.Fatal(http.ListenAndServe(":"+port, http.HandlerFunc(logMiddleware)))
+	addr := ":" + port
+	logger.Info("serving explorer", "dir", rootDir, "addr", addr, "maxUploadMB", maxSizeMB)
+	server := &http.Server{
+		Addr:     addr,
+		Handler:  http.HandlerFunc(logMiddleware),
+		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
+	if err := server.ListenAndServe(); err != nil {
+		fatalLog("serve http", "addr", addr, "err", err)
+	}
 }
 
 // ── logging & security middleware ─────────────────────────────────────────────
+
+func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
+	l := base.With("ip", clientIP(r),
+		"unlocked", isUnlocked(r),
+		"method", r.Method,
+		"remote_address", r.RemoteAddr,
+		"path", r.URL.Path,
+		"query", r.URL.RawQuery,
+	)
+	fwd := forwardedClientIP(r)
+	if fwd != "" {
+		l = l.With("fwd", fwd)
+	}
+	return l
+}
 
 func logMiddleware(w http.ResponseWriter, r *http.Request) {
 	// Generate a random nonce for this request
@@ -227,14 +297,11 @@ func logMiddleware(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 
-	locked := "L"
-	if isUnlocked(r) {
-		locked = "U"
-	}
-	log.Printf("[%s][%s] %s %s %s", clientIP(r), locked, r.Method, r.URL.Path, r.URL.RawQuery)
+	reqLog := requestLogger(logger, r)
+	reqLog.Info("request")
 
 	// Pass nonce through request context or just handle it directly
-	handle(w, r, nonce)
+	handle(reqLog, w, r, nonce)
 }
 
 func generateNonce() string {
@@ -308,7 +375,7 @@ func normalizeIP(ip string) string {
 
 // ── routing ───────────────────────────────────────────────────────────────────
 
-func handle(w http.ResponseWriter, r *http.Request, nonce string) {
+func handle(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, nonce string) {
 	if isCrossOrigin(r) {
 		ext := strings.ToLower(filepath.Ext(r.URL.Path))
 		if ext != "" && ext != ".html" {
@@ -327,9 +394,9 @@ func handle(w http.ResponseWriter, r *http.Request, nonce string) {
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		handleGET(w, r, fullPath, relPath, nonce)
+		handleGET(reqLog, w, r, fullPath, relPath, nonce)
 	case http.MethodPost:
-		handlePOST(w, r, fullPath, relPath)
+		handlePOST(reqLog, w, r, fullPath, relPath)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -368,7 +435,7 @@ func isUnderRoot(fullPath string) bool {
 
 // ── GET/HEAD handler ──────────────────────────────────────────────────────────
 
-func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
+func handleGET(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -380,13 +447,13 @@ func handleGET(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce 
 	}
 
 	if info.IsDir() {
-		serveDir(w, r, fullPath, relPath, nonce)
+		serveDir(reqLog, w, r, fullPath, relPath, nonce)
 	} else {
-		serveFile(w, r, fullPath, info, relPath)
+		serveFile(reqLog, w, r, fullPath, info, relPath)
 	}
 }
 
-func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.FileInfo, relPath string) {
+func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullPath string, info os.FileInfo, relPath string) {
 	if !isUnlocked(r) && !isPublicPath(fullPath) {
 		parentRel := filepath.ToSlash(filepath.Dir(relPath))
 		if parentRel == "." {
@@ -406,7 +473,13 @@ func serveFile(w http.ResponseWriter, r *http.Request, fullPath string, info os.
 	tw := &transferLogWriter{ResponseWriter: w}
 	http.ServeFile(tw, r, fullPath)
 	duration := time.Since(start)
-	log.Printf("[%s] READ %s duration=%s size=%s avg=%s", clientIP(r), relPath, duration, fmtBytes(tw.bytes), fmtTransferRate(tw.bytes, duration))
+	reqLog.Info("download",
+		"file", relPath,
+		"duration", duration,
+		"bytes", tw.bytes,
+		"size", fmtBytes(tw.bytes),
+		"rate", fmtTransferRate(tw.bytes, duration),
+	)
 }
 
 // ── directory listing ─────────────────────────────────────────────────────────
@@ -431,7 +504,7 @@ func (e entry) SizeStr() string {
 }
 func (e entry) ModTimeStr() string { return e.ModTime.Format("2006-01-02 15:04") }
 
-func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
+func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
 	start := time.Now()
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -552,7 +625,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 
 	var body bytes.Buffer
 	if err := tmpl.Execute(&body, data); err != nil {
-		log.Printf("render directory %q: %v", relPath, err)
+		reqLog.Error("render directory", "dir", relPath, "err", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
@@ -564,7 +637,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 	}
 
 	if _, err := body.WriteTo(w); err != nil {
-		log.Printf("write directory %q: %v", relPath, err)
+		reqLog.Error("write directory", "dir", relPath, "err", err)
 	}
 }
 
@@ -690,9 +763,7 @@ func buildCrumbs(relPath string) []crumb {
 
 // ── upload (POST) ─────────────────────────────────────────────────────────────
 
-func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
-	ip := clientIP(r)
-
+func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -703,12 +774,12 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		return
 	}
 	if !info.IsDir() {
-		log.Printf("[%s] UPLOAD REJECTED: target is not a directory: %q", ip, relPath)
+		reqLog.Warn("upload rejected", "reason", "target is not a directory", "target", relPath)
 		http.Error(w, "Upload target must be a directory", http.StatusBadRequest)
 		return
 	}
 	if r.ContentLength > maxFileSize && r.ContentLength != -1 {
-		log.Printf("[%s] UPLOAD REJECTED: content length %d exceeds max %d", ip, r.ContentLength, maxFileSize)
+		reqLog.Warn("upload rejected", "reason", "content length exceeds max", "contentLength", r.ContentLength, "maxBytes", maxFileSize)
 		http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -719,19 +790,19 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		return
 	}
 	if !validateCSRFHeader(r) {
-		if ok, handled := validateMultipartCSRF(w, r, mr, ip); !ok {
+		if ok, handled := validateMultipartCSRF(reqLog, w, r, mr); !ok {
 			if handled {
 				return
 			}
-			log.Printf("[%s] UPLOAD REJECTED: invalid CSRF token", ip)
+			reqLog.Warn("upload rejected", "reason", "invalid CSRF token")
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 	}
 
-	savedCount, err := streamParts(mr, fullPath, ip)
+	savedCount, err := streamParts(reqLog, mr, fullPath)
 	if err != nil {
-		log.Printf("[%s] UPLOAD ERROR: %v", ip, err)
+		reqLog.Error("upload failed", "err", err)
 		if errors.Is(err, errUploadBadRequest) {
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
@@ -740,7 +811,7 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 		return
 	}
 	if savedCount == 0 {
-		log.Printf("[%s] UPLOAD REJECTED: no files", ip)
+		reqLog.Warn("upload rejected", "reason", "no files")
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
@@ -752,7 +823,7 @@ func handlePOST(w http.ResponseWriter, r *http.Request, fullPath, relPath string
 	http.Redirect(w, r, "/"+filepath.ToSlash(relPath), http.StatusSeeOther)
 }
 
-func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
+func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int, error) {
 	topRemap := map[string]string{}
 	createdTopDirs := []string{}
 	createdFiles := []string{}
@@ -806,7 +877,7 @@ func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 
 		destPath := filepath.Join(destDir, finalRel)
 		if !isUnderRoot(destPath) {
-			log.Printf("[%s] UPLOAD SKIP (traversal): %q", ip, rawName)
+			reqLog.Warn("upload skipped", "reason", "traversal", "file", rawName)
 			part.Close()
 			continue
 		}
@@ -831,7 +902,13 @@ func streamParts(mr *multipart.Reader, destDir, ip string) (int, error) {
 		if err != nil {
 			writtenRel = filepath.Base(writtenPath)
 		}
-		log.Printf("[%s] WRITE %s duration=%s size=%s avg=%s", ip, filepath.ToSlash(writtenRel), duration, fmtBytes(bytesWritten), fmtTransferRate(bytesWritten, duration))
+		reqLog.Info("upload",
+			"file", filepath.ToSlash(writtenRel),
+			"duration", duration,
+			"bytes", bytesWritten,
+			"size", fmtBytes(bytesWritten),
+			"rate", fmtTransferRate(bytesWritten, duration),
+		)
 		savedCount++
 		part.Close()
 	}
@@ -917,20 +994,20 @@ func validateCSRFValue(r *http.Request, token string) bool {
 	return err == nil && c.Value != "" && token != "" && token == c.Value
 }
 
-func validateMultipartCSRF(w http.ResponseWriter, r *http.Request, mr *multipart.Reader, ip string) (ok bool, handled bool) {
+func validateMultipartCSRF(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, mr *multipart.Reader) (ok bool, handled bool) {
 	csrfPart, err := mr.NextPart()
 	if err == io.EOF {
-		log.Printf("[%s] UPLOAD REJECTED: missing csrf_token part", ip)
+		reqLog.Warn("upload rejected", "reason", "missing csrf_token part")
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false, true
 	}
 	if err != nil {
-		log.Printf("[%s] UPLOAD REJECTED: invalid multipart before csrf: %v", ip, err)
+		reqLog.Warn("upload rejected", "reason", "invalid multipart before csrf", "err", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return false, true
 	}
 	if csrfPart.FormName() != "csrf_token" {
-		log.Printf("[%s] UPLOAD REJECTED: first part is %q, expected csrf_token", ip, csrfPart.FormName())
+		reqLog.Warn("upload rejected", "reason", "first part is not csrf_token", "part", csrfPart.FormName())
 		csrfPart.Close()
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false, true
@@ -939,7 +1016,7 @@ func validateMultipartCSRF(w http.ResponseWriter, r *http.Request, mr *multipart
 	tokenBytes, err := io.ReadAll(io.LimitReader(csrfPart, 128))
 	csrfPart.Close()
 	if err != nil {
-		log.Printf("[%s] UPLOAD REJECTED: could not read CSRF token: %v", ip, err)
+		reqLog.Warn("upload rejected", "reason", "could not read CSRF token", "err", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return false, true
 	}

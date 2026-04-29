@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"io"
-	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -142,18 +142,7 @@ func TestHandlePublicFileReadLogIncludesTransferStats(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 	mustWriteFile(t, filepath.Join(root, "public", "hello.txt"), "hello world")
 
-	var logBuf bytes.Buffer
-	oldWriter := log.Writer()
-	oldFlags := log.Flags()
-	oldPrefix := log.Prefix()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	log.SetPrefix("")
-	t.Cleanup(func() {
-		log.SetOutput(oldWriter)
-		log.SetFlags(oldFlags)
-		log.SetPrefix(oldPrefix)
-	})
+	logBuf := captureExplorerLogs(t)
 
 	w := serveExplorerRequest(http.MethodGet, "/public/hello.txt", nil)
 
@@ -162,13 +151,19 @@ func TestHandlePublicFileReadLogIncludesTransferStats(t *testing.T) {
 	}
 
 	line := logBuf.String()
-	if !strings.Contains(line, "READ public/hello.txt duration=") {
+	if !strings.Contains(line, "msg=download") {
+		t.Fatalf("log line missing read message, got %q", line)
+	}
+	if !strings.Contains(line, "file=public/hello.txt") {
+		t.Fatalf("log line missing file, got %q", line)
+	}
+	if !strings.Contains(line, "duration=") {
 		t.Fatalf("log line missing duration, got %q", line)
 	}
-	if !strings.Contains(line, "size=11 B") {
+	if !strings.Contains(line, "bytes=11") || !strings.Contains(line, `size="11 B"`) {
 		t.Fatalf("log line missing size, got %q", line)
 	}
-	if !regexp.MustCompile(`avg=(?:n/a|[0-9.]+ [KMGTPE]?B/s)`).MatchString(line) {
+	if !strings.Contains(line, "rate=") {
 		t.Fatalf("log line missing avg transfer rate, got %q", line)
 	}
 }
@@ -326,18 +321,7 @@ func TestHandleUploadWriteLogIncludesTransferStats(t *testing.T) {
 		}
 	})
 
-	var logBuf bytes.Buffer
-	oldWriter := log.Writer()
-	oldFlags := log.Flags()
-	oldPrefix := log.Prefix()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	log.SetPrefix("")
-	t.Cleanup(func() {
-		log.SetOutput(oldWriter)
-		log.SetFlags(oldFlags)
-		log.SetPrefix(oldPrefix)
-	})
+	logBuf := captureExplorerLogs(t)
 
 	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
 		{Name: cookieCSRF, Value: "csrf-upload"},
@@ -348,13 +332,19 @@ func TestHandleUploadWriteLogIncludesTransferStats(t *testing.T) {
 	}
 
 	line := logBuf.String()
-	if !strings.Contains(line, "WRITE report.txt duration=") {
+	if !strings.Contains(line, "msg=upload") {
+		t.Fatalf("log line missing write message, got %q", line)
+	}
+	if !strings.Contains(line, "file=report.txt") {
+		t.Fatalf("log line missing file, got %q", line)
+	}
+	if !strings.Contains(line, "duration=") {
 		t.Fatalf("log line missing duration, got %q", line)
 	}
-	if !strings.Contains(line, "size=11 B") {
+	if !strings.Contains(line, "bytes=11") || !strings.Contains(line, `size="11 B"`) {
 		t.Fatalf("log line missing size, got %q", line)
 	}
-	if !regexp.MustCompile(`avg=(?:0 B/s|[0-9.]+ [KMGTPE]?B/s)`).MatchString(line) {
+	if !strings.Contains(line, "rate=") {
 		t.Fatalf("log line missing avg transfer rate, got %q", line)
 	}
 }
@@ -789,6 +779,17 @@ func setupExplorerTestRoot(t *testing.T) string {
 	return rootDir
 }
 
+func captureExplorerLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	var logBuf bytes.Buffer
+	oldLogger := logger
+	logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	t.Cleanup(func() { logger = oldLogger })
+
+	return &logBuf
+}
+
 func serveExplorerRequest(method, target string, cookies []*http.Cookie) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, nil)
 	for _, cookie := range cookies {
@@ -796,7 +797,7 @@ func serveExplorerRequest(method, target string, cookies []*http.Cookie) *httpte
 	}
 
 	w := httptest.NewRecorder()
-	handle(w, req, "test-nonce")
+	handle(requestLogger(logger, req), w, req, "test-nonce")
 	return w
 }
 
@@ -815,7 +816,7 @@ func serveExplorerBodyRequest(method, target string, body io.Reader, contentType
 	}
 
 	w := httptest.NewRecorder()
-	handle(w, req, "test-nonce")
+	handle(requestLogger(logger, req), w, req, "test-nonce")
 	return w
 }
 
