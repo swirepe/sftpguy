@@ -82,7 +82,7 @@ func newLogger(out io.Writer) *slog.Logger {
 				}
 				src.File = filepath.Base(src.File)
 			}
-			if a.Value.Kind() == slog.KindString && a.Value.String() == "" {
+			if a.Value.Kind() == slog.KindString && (a.Value.String() == "" || a.Value.String() == "\"\"") {
 				return slog.Attr{} // drop empty values
 			}
 			return a
@@ -301,6 +301,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-%s';", nonce))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Form-Factors, Downlink, ECT, RTT, Sec-CH-Device-Memory, Sec-CH-UA-Arch, Sec-CH-UA-Platform-Version")
 
 	sr := &statusRecorder{
 		ResponseWriter: w,
@@ -310,7 +311,8 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	reqLog := requestLogger(logger, r)
 
 	handle(reqLog, sr, r, nonce)
-	reqLog.Info("request", "status", sr.status)
+	reqLog.Info("request",
+		"status", sr.status)
 }
 
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
@@ -323,12 +325,14 @@ func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
 		"query", r.URL.RawQuery,
 		"referer", r.Referer(),
 	)
+
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" && fwd != ip {
 		l = l.With("fwd", fwd)
 	}
 
 	if r.URL.Path == "/robots.txt" || r.URL.Path == "/favicon.ico" || r.Method == "POST" {
-		l = l.With("user_agent", r.Header.Get("user-agent"))
+		//l = l.With("user_agent", r.Header.Get("user-agent"))
+		l = l.With(clientLogGroup(r))
 	}
 
 	return l
@@ -495,6 +499,24 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		"bytes", tw.bytes,
 		"size", fmtBytes(tw.bytes),
 		"rate", fmtTransferRate(tw.bytes, dur),
+		clientLogGroup(r),
+	)
+
+}
+
+func clientLogGroup(r *http.Request) slog.Attr {
+	return slog.Group("client",
+		"user_agent", r.Header.Get("user-agent"),
+		"mobile", r.Header.Get("Sec-CH-UA-Mobile"), // ?0 for false, ?1 for true
+		"downlink", r.Header.Get("Downlink"), // downlink rate in Mbps, rounded to the nearest 25 kilobits.
+		"ect", r.Header.Get("ECT"), // effective connection type, e.g. 4g
+		"rtt", r.Header.Get("RTT"), // approximate round trip time in milliseconds, rounded to the nearest 25 milliseconds.
+		"model", r.Header.Get("Sec-CH-UA-Model"), // e.g. "Pixel 3 XL"
+		"platform", r.Header.Get("Sec-CH-UA-Platform"), // e.g. macOS, Android
+		"version", r.Header.Get("Sec-CH-UA-Platform-Version"), // e.g. "11.0.0". The version string on Linux is always empty.
+		"form_factors", r.Header.Get("Sec-CH-UA-Form-Factors"), // e.g. Desktop, Mobile, Automotive
+		"memory", r.Header.Get("Sec-CH-Device-Memory"), // approximate amount of available RAM on the client device, in gigabytes
+		"arch", r.Header.Get("Sec-CH-UA-Arch"), // e.g. arm
 	)
 }
 
@@ -811,6 +833,7 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 		}
 	}
 
+	reqLog = reqLog.With(clientLogGroup(r))
 	savedCount, err := streamParts(reqLog, mr, fullPath)
 	if err != nil {
 		reqLog.Error("upload failed", "err", err)
