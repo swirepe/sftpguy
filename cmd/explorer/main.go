@@ -440,6 +440,7 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 	q := r.URL.Query()
 	sortBy := q.Get("sort")
 	order := q.Get("order")
+	directorySortQuery := currentDirectorySortQuery(q)
 	if sortBy == "" {
 		sortBy = "name"
 	}
@@ -459,14 +460,14 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 		wantedFile = q.Get("wanted")
 	}
 
-	parentURL := ""
+	parentURL := template.URL("")
 	if relPath != "" {
 		parentRel := filepath.ToSlash(filepath.Dir(relPath))
 		if parentRel == "." {
 			parentRel = ""
 		}
 		u := url.URL{Path: "/" + parentRel}
-		parentURL = u.EscapedPath()
+		parentURL = template.URL(u.EscapedPath())
 		if parentURL == "" {
 			parentURL = "/"
 		}
@@ -494,23 +495,36 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 		return " ▼"
 	}
 
+	directoryLink := func(rawURL template.URL) template.URL {
+		if directorySortQuery == "" {
+			return rawURL
+		}
+		u, err := url.Parse(string(rawURL))
+		if err != nil {
+			return rawURL
+		}
+		u.RawQuery = directorySortQuery
+		return template.URL(u.String())
+	}
+
 	data := struct {
-		Title      string
-		DirLabel   string
-		Crumbs     []crumb
-		ParentURL  string
-		Entries    []entry
-		Unlocked   bool
-		IsPublic   bool
-		WantedFile string
-		CSRFToken  string
-		Nonce      string
-		SortLink   func(string) template.URL
-		Arrow      func(string) string
-		UploadPath string
-		Header     template.HTML
-		Footer     template.HTML
-		RenderTime time.Duration
+		Title         string
+		DirLabel      string
+		Crumbs        []crumb
+		ParentURL     template.URL
+		Entries       []entry
+		Unlocked      bool
+		IsPublic      bool
+		WantedFile    string
+		CSRFToken     string
+		Nonce         string
+		SortLink      func(string) template.URL
+		DirectoryLink func(template.URL) template.URL
+		Arrow         func(string) string
+		UploadPath    string
+		Header        template.HTML
+		Footer        template.HTML
+		RenderTime    time.Duration
 	}{
 		Title: "Index of /" + relPath,
 		DirLabel: func() string {
@@ -519,20 +533,21 @@ func serveDir(w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce s
 			}
 			return relPath
 		}(),
-		Crumbs:     buildCrumbs(relPath),
-		ParentURL:  parentURL,
-		Entries:    entries,
-		Unlocked:   isUnlocked(r),
-		IsPublic:   isPublicPath(fullPath),
-		WantedFile: wantedFile,
-		CSRFToken:  csrf,
-		Nonce:      nonce,
-		SortLink:   sortLink,
-		Arrow:      arrow,
-		UploadPath: (&url.URL{Path: "/" + relPath}).EscapedPath(),
-		Header:     headerHTML,
-		Footer:     footerHTML,
-		RenderTime: time.Since(start),
+		Crumbs:        buildCrumbs(relPath),
+		ParentURL:     parentURL,
+		Entries:       entries,
+		Unlocked:      isUnlocked(r),
+		IsPublic:      isPublicPath(fullPath),
+		WantedFile:    wantedFile,
+		CSRFToken:     csrf,
+		Nonce:         nonce,
+		SortLink:      sortLink,
+		DirectoryLink: directoryLink,
+		Arrow:         arrow,
+		UploadPath:    (&url.URL{Path: "/" + relPath}).EscapedPath(),
+		Header:        headerHTML,
+		Footer:        footerHTML,
+		RenderTime:    time.Since(start),
 	}
 
 	var body bytes.Buffer
@@ -588,6 +603,17 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 		})
 	}
 	return out, nil
+}
+
+func currentDirectorySortQuery(q url.Values) string {
+	uq := url.Values{}
+	if _, ok := q["sort"]; ok {
+		uq.Set("sort", q.Get("sort"))
+	}
+	if _, ok := q["order"]; ok {
+		uq.Set("order", q.Get("order"))
+	}
+	return uq.Encode()
 }
 
 func countDirItems(path string) int64 {
@@ -1077,7 +1103,7 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
 {{- range $i, $c := .Crumbs}}
   {{- if $i}}<span class="sep">/</span>{{end}}
   {{- if $c.IsCurrent}}<span class="cur">{{$c.Name}}</span>
-  {{- else}}<a href="{{$c.URL}}">{{$c.Name}}</a>{{end}}
+  {{- else}}<a href="{{call $.DirectoryLink $c.URL}}">{{$c.Name}}</a>{{end}}
 {{- end}}
 </nav>
 <h1>{{.Title}}</h1>
@@ -1117,12 +1143,12 @@ footer{ margin-top:28px; padding-top:12px; border-top:1px solid #eaeef2; font-si
   </tr>
 </thead>
 <tbody>
-{{if .ParentURL}}<tr><td colspan="3"><a href="{{.ParentURL}}">↑ Parent Directory</a></td></tr>{{end}}
+{{if .ParentURL}}<tr><td colspan="3"><a href="{{call .DirectoryLink .ParentURL}}">↑ Parent Directory</a></td></tr>{{end}}
 {{range .Entries}}
 <tr class="{{if .IsPublic}}public-row{{end}} {{if and .IsPublic .IsDir}}dir-link-public{{end}}">
   <td class="col-name">
     {{- if .IsDir}}
-      <a href="{{.URL}}" class="dir-link">
+      <a href="{{call $.DirectoryLink .URL}}" class="dir-link">
         <span class="dir-tag-desktop">[DIR]</span>
         <span class="dir-tag-mobile">📂</span>
         <span>{{.Name}}/</span>

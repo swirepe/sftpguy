@@ -43,6 +43,33 @@ func TestHandleDirectoryListingHighlightsPublicDirectoriesAndLockedFiles(t *test
 	}
 }
 
+func TestHandleDirectoryListingCarriesSortQueryOnDirectoryLinks(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	mustMkdir(t, filepath.Join(root, "docs", "manuals"))
+	mustMkdir(t, filepath.Join(root, "docs", "notes"))
+	mustWriteFile(t, filepath.Join(root, "docs", "readme.txt"), "hello")
+
+	w := serveExplorerRequest(http.MethodGet, "/docs?sort=modified&order=desc", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /docs status = %d, body=%s", w.Code, w.Body.String())
+	}
+
+	body := w.Body.String()
+	for _, want := range []string{
+		`<a href="/docs/manuals?order=desc&amp;sort=modified" class="dir-link">`,
+		`<a href="/docs/notes?order=desc&amp;sort=modified" class="dir-link">`,
+		`<a href="/?order=desc&amp;sort=modified">↑ Parent Directory</a>`,
+		`<a href="/?order=desc&amp;sort=modified">root</a>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected sorted directory link %q, body=%s", want, body)
+		}
+	}
+	if strings.Contains(body, `href="/docs/readme.txt?`) {
+		t.Fatalf("did not expect file download link to carry sort query, body=%s", body)
+	}
+}
+
 func TestHandlePublicDirectoryRendersBannerAndPublicDownloads(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 	mustMkdir(t, filepath.Join(root, "public", "assets"))
