@@ -82,6 +82,9 @@ func newLogger(out io.Writer) *slog.Logger {
 				}
 				src.File = filepath.Base(src.File)
 			}
+			if a.Value.Kind() == slog.KindString && a.Value.String() == "" {
+				return slog.Attr{} // drop empty values
+			}
 			return a
 		},
 	})
