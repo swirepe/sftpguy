@@ -279,6 +279,22 @@ func main() {
 
 // ── middleware & routing ──────────────────────────────────────────────────────
 
+type statusRecorder struct {
+	http.ResponseWriter
+	wroteHeader bool
+	status      int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	if sr.wroteHeader {
+		return
+	}
+
+	sr.status = code
+	sr.wroteHeader = true
+	sr.ResponseWriter.WriteHeader(code)
+}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	nonce := generateNonce()
 	w.Header().Set("Content-Security-Policy", fmt.Sprintf(
@@ -286,24 +302,31 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 
+	sr := &statusRecorder{
+		ResponseWriter: w,
+		status:         http.StatusOK,
+	}
+
 	reqLog := requestLogger(logger, r)
-	reqLog.Info("request")
-	handle(reqLog, w, r, nonce)
+
+	handle(reqLog, sr, r, nonce)
+	reqLog.Info("request", "status", sr.status)
 }
 
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
+	ip := clientIP(r)
 	l := base.With(
-		"ip", clientIP(r),
+		"ip", ip,
 		"unlocked", isUnlocked(r),
 		"method", r.Method,
 		"path", r.URL.Path,
 		"query", r.URL.RawQuery,
 	)
-	if fwd := forwardedClientIP(r); fwd != "" {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" && fwd != ip {
 		l = l.With("fwd", fwd)
 	}
 
-	if r.URL.Path == "/robots.txt" || r.URL.Path == "/favicon.ico" {
+	if r.URL.Path == "/robots.txt" || r.URL.Path == "/favicon.ico" || r.Method == "POST" {
 		l = l.With("user_agent", r.Header.Get("user-agent"))
 	}
 
