@@ -293,13 +293,17 @@ func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
 		"ip", clientIP(r),
 		"unlocked", isUnlocked(r),
 		"method", r.Method,
-		"remote_address", r.RemoteAddr,
 		"path", r.URL.Path,
 		"query", r.URL.RawQuery,
 	)
 	if fwd := forwardedClientIP(r); fwd != "" {
 		l = l.With("fwd", fwd)
 	}
+
+	if r.URL.Path == "/robots.txt" || r.URL.Path == "/favicon.ico" {
+		l = l.With("user_agent", r.Header.Get("user-agent"))
+	}
+
 	return l
 }
 
@@ -457,6 +461,7 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 	tw := &transferLogWriter{ResponseWriter: w}
 	http.ServeFile(tw, r, fullPath)
 	dur := time.Since(start)
+
 	reqLog.Info("download",
 		"file", relPath,
 		"duration", dur,
