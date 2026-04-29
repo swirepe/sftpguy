@@ -321,6 +321,7 @@ func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
 		"method", r.Method,
 		"path", r.URL.Path,
 		"query", r.URL.RawQuery,
+		"referer", r.Referer(),
 	)
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" && fwd != ip {
 		l = l.With("fwd", fwd)
