@@ -45,49 +45,47 @@ var (
 	maxFileSize         int64
 	headerHTML          template.HTML
 	footerHTML          template.HTML
-	logger              = newExplorerLogger(os.Stderr)
+	logger              = newLogger(os.Stderr)
 	errUploadBadRequest = errors.New("upload bad request")
 	errUploadFailed     = errors.New("upload failed")
 )
 
-// conditionalSourceHandler wraps an slog.Handler to hide source files on lower log levels.
-type conditionalSourceHandler struct {
-	slog.Handler
-}
+// ── logging ───────────────────────────────────────────────────────────────────
 
-func (h conditionalSourceHandler) Handle(ctx context.Context, r slog.Record) error {
-	// If the log level is lower than WARN (e.g., INFO, DEBUG), zero out the Program Counter.
-	// This prevents the inner TextHandler's `AddSource: true` from extracting the file/line.
+// sourceOnWarnHandler suppresses file:line source annotations for log levels
+// below WARN and includes them at WARN and above.
+type sourceOnWarnHandler struct{ slog.Handler }
+
+func (h sourceOnWarnHandler) Handle(ctx context.Context, r slog.Record) error {
 	if r.Level < slog.LevelWarn {
-		r.PC = 0
+		r.PC = 0 // zero PC prevents AddSource from resolving file/line
 	}
 	return h.Handler.Handle(ctx, r)
 }
 
-func (h conditionalSourceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return conditionalSourceHandler{Handler: h.Handler.WithAttrs(attrs)}
+func (h sourceOnWarnHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return sourceOnWarnHandler{h.Handler.WithAttrs(attrs)}
 }
 
-// WithGroup ensures that when logger.WithGroup() is called, our wrapper isn't lost.
-func (h conditionalSourceHandler) WithGroup(name string) slog.Handler {
-	return conditionalSourceHandler{Handler: h.Handler.WithGroup(name)}
+func (h sourceOnWarnHandler) WithGroup(name string) slog.Handler {
+	return sourceOnWarnHandler{h.Handler.WithGroup(name)}
 }
 
-func newExplorerLogger(out io.Writer) *slog.Logger {
-	innerHandler := slog.NewTextHandler(out, &slog.HandlerOptions{
+func newLogger(out io.Writer) *slog.Logger {
+	inner := slog.NewTextHandler(out, &slog.HandlerOptions{
 		AddSource: true,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.SourceKey {
-				source, _ := a.Value.Any().(*slog.Source)
-				if source == nil || source.File == "" {
-					return slog.Attr{} // drop it entirely
+				src, _ := a.Value.Any().(*slog.Source)
+				if src == nil || src.File == "" {
+					return slog.Attr{} // no source info — drop the key entirely
 				}
-				source.File = filepath.Base(source.File)
+				src.File = filepath.Base(src.File)
 			}
 			return a
 		},
 	})
-	return slog.New(conditionalSourceHandler{Handler: innerHandler})
+	return slog.New(sourceOnWarnHandler{inner})
 }
 
 func fatalLog(msg string, args ...any) {
@@ -95,9 +93,10 @@ func fatalLog(msg string, args ...any) {
 	os.Exit(1)
 }
 
+// ── log file with rotation support ───────────────────────────────────────────
+
 type rotationAwareLogWriter struct {
 	path string
-
 	mu   sync.Mutex
 	file *os.File
 }
@@ -117,14 +116,13 @@ func (w *rotationAwareLogWriter) Write(p []byte) (int, error) {
 	if err := w.ensureCurrentLocked(); err != nil {
 		return 0, err
 	}
-
 	n, err := w.file.Write(p)
 	if err == nil {
 		return n, nil
 	}
-
-	// Retry once after reopening so a stale descriptor from rotation
-	// does not permanently break file logging.
+	// Retry once — handles the case where a log rotator replaced the file
+	// and our descriptor went stale between the ensureCurrentLocked check above
+	// and the Write call.
 	if reopenErr := w.reopenLocked(); reopenErr != nil {
 		return n, err
 	}
@@ -134,14 +132,12 @@ func (w *rotationAwareLogWriter) Write(p []byte) (int, error) {
 func (w *rotationAwareLogWriter) Reopen() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	return w.reopenLocked()
 }
 
 func (w *rotationAwareLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	if w.file == nil {
 		return nil
 	}
@@ -154,21 +150,19 @@ func (w *rotationAwareLogWriter) ensureCurrentLocked() error {
 	if w.file == nil {
 		return w.reopenLocked()
 	}
-
-	currentInfo, err := w.file.Stat()
+	cur, err := w.file.Stat()
 	if err != nil {
 		return w.reopenLocked()
 	}
-
-	pathInfo, err := os.Stat(w.path)
+	onDisk, err := os.Stat(w.path)
 	if err == nil {
-		if os.SameFile(currentInfo, pathInfo) {
+		if os.SameFile(cur, onDisk) {
 			return nil
 		}
 		return w.reopenLocked()
 	}
 	if os.IsNotExist(err) {
-		// Keep writing to the old descriptor until rotation recreates the path.
+		// Path was removed; keep writing to the old fd until rotation recreates it.
 		return nil
 	}
 	return err
@@ -179,27 +173,40 @@ func (w *rotationAwareLogWriter) reopenLocked() error {
 	if err != nil {
 		return err
 	}
-	oldFile := w.file
-	w.file = f
-	if oldFile != nil {
-		_ = oldFile.Close()
+	if w.file != nil {
+		_ = w.file.Close()
 	}
+	w.file = f
 	return nil
 }
 
-func watchLogReopenSignals(logFile *rotationAwareLogWriter) {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP)
-
+// watchSIGHUP listens for SIGHUP and reopens the log file, supporting
+// log-rotation tools that move the current file and expect writers to reopen.
+func watchSIGHUP(lf *rotationAwareLogWriter) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
 	go func() {
-		for sig := range sigChan {
-			if err := logFile.Reopen(); err != nil {
-				logger.Error("failed to reopen log file", "signal", sig.String(), "err", err)
+		for sig := range ch {
+			if err := lf.Reopen(); err != nil {
+				logger.Error("log reopen failed", "signal", sig, "err", err)
 				continue
 			}
-			logger.Info("reopened log file", "signal", sig.String())
+			logger.Info("log reopened", "signal", sig)
 		}
 	}()
+}
+
+// initLogger wires the global logger to both stdout and the given log file,
+// and installs a SIGHUP handler for log rotation. It returns the log file
+// writer so the caller can close it on shutdown.
+func initLogger(logPath string) (*rotationAwareLogWriter, error) {
+	lf, err := newRotationAwareLogWriter(logPath)
+	if err != nil {
+		return nil, err
+	}
+	logger = newLogger(io.MultiWriter(os.Stdout, lf))
+	watchSIGHUP(lf)
+	return lf, nil
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -215,7 +222,6 @@ func main() {
 	flag.StringVar(&headerPath, "header", "", "Path to an HTML fragment to inject at the top of every page")
 	flag.StringVar(&footerPath, "footer", "", "Path to an HTML fragment to inject at the bottom of every page")
 	src := flag.Bool("src", false, "Print this program's source and exit")
-
 	flag.Parse()
 
 	if *src {
@@ -240,13 +246,11 @@ func main() {
 		footerHTML = template.HTML(b)
 	}
 
-	lf, err := newRotationAwareLogWriter(logPath)
+	lf, err := initLogger(logPath)
 	if err != nil {
 		fatalLog("open log", "err", err)
 	}
 	defer lf.Close()
-	logger = newExplorerLogger(io.MultiWriter(os.Stdout, lf))
-	watchLogReopenSignals(lf)
 
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
@@ -262,7 +266,7 @@ func main() {
 	logger.Info("serving explorer", "dir", rootDir, "addr", addr, "maxUploadMB", maxSizeMB)
 	server := &http.Server{
 		Addr:     addr,
-		Handler:  http.HandlerFunc(logMiddleware),
+		Handler:  http.HandlerFunc(rootHandler),
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	if err := server.ListenAndServe(); err != nil {
@@ -270,38 +274,33 @@ func main() {
 	}
 }
 
-// ── logging & security middleware ─────────────────────────────────────────────
+// ── middleware & routing ──────────────────────────────────────────────────────
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	nonce := generateNonce()
+	w.Header().Set("Content-Security-Policy", fmt.Sprintf(
+		"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-%s';", nonce))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+
+	reqLog := requestLogger(logger, r)
+	reqLog.Info("request")
+	handle(reqLog, w, r, nonce)
+}
 
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
-	l := base.With("ip", clientIP(r),
+	l := base.With(
+		"ip", clientIP(r),
 		"unlocked", isUnlocked(r),
 		"method", r.Method,
 		"remote_address", r.RemoteAddr,
 		"path", r.URL.Path,
 		"query", r.URL.RawQuery,
 	)
-	fwd := forwardedClientIP(r)
-	if fwd != "" {
+	if fwd := forwardedClientIP(r); fwd != "" {
 		l = l.With("fwd", fwd)
 	}
 	return l
-}
-
-func logMiddleware(w http.ResponseWriter, r *http.Request) {
-	// Generate a random nonce for this request
-	nonce := generateNonce()
-
-	// Update CSP to allow scripts only with this specific nonce
-	csp := fmt.Sprintf("default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-%s';", nonce)
-	w.Header().Set("Content-Security-Policy", csp)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-
-	reqLog := requestLogger(logger, r)
-	reqLog.Info("request")
-
-	// Pass nonce through request context or just handle it directly
-	handle(reqLog, w, r, nonce)
 }
 
 func generateNonce() string {
@@ -309,6 +308,8 @@ func generateNonce() string {
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// ── IP helpers ────────────────────────────────────────────────────────────────
 
 func clientIP(r *http.Request) string {
 	peer := remoteIP(r)
@@ -318,15 +319,14 @@ func clientIP(r *http.Request) string {
 	if !isTrustedProxy(peer) {
 		return peer
 	}
-
-	forwarded := forwardedClientIP(r)
-	if forwarded == "" || forwarded == peer {
+	fwd := forwardedClientIP(r)
+	if fwd == "" || fwd == peer {
 		return peer
 	}
 	if isLoopbackIP(peer) {
-		return forwarded
+		return fwd
 	}
-	return fmt.Sprintf("%s via %s", forwarded, peer)
+	return fmt.Sprintf("%s via %s", fwd, peer)
 }
 
 func remoteIP(r *http.Request) string {
@@ -339,38 +339,28 @@ func remoteIP(r *http.Request) string {
 
 func forwardedClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			if ip := normalizeIP(strings.TrimSpace(ips[0])); ip != "" {
-				return ip
-			}
+		if ip := normalizeIP(strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])); ip != "" {
+			return ip
 		}
 	}
-	if ip := normalizeIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != "" {
-		return ip
-	}
-	return ""
+	return normalizeIP(strings.TrimSpace(r.Header.Get("X-Real-IP")))
 }
 
 func isTrustedProxy(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	return parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast()
+	p := net.ParseIP(ip)
+	return p != nil && (p.IsLoopback() || p.IsPrivate() || p.IsLinkLocalUnicast())
 }
 
 func isLoopbackIP(ip string) bool {
-	parsed := net.ParseIP(ip)
-	return parsed != nil && parsed.IsLoopback()
+	p := net.ParseIP(ip)
+	return p != nil && p.IsLoopback()
 }
 
 func normalizeIP(ip string) string {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return ""
+	if p := net.ParseIP(ip); p != nil {
+		return p.String()
 	}
-	return parsed.String()
+	return ""
 }
 
 // ── routing ───────────────────────────────────────────────────────────────────
@@ -403,12 +393,10 @@ func handle(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, nonce s
 }
 
 func isCrossOrigin(r *http.Request) bool {
-	site := r.Header.Get("Sec-Fetch-Site")
-	if site != "" && site != "same-origin" && site != "none" {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return true
 	}
-	ref := r.Header.Get("Referer")
-	if ref != "" {
+	if ref := r.Header.Get("Referer"); ref != "" {
 		u, err := url.Parse(ref)
 		if err != nil || u.Host != r.Host {
 			return true
@@ -427,10 +415,7 @@ func cleanRelPath(urlPath string) string {
 
 func isUnderRoot(fullPath string) bool {
 	rel, err := filepath.Rel(rootDir, fullPath)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, "..")
+	return err == nil && !strings.HasPrefix(rel, "..")
 }
 
 // ── GET/HEAD handler ──────────────────────────────────────────────────────────
@@ -445,7 +430,6 @@ func handleGET(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		}
 		return
 	}
-
 	if info.IsDir() {
 		serveDir(reqLog, w, r, fullPath, relPath, nonce)
 	} else {
@@ -472,13 +456,13 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 	start := time.Now()
 	tw := &transferLogWriter{ResponseWriter: w}
 	http.ServeFile(tw, r, fullPath)
-	duration := time.Since(start)
+	dur := time.Since(start)
 	reqLog.Info("download",
 		"file", relPath,
-		"duration", duration,
+		"duration", dur,
 		"bytes", tw.bytes,
 		"size", fmtBytes(tw.bytes),
-		"rate", fmtTransferRate(tw.bytes, duration),
+		"rate", fmtTransferRate(tw.bytes, dur),
 	)
 }
 
@@ -502,6 +486,7 @@ func (e entry) SizeStr() string {
 	}
 	return fmtBytes(e.Size)
 }
+
 func (e entry) ModTimeStr() string { return e.ModTime.Format("2006-01-02 15:04") }
 
 func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullPath, relPath, nonce string) {
@@ -509,17 +494,17 @@ func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullP
 	w.Header().Set("Cache-Control", "no-store")
 
 	csrf := csrfToken(w, r)
-
 	q := r.URL.Query()
+
 	sortBy := q.Get("sort")
-	order := q.Get("order")
-	directorySortQuery := currentDirectorySortQuery(q)
 	if sortBy == "" {
 		sortBy = "name"
 	}
+	order := q.Get("order")
 	if order == "" {
 		order = "asc"
 	}
+	directorySortQuery := currentDirectorySortQuery(q)
 
 	entries, err := readDir(fullPath, relPath)
 	if err != nil {
@@ -554,8 +539,7 @@ func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullP
 		uq := url.Values{}
 		uq.Set("sort", col)
 		uq.Set("order", o)
-		u := url.URL{Path: r.URL.Path, RawQuery: uq.Encode()}
-		return template.URL(u.String())
+		return template.URL((&url.URL{Path: r.URL.Path, RawQuery: uq.Encode()}).String())
 	}
 
 	arrow := func(col string) string {
@@ -635,7 +619,6 @@ func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullP
 	if r.Method == http.MethodHead {
 		return
 	}
-
 	if _, err := body.WriteTo(w); err != nil {
 		reqLog.Error("write directory", "dir", relPath, "err", err)
 	}
@@ -651,7 +634,6 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 		if de.IsDir() && shouldHideListedDirectory(de.Name()) {
 			continue
 		}
-
 		info, err := de.Info()
 		if err != nil {
 			continue
@@ -659,18 +641,18 @@ func readDir(fullPath, relPath string) ([]entry, error) {
 		entryPath := filepath.Join(fullPath, de.Name())
 		entRel := filepath.ToSlash(filepath.Join(relPath, de.Name()))
 
-		var sizeVal int64
+		var sz int64
 		if de.IsDir() {
-			sizeVal = countDirItems(entryPath)
+			sz = countDirItems(entryPath)
 		} else {
-			sizeVal = info.Size()
+			sz = info.Size()
 		}
 
 		out = append(out, entry{
 			Name:     de.Name(),
 			IsDir:    de.IsDir(),
 			IsPublic: isPublicPath(entryPath),
-			Size:     sizeVal,
+			Size:     sz,
 			ModTime:  info.ModTime(),
 			URL:      template.URL((&url.URL{Path: "/" + entRel}).EscapedPath()),
 		})
@@ -691,23 +673,17 @@ func currentDirectorySortQuery(q url.Values) string {
 
 func countDirItems(path string) int64 {
 	des, _ := os.ReadDir(path)
-	var count int64
+	var n int64
 	for _, de := range des {
-		if de.IsDir() && shouldHideListedDirectory(de.Name()) {
-			continue
+		if !(de.IsDir() && shouldHideListedDirectory(de.Name())) {
+			n++
 		}
-		count++
 	}
-	return count
+	return n
 }
 
 func shouldHideListedDirectory(name string) bool {
-	switch name {
-	case "#recycle", "@eaDir":
-		return true
-	default:
-		return false
-	}
+	return name == "#recycle" || name == "@eaDir"
 }
 
 func sortEntries(entries []entry, by, order string) {
@@ -779,23 +755,26 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 		return
 	}
 	if r.ContentLength > maxFileSize && r.ContentLength != -1 {
-		reqLog.Warn("upload rejected", "reason", "content length exceeds max", "contentLength", r.ContentLength, "maxBytes", maxFileSize)
+		reqLog.Warn("upload rejected", "reason", "content length exceeds max",
+			"contentLength", r.ContentLength, "maxBytes", maxFileSize)
 		http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
+
 	if !validateCSRFHeader(r) {
-		if ok, handled := validateMultipartCSRF(reqLog, w, r, mr); !ok {
-			if handled {
-				return
+		ok, handled := validateMultipartCSRF(reqLog, w, r, mr)
+		if !ok {
+			if !handled {
+				reqLog.Warn("upload rejected", "reason", "invalid CSRF token")
+				http.Error(w, "Forbidden", http.StatusForbidden)
 			}
-			reqLog.Warn("upload rejected", "reason", "invalid CSRF token")
-			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 	}
@@ -805,9 +784,9 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 		reqLog.Error("upload failed", "err", err)
 		if errors.Is(err, errUploadBadRequest) {
 			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
+		} else {
+			http.Error(w, "Upload failed", http.StatusInternalServerError)
 		}
-		http.Error(w, "Upload failed", http.StatusInternalServerError)
 		return
 	}
 	if savedCount == 0 {
@@ -817,18 +796,23 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name: cookieUnlock, Value: "true", Path: "/",
-		HttpOnly: true, MaxAge: 86400 * 30, SameSite: http.SameSiteStrictMode,
+		Name:     cookieUnlock,
+		Value:    "true",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   86400 * 30,
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/"+filepath.ToSlash(relPath), http.StatusSeeOther)
 }
 
 func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int, error) {
 	topRemap := map[string]string{}
-	createdTopDirs := []string{}
-	createdFiles := []string{}
+	var createdTopDirs []string
+	var createdFiles []string
 	savedCount := 0
-	cleanupCreatedPaths := func() {
+
+	cleanup := func() {
 		for i := len(createdFiles) - 1; i >= 0; i-- {
 			_ = os.Remove(createdFiles[i])
 		}
@@ -836,13 +820,14 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 			_ = os.RemoveAll(createdTopDirs[i])
 		}
 	}
+
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			return savedCount, nil
 		}
 		if err != nil {
-			cleanupCreatedPaths()
+			cleanup()
 			return savedCount, fmt.Errorf("%w: reading multipart: %v", errUploadBadRequest, err)
 		}
 
@@ -864,7 +849,7 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 				actual, err := atomicMkdirUnique(filepath.Join(destDir, topName))
 				if err != nil {
 					part.Close()
-					cleanupCreatedPaths()
+					cleanup()
 					return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Join(destDir, topName), err)
 				}
 				topRemap[topName] = filepath.Base(actual)
@@ -884,30 +869,33 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			part.Close()
-			cleanupCreatedPaths()
+			cleanup()
 			return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Dir(destPath), err)
 		}
-		writtenPath, bytesWritten, duration, err := writeFileAtomic(part, destPath, !isNested)
+
+		writtenPath, bytesWritten, dur, err := writeFileAtomic(part, destPath, !isNested)
 		if err != nil {
 			part.Close()
-			cleanupCreatedPaths()
+			cleanup()
 			var pathErr *os.PathError
 			if errors.As(err, &pathErr) {
 				return savedCount, fmt.Errorf("%w: write %q: %v", errUploadFailed, finalRel, err)
 			}
 			return savedCount, fmt.Errorf("%w: write %q: %v", errUploadBadRequest, finalRel, err)
 		}
+
 		createdFiles = append(createdFiles, writtenPath)
+
 		writtenRel, err := filepath.Rel(rootDir, writtenPath)
 		if err != nil {
 			writtenRel = filepath.Base(writtenPath)
 		}
 		reqLog.Info("upload",
 			"file", filepath.ToSlash(writtenRel),
-			"duration", duration,
+			"duration", dur,
 			"bytes", bytesWritten,
 			"size", fmtBytes(bytesWritten),
-			"rate", fmtTransferRate(bytesWritten, duration),
+			"rate", fmtTransferRate(bytesWritten, dur),
 		)
 		savedCount++
 		part.Close()
@@ -919,16 +907,13 @@ func partFilename(p *multipart.Part) string {
 	if err != nil {
 		return ""
 	}
-	name := params["filename"]
-	if name == "" {
-		return ""
-	}
-	return name
+	return params["filename"]
 }
 
 func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, bytesWritten int64, duration time.Duration, err error) {
 	var f *os.File
 	finalPath = path
+
 	if !uniqueNaming {
 		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	} else {
@@ -944,16 +929,17 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath str
 	if err != nil {
 		return "", 0, 0, err
 	}
+
 	defer func() {
 		f.Close()
 		if err != nil {
 			os.Remove(f.Name())
 		}
 	}()
+
 	start := time.Now()
 	bytesWritten, err = io.Copy(f, r)
-	duration = time.Since(start)
-	return f.Name(), bytesWritten, duration, err
+	return f.Name(), bytesWritten, time.Since(start), err
 }
 
 func atomicMkdirUnique(path string) (string, error) {
@@ -969,6 +955,8 @@ func atomicMkdirUnique(path string) (string, error) {
 	return "", errors.New("mkdir collision")
 }
 
+// ── CSRF ──────────────────────────────────────────────────────────────────────
+
 func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	if c, err := r.Cookie(cookieCSRF); err == nil && len(c.Value) == 64 {
 		return c.Value
@@ -976,7 +964,14 @@ func csrfToken(w http.ResponseWriter, r *http.Request) string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	token := hex.EncodeToString(b)
-	http.SetCookie(w, &http.Cookie{Name: cookieCSRF, Value: token, Path: "/", HttpOnly: true, MaxAge: 86400 * 30, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieCSRF,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   86400 * 30,
+		SameSite: http.SameSiteStrictMode,
+	})
 	return token
 }
 
@@ -995,7 +990,7 @@ func validateCSRFValue(r *http.Request, token string) bool {
 }
 
 func validateMultipartCSRF(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, mr *multipart.Reader) (ok bool, handled bool) {
-	csrfPart, err := mr.NextPart()
+	part, err := mr.NextPart()
 	if err == io.EOF {
 		reqLog.Warn("upload rejected", "reason", "missing csrf_token part")
 		http.Error(w, "Forbidden", http.StatusForbidden)
@@ -1006,15 +1001,14 @@ func validateMultipartCSRF(reqLog *slog.Logger, w http.ResponseWriter, r *http.R
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return false, true
 	}
-	if csrfPart.FormName() != "csrf_token" {
-		reqLog.Warn("upload rejected", "reason", "first part is not csrf_token", "part", csrfPart.FormName())
-		csrfPart.Close()
+	if part.FormName() != "csrf_token" {
+		reqLog.Warn("upload rejected", "reason", "first part is not csrf_token", "part", part.FormName())
+		part.Close()
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return false, true
 	}
-
-	tokenBytes, err := io.ReadAll(io.LimitReader(csrfPart, 128))
-	csrfPart.Close()
+	tokenBytes, err := io.ReadAll(io.LimitReader(part, 128))
+	part.Close()
 	if err != nil {
 		reqLog.Warn("upload rejected", "reason", "could not read CSRF token", "err", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
@@ -1022,6 +1016,8 @@ func validateMultipartCSRF(reqLog *slog.Logger, w http.ResponseWriter, r *http.R
 	}
 	return validateCSRFValue(r, string(tokenBytes)), false
 }
+
+// ── auth helpers ──────────────────────────────────────────────────────────────
 
 func isUnlocked(r *http.Request) bool {
 	c, err := r.Cookie(cookieUnlock)
@@ -1032,10 +1028,11 @@ func isPublicPath(fullPath string) bool {
 	if strings.HasSuffix(fullPath, "/robots.txt") || strings.HasSuffix(fullPath, "/favicon.ico") {
 		return true
 	}
-
 	rel, err := filepath.Rel(filepath.Join(rootDir, "public"), fullPath)
 	return err == nil && !strings.HasPrefix(rel, "..")
 }
+
+// ── formatting helpers ────────────────────────────────────────────────────────
 
 func fmtBytes(b int64) string {
 	if b < 1024 {
@@ -1071,6 +1068,8 @@ func fmtBytesFloat(b float64) string {
 	return fmt.Sprintf("%.1f %cB", b/div, "KMGTPE"[exp])
 }
 
+// ── response writer wrapper ───────────────────────────────────────────────────
+
 type transferLogWriter struct {
 	http.ResponseWriter
 	bytes int64
@@ -1088,9 +1087,7 @@ func (w *transferLogWriter) ReadFrom(r io.Reader) (int64, error) {
 	return n, err
 }
 
-func (w *transferLogWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
+func (w *transferLogWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // ── template ──────────────────────────────────────────────────────────────────
 
