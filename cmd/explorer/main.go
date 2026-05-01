@@ -185,7 +185,7 @@ func (w *rotationAwareLogWriter) reopenLocked() error {
 
 // watchSIGHUP listens for SIGHUP and reopens the log file, supporting
 // log-rotation tools that move the current file and expect writers to reopen.
-func watchSIGHUP(lf *rotationAwareLogWriter) {
+func watchSIGHUP(lf *rotationAwareLogWriter) (stop func()) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	go func() {
@@ -197,19 +197,23 @@ func watchSIGHUP(lf *rotationAwareLogWriter) {
 			logger.Info("log reopened", "signal", sig)
 		}
 	}()
+	return func() {
+		signal.Stop(ch)
+		close(ch)
+	}
 }
 
 // initLogger wires the global logger to both stdout and the given log file,
 // and installs a SIGHUP handler for log rotation. It returns the log file
 // writer so the caller can close it on shutdown.
-func initLogger(logPath string) (*rotationAwareLogWriter, error) {
+func initLogger(logPath string) (*rotationAwareLogWriter, func(), error) {
 	lf, err := newRotationAwareLogWriter(logPath)
 	if err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
 	logger = newLogger(io.MultiWriter(os.Stdout, lf))
-	watchSIGHUP(lf)
-	return lf, nil
+	stop := watchSIGHUP(lf)
+	return lf, stop, nil
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -249,11 +253,16 @@ func main() {
 		footerHTML = template.HTML(b)
 	}
 
-	lf, err := initLogger(logPath)
+	start := time.Now()
+	lf, stop, err := initLogger(logPath)
 	if err != nil {
 		fatalLog("open log", "err", err)
 	}
-	defer lf.Close()
+	defer func() {
+		logger.Info("Logger closing", "uptime", time.Since(start))
+		stop()
+		lf.Close()
+	}()
 
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
@@ -272,9 +281,32 @@ func main() {
 		Handler:  http.HandlerFunc(rootHandler),
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
-	if err := server.ListenAndServe(); err != nil {
+	// Run server in background so we can wait for a signal.
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	// Wait for SIGINT/SIGTERM or a fatal server error.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErr:
 		fatalLog("serve http", "addr", addr, "err", err)
+	case sig := <-quit:
+		logger.Info("shutting down", "signal", sig)
 	}
+
+	// Give in-flight requests up to 60 s to finish.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		fatalLog("shutdown", "err", err)
+	}
+	logger.Info("shutdown complete")
 }
 
 // ── middleware & routing ──────────────────────────────────────────────────────
@@ -1080,7 +1112,7 @@ func isUnlocked(r *http.Request) bool {
 }
 
 func isPublicPath(fullPath string) bool {
-	if strings.HasSuffix(fullPath, "/robots.txt") || strings.HasSuffix(fullPath, "/favicon.ico") {
+	if fullPath == filepath.Join(rootDir, "robots.txt") || fullPath == filepath.Join(rootDir, "favicon.ico") {
 		return true
 	}
 	rel, err := filepath.Rel(filepath.Join(rootDir, "public"), fullPath)
