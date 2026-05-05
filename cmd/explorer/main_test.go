@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -753,6 +755,47 @@ func TestRotationAwareLogWriterReopensAfterRenameRotation(t *testing.T) {
 	}
 	if got := mustReadFile(t, logPath); got != "after rotation\n" {
 		t.Fatalf("replacement file contents = %q, want %q", got, "after rotation\n")
+	}
+}
+
+func TestWaitForShutdownStopsSignalNotifications(t *testing.T) {
+	serverErr := make(chan error)
+	quit := make(chan os.Signal, 1)
+	quit <- syscall.SIGTERM
+
+	stopCalled := false
+	sig, err := waitForShutdown(serverErr, quit, func(ch chan<- os.Signal) {
+		stopCalled = true
+	})
+	if err != nil {
+		t.Fatalf("waitForShutdown error = %v, want nil", err)
+	}
+	if sig != syscall.SIGTERM {
+		t.Fatalf("waitForShutdown signal = %v, want %v", sig, syscall.SIGTERM)
+	}
+	if !stopCalled {
+		t.Fatalf("waitForShutdown did not stop signal notifications")
+	}
+}
+
+func TestWaitForShutdownReturnsServerErrorWithoutStoppingSignals(t *testing.T) {
+	wantErr := errors.New("listen failed")
+	serverErr := make(chan error, 1)
+	serverErr <- wantErr
+	quit := make(chan os.Signal)
+
+	stopCalled := false
+	sig, err := waitForShutdown(serverErr, quit, func(ch chan<- os.Signal) {
+		stopCalled = true
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("waitForShutdown error = %v, want %v", err, wantErr)
+	}
+	if sig != nil {
+		t.Fatalf("waitForShutdown signal = %v, want nil", sig)
+	}
+	if stopCalled {
+		t.Fatalf("waitForShutdown stopped signal notifications on server error")
 	}
 }
 

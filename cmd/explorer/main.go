@@ -293,12 +293,11 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case err := <-serverErr:
+	sig, err := waitForShutdown(serverErr, quit, signal.Stop)
+	if err != nil {
 		fatalLog("serve http", "addr", addr, "err", err)
-	case sig := <-quit:
-		logger.Info("shutting down", "signal", sig)
 	}
+	logger.Info("shutting down", "signal", sig)
 
 	// Give in-flight requests up to 60 s to finish.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -307,6 +306,16 @@ func main() {
 		fatalLog("shutdown", "err", err)
 	}
 	logger.Info("shutdown complete")
+}
+
+func waitForShutdown(serverErr <-chan error, quit chan os.Signal, stopSignal func(chan<- os.Signal)) (os.Signal, error) {
+	select {
+	case err := <-serverErr:
+		return nil, err
+	case sig := <-quit:
+		stopSignal(quit)
+		return sig, nil
+	}
 }
 
 // ── middleware & routing ──────────────────────────────────────────────────────
