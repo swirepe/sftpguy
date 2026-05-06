@@ -228,7 +228,7 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 		IP             string `json:"ip"`
 		Path           string `json:"path"`
 		Size           int64  `json:"size"`
-		DurationMS     int64  `json:"duration_ms"`
+		DurationMS     float64 `json:"duration_ms"`
 		AvgBytesPerSec int64  `json:"avg_bytes_per_sec"`
 		Session        string `json:"session"`
 	}
@@ -274,7 +274,7 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 		}
 		metaObj := parseJSONMap(meta)
 		row.Size = int64FromAny(metaObj["size"])
-		row.DurationMS = int64FromAny(metaObj["duration_ms"])
+		row.DurationMS = float64FromAny(metaObj["duration_ms"])
 		row.AvgBytesPerSec = int64FromAny(metaObj["avg_bytes_per_sec"])
 		row.Time = formatUnix(row.Timestamp)
 		recent = append(recent, row)
@@ -355,7 +355,7 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 			}
 			metaObj := parseJSONMap(meta)
 			row.Size = int64FromAny(metaObj["size"])
-			row.DurationMS = int64FromAny(metaObj["duration_ms"])
+			row.DurationMS = float64FromAny(metaObj["duration_ms"])
 			row.AvgBytesPerSec = int64FromAny(metaObj["avg_bytes_per_sec"])
 			row.Time = formatUnix(row.Timestamp)
 			selectedHistory = append(selectedHistory, row)

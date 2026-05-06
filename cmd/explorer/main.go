@@ -25,6 +25,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"sftpguy/internal/explorerevents"
+	"sftpguy/internal/socketactivation"
 )
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -46,6 +49,7 @@ var (
 	headerHTML          template.HTML
 	footerHTML          template.HTML
 	logger              = newLogger(os.Stderr)
+	eventClient         *explorerevents.Client
 	errUploadBadRequest = errors.New("upload bad request")
 	errUploadFailed     = errors.New("upload failed")
 )
@@ -219,13 +223,14 @@ func initLogger(logPath string) (*rotationAwareLogWriter, func(), error) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	var logPath, port, headerPath, footerPath string
+	var logPath, port, headerPath, footerPath, eventsSocket string
 	var maxSizeMB int64
 
 	flag.StringVar(&rootDir, "dir", "./shared", "Directory to serve")
 	flag.StringVar(&port, "port", "8080", "Port to listen on")
 	flag.Int64Var(&maxSizeMB, "maxsize", 1000, "Max upload size in MB")
 	flag.StringVar(&logPath, "log", "explorer.log", "Log file path")
+	flag.StringVar(&eventsSocket, "events", "", "Unix socket path for sending upload/download/request events to sftpguy")
 	flag.StringVar(&headerPath, "header", "", "Path to an HTML fragment to inject at the top of every page")
 	flag.StringVar(&footerPath, "footer", "", "Path to an HTML fragment to inject at the bottom of every page")
 	src := flag.Bool("src", false, "Print this program's source and exit")
@@ -260,9 +265,11 @@ func main() {
 	}
 	defer func() {
 		logger.Info("Logger closing", "uptime", time.Since(start))
+		eventClient.Close(2 * time.Second)
 		stop()
 		lf.Close()
 	}()
+	eventClient = explorerevents.NewClient(eventsSocket, logger)
 
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
@@ -275,16 +282,20 @@ func main() {
 	}
 
 	addr := ":" + port
-	logger.Info("serving explorer", "dir", rootDir, "addr", addr, "maxUploadMB", maxSizeMB)
+	listener, inherited, err := explorerListener(addr)
+	if err != nil {
+		fatalLog("listen http", "addr", addr, "err", err)
+	}
+	logger.Info("serving explorer", "dir", rootDir, "addr", listener.Addr().String(), "maxUploadMB", maxSizeMB, "systemd_socket", inherited, "events_socket", eventsSocket)
 	server := &http.Server{
-		Addr:     addr,
+		Addr:     listener.Addr().String(),
 		Handler:  http.HandlerFunc(rootHandler),
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 	// Run server in background so we can wait for a signal.
 	serverErr := make(chan error, 1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
@@ -318,6 +329,16 @@ func waitForShutdown(serverErr <-chan error, quit chan os.Signal, stopSignal fun
 	}
 }
 
+func explorerListener(addr string) (net.Listener, bool, error) {
+	if l, ok, err := socketactivation.ListenerByName("explorer"); err != nil {
+		return nil, false, err
+	} else if ok {
+		return l, true, nil
+	}
+	l, err := net.Listen("tcp", addr)
+	return l, false, err
+}
+
 // ── middleware & routing ──────────────────────────────────────────────────────
 
 type statusRecorder struct {
@@ -337,6 +358,7 @@ func (sr *statusRecorder) WriteHeader(code int) {
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	nonce := generateNonce()
 	w.Header().Set("Content-Security-Policy", fmt.Sprintf(
 		"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-%s';", nonce))
@@ -352,8 +374,11 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	reqLog := requestLogger(logger, r)
 
 	handle(reqLog, sr, r, nonce)
+	duration := time.Since(start)
 	reqLog.Info("request",
-		"status", sr.status)
+		"status", sr.status,
+		"duration", duration)
+	emitRequestEvent(r, sr.status, duration)
 }
 
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
@@ -403,6 +428,20 @@ func clientIP(r *http.Request) string {
 		return fwd
 	}
 	return fmt.Sprintf("%s via %s", fwd, peer)
+}
+
+func clientIdentityIP(r *http.Request) string {
+	peer := remoteIP(r)
+	if peer == "" {
+		return ""
+	}
+	if !isTrustedProxy(peer) {
+		return normalizeIP(peer)
+	}
+	if fwd := forwardedClientIP(r); fwd != "" {
+		return fwd
+	}
+	return normalizeIP(peer)
 }
 
 func remoteIP(r *http.Request) string {
@@ -542,6 +581,9 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		"rate", fmtTransferRate(tw.bytes, dur),
 		clientLogGroup(r),
 	)
+	if r.Method == http.MethodGet {
+		emitTransferEvent(explorerevents.KindDownload, r, relPath, tw.bytes, info.Size(), 0, dur)
+	}
 
 }
 
@@ -559,6 +601,95 @@ func clientLogGroup(r *http.Request) slog.Attr {
 		"memory", r.Header.Get("Sec-CH-Device-Memory"), // approximate amount of available RAM on the client device, in gigabytes
 		"arch", r.Header.Get("Sec-CH-UA-Arch"), // e.g. arm
 	)
+}
+
+func emitTransferEvent(kind string, r *http.Request, relPath string, bytes, size, delta int64, duration time.Duration) {
+	if eventClient == nil || r == nil {
+		return
+	}
+	eventClient.Emit(transferEvent(kind, r, relPath, bytes, size, delta, duration))
+}
+
+func transferEvent(kind string, r *http.Request, relPath string, bytes, size, delta int64, duration time.Duration) explorerevents.Event {
+	return explorerevents.Event{
+		Kind:           kind,
+		ClientIP:       clientIdentityIP(r),
+		RemoteAddr:     r.RemoteAddr,
+		Path:           filepath.ToSlash(relPath),
+		Bytes:          bytes,
+		Size:           size,
+		Delta:          delta,
+		DurationMS:     durationMillis(duration),
+		AvgBytesPerSec: avgBytesPerSecond(bytes, duration),
+		Method:         r.Method,
+		URLPath:        r.URL.Path,
+		Query:          r.URL.RawQuery,
+		Meta: map[string]any{
+			"file":       filepath.ToSlash(relPath),
+			"filename":   filepath.Base(relPath),
+			"user_agent": r.Header.Get("user-agent"),
+			"headers":    requestHeaders(r),
+		},
+	}
+}
+
+func emitRequestEvent(r *http.Request, status int, duration time.Duration) {
+	if eventClient == nil || r == nil {
+		return
+	}
+	eventClient.Emit(requestEvent(r, status, duration))
+}
+
+func requestEvent(r *http.Request, status int, duration time.Duration) explorerevents.Event {
+	return explorerevents.Event{
+		Kind:       explorerevents.KindRequest,
+		ClientIP:   clientIdentityIP(r),
+		RemoteAddr: r.RemoteAddr,
+		Status:     status,
+		Method:     r.Method,
+		URLPath:    r.URL.Path,
+		Query:      r.URL.RawQuery,
+		DurationMS: durationMillis(duration),
+		Level:      "info",
+		Message:    "request",
+		Meta: map[string]any{
+			"unlocked":   isUnlocked(r),
+			"referer":    r.Referer(),
+			"user_agent": r.Header.Get("user-agent"),
+			"headers":    requestHeaders(r),
+		},
+	}
+}
+
+func requestHeaders(r *http.Request) map[string][]string {
+	if r == nil || len(r.Header) == 0 {
+		return nil
+	}
+	headers := make(map[string][]string, len(r.Header))
+	for name, values := range r.Header {
+		copied := make([]string, len(values))
+		copy(copied, values)
+		headers[name] = copied
+	}
+	return headers
+}
+
+func avgBytesPerSecond(bytes int64, duration time.Duration) int64 {
+	if bytes <= 0 || duration <= 0 {
+		return 0
+	}
+	return int64(float64(bytes) / duration.Seconds())
+}
+
+func durationMillis(duration time.Duration) float64 {
+	if duration <= 0 {
+		return 0
+	}
+	ms := float64(duration) / float64(time.Millisecond)
+	if ms < 1 {
+		return ms
+	}
+	return float64(duration.Milliseconds())
 }
 
 // ── directory listing ─────────────────────────────────────────────────────────
@@ -875,7 +1006,7 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 	}
 
 	reqLog = reqLog.With(clientLogGroup(r))
-	savedCount, err := streamParts(reqLog, mr, fullPath)
+	savedCount, uploads, err := streamParts(reqLog, mr, fullPath)
 	if err != nil {
 		reqLog.Error("upload failed", "err", err)
 		if errors.Is(err, errUploadBadRequest) {
@@ -890,6 +1021,9 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
+	for _, upload := range uploads {
+		emitTransferEvent(explorerevents.KindUpload, r, upload.relPath, upload.bytes, upload.size, upload.delta, upload.duration)
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieUnlock,
@@ -902,10 +1036,19 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 	http.Redirect(w, r, "/"+filepath.ToSlash(relPath), http.StatusSeeOther)
 }
 
-func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int, error) {
+type uploadRecord struct {
+	relPath  string
+	bytes    int64
+	size     int64
+	delta    int64
+	duration time.Duration
+}
+
+func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int, []uploadRecord, error) {
 	topRemap := map[string]string{}
 	var createdTopDirs []string
 	var createdFiles []string
+	var uploads []uploadRecord
 	savedCount := 0
 
 	cleanup := func() {
@@ -920,11 +1063,11 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
-			return savedCount, nil
+			return savedCount, uploads, nil
 		}
 		if err != nil {
 			cleanup()
-			return savedCount, fmt.Errorf("%w: reading multipart: %v", errUploadBadRequest, err)
+			return savedCount, nil, fmt.Errorf("%w: reading multipart: %v", errUploadBadRequest, err)
 		}
 
 		rawName := partFilename(part)
@@ -946,7 +1089,7 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 				if err != nil {
 					part.Close()
 					cleanup()
-					return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Join(destDir, topName), err)
+					return savedCount, nil, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Join(destDir, topName), err)
 				}
 				topRemap[topName] = filepath.Base(actual)
 				createdTopDirs = append(createdTopDirs, actual)
@@ -966,18 +1109,18 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			part.Close()
 			cleanup()
-			return savedCount, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Dir(destPath), err)
+			return savedCount, nil, fmt.Errorf("%w: mkdir %q: %v", errUploadFailed, filepath.Dir(destPath), err)
 		}
 
-		writtenPath, bytesWritten, dur, err := writeFileAtomic(part, destPath, !isNested)
+		writtenPath, bytesWritten, size, delta, dur, err := writeFileAtomic(part, destPath, !isNested)
 		if err != nil {
 			part.Close()
 			cleanup()
 			var pathErr *os.PathError
 			if errors.As(err, &pathErr) {
-				return savedCount, fmt.Errorf("%w: write %q: %v", errUploadFailed, finalRel, err)
+				return savedCount, nil, fmt.Errorf("%w: write %q: %v", errUploadFailed, finalRel, err)
 			}
-			return savedCount, fmt.Errorf("%w: write %q: %v", errUploadBadRequest, finalRel, err)
+			return savedCount, nil, fmt.Errorf("%w: write %q: %v", errUploadBadRequest, finalRel, err)
 		}
 
 		createdFiles = append(createdFiles, writtenPath)
@@ -993,6 +1136,13 @@ func streamParts(reqLog *slog.Logger, mr *multipart.Reader, destDir string) (int
 			"size", fmtBytes(bytesWritten),
 			"rate", fmtTransferRate(bytesWritten, dur),
 		)
+		uploads = append(uploads, uploadRecord{
+			relPath:  filepath.ToSlash(writtenRel),
+			bytes:    bytesWritten,
+			size:     size,
+			delta:    delta,
+			duration: dur,
+		})
 		savedCount++
 		part.Close()
 	}
@@ -1006,11 +1156,15 @@ func partFilename(p *multipart.Part) string {
 	return params["filename"]
 }
 
-func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, bytesWritten int64, duration time.Duration, err error) {
+func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath string, bytesWritten, size, delta int64, duration time.Duration, err error) {
 	var f *os.File
 	finalPath = path
+	oldSize := int64(0)
 
 	if !uniqueNaming {
+		if fi, statErr := os.Stat(path); statErr == nil && fi.Mode().IsRegular() {
+			oldSize = fi.Size()
+		}
 		f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	} else {
 		dir, base := filepath.Split(path)
@@ -1023,7 +1177,7 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath str
 		}
 	}
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, 0, 0, err
 	}
 
 	defer func() {
@@ -1035,7 +1189,14 @@ func writeFileAtomic(r io.Reader, path string, uniqueNaming bool) (finalPath str
 
 	start := time.Now()
 	bytesWritten, err = io.Copy(f, r)
-	return f.Name(), bytesWritten, time.Since(start), err
+	if fi, statErr := f.Stat(); statErr == nil {
+		size = fi.Size()
+	}
+	delta = size - oldSize
+	if delta < 0 {
+		delta = 0
+	}
+	return f.Name(), bytesWritten, size, delta, time.Since(start), err
 }
 
 func atomicMkdirUnique(path string) (string, error) {

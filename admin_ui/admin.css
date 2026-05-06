@@ -200,6 +200,48 @@
 	      border-radius: 8px;
 	      background: rgba(8,13,20,.7);
 	    }
+	    .audit-meta summary {
+	      cursor: pointer;
+	      display: flex;
+	      flex-wrap: wrap;
+	      gap: 4px;
+	      align-items: center;
+	    }
+	    .meta-chip {
+	      display: inline-flex;
+	      max-width: 240px;
+	      border: 1px solid rgba(94,199,255,.32);
+	      border-radius: 999px;
+	      padding: 1px 7px;
+	      color: #c9ebff;
+	      background: rgba(32,84,109,.22);
+	      font-size: 10px;
+	      white-space: nowrap;
+	      overflow: hidden;
+	      text-overflow: ellipsis;
+	    }
+	    .meta-file {
+	      color: #b5ffd6;
+	      border-color: rgba(86,216,151,.42);
+	      background: rgba(39,93,71,.22);
+	    }
+	    .meta-section {
+	      margin-top: 7px;
+	      padding: 7px;
+	      border: 1px solid rgba(42,62,86,.45);
+	      border-radius: 8px;
+	      background: rgba(8,13,20,.5);
+	    }
+	    .meta-kv {
+	      display: grid;
+	      grid-template-columns: minmax(96px, max-content) minmax(180px, 1fr);
+	      gap: 8px;
+	      padding: 2px 0;
+	    }
+	    .meta-kv span {
+	      color: var(--text);
+	      overflow-wrap: anywhere;
+	    }
 
 	    @media (max-width: 900px) {
 	      .timeline-item {

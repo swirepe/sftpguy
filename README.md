@@ -143,6 +143,7 @@ Run `go run . -h` for the full list. The flags most operators care about are:
 | `-dir` | Upload directory on disk. Default: `./uploads`. |
 | `-db.path` | SQLite database path. Default: `sftp.db`. |
 | `-hostkey` | SSH host key path. Default: `id_ed25519`. |
+| `-explorer.events` | Unix socket path where the SFTP server accepts standalone explorer events. Normally set by the systemd installer. |
 | `-contrib` | Bytes required to unlock all downloads. Default: `1mb`. |
 | `-unrestricted` | Comma-separated list of always-downloadable files/directories. |
 | `-dir.owners_only` | Only allow uploads into directories the current user owns. |
@@ -246,9 +247,9 @@ go run . -test
 go run . -test.continue -admin.http 127.0.0.1:8080
 ```
 
-## Installing As A systemd Service
+## Installing As systemd Services
 
-The binary has a built-in installer:
+The main binary has a built-in installer. For Linux installs it writes systemd socket units for the SFTP listener and the explorer event IPC socket, then starts the service with those inherited sockets:
 
 ```bash
 sudo ./sftpguy \
@@ -261,7 +262,23 @@ sudo ./sftpguy \
   -logfile /var/log/sftpguy.log
 ```
 
-This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, optionally creates the service user and group, reloads systemd, enables the unit, and starts it.
+This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, `<service>.socket`, and `<service>-explorer-events.socket`, optionally creates the service user and group, reloads systemd, enables the units, and starts them.
+
+To install the standalone HTTP explorer too, build it beside the main binary and point the installer at it:
+
+```bash
+go build -o sftpguy .
+go build -o explorer ./cmd/explorer
+sudo ./sftpguy \
+  -install \
+  -install.explorer ./explorer \
+  -install.explorer.port 8080 \
+  -dir /var/lib/sftpguy/uploads \
+  -db.path /var/lib/sftpguy/sftp.db \
+  -logfile /var/log/sftpguy.log
+```
+
+The explorer service gets its own TCP socket and sends upload, download, and request events over the systemd-owned Unix socket at `/run/<service>/explorer-events.sock`. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
 
 ## Repository Extras
 

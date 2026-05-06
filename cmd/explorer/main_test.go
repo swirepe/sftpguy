@@ -16,6 +16,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"sftpguy/internal/explorerevents"
 )
 
 func TestHandleDirectoryListingHighlightsPublicDirectoriesAndLockedFiles(t *testing.T) {
@@ -348,6 +351,111 @@ func TestHandleUploadWriteLogIncludesTransferStats(t *testing.T) {
 	}
 	if !strings.Contains(line, "rate=") {
 		t.Fatalf("log line missing avg transfer rate, got %q", line)
+	}
+}
+
+func TestTransferEventIncludesStatsAndAllRequestHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/album?sort=name", nil)
+	req.RemoteAddr = "198.51.100.77:43210"
+	req.Header.Set("User-Agent", "audit-test")
+	req.Header.Add("X-Custom-Audit", "one")
+	req.Header.Add("X-Custom-Audit", "two")
+	req.Header.Set("Downlink", "10")
+
+	evt := transferEvent(explorerevents.KindUpload, req, "album/report.txt", 12, 20, 8, 25*time.Millisecond)
+
+	if evt.Kind != explorerevents.KindUpload {
+		t.Fatalf("kind = %q, want %q", evt.Kind, explorerevents.KindUpload)
+	}
+	if evt.ClientIP != "198.51.100.77" {
+		t.Fatalf("client ip = %q, want 198.51.100.77", evt.ClientIP)
+	}
+	if evt.Path != "album/report.txt" || evt.Bytes != 12 || evt.Size != 20 || evt.Delta != 8 {
+		t.Fatalf("unexpected transfer stats: path=%q bytes=%d size=%d delta=%d", evt.Path, evt.Bytes, evt.Size, evt.Delta)
+	}
+	if evt.DurationMS != 25 || evt.AvgBytesPerSec != 480 {
+		t.Fatalf("unexpected timing stats: duration_ms=%v avg=%d", evt.DurationMS, evt.AvgBytesPerSec)
+	}
+	headers, ok := evt.Meta["headers"].(map[string][]string)
+	if !ok {
+		t.Fatalf("headers meta missing or wrong type: %#v", evt.Meta["headers"])
+	}
+	if !slices.Equal(headers["X-Custom-Audit"], []string{"one", "two"}) {
+		t.Fatalf("X-Custom-Audit headers = %#v", headers["X-Custom-Audit"])
+	}
+	if got := headers["User-Agent"]; !slices.Equal(got, []string{"audit-test"}) {
+		t.Fatalf("User-Agent header = %#v", got)
+	}
+	if got := headers["Downlink"]; !slices.Equal(got, []string{"10"}) {
+		t.Fatalf("Downlink header = %#v", got)
+	}
+	if got := evt.Meta["file"]; got != "album/report.txt" {
+		t.Fatalf("file meta = %#v, want album/report.txt", got)
+	}
+	if got := evt.Meta["filename"]; got != "report.txt" {
+		t.Fatalf("filename meta = %#v, want report.txt", got)
+	}
+
+	fast := transferEvent(explorerevents.KindUpload, req, "fast.bin", 1, 1, 1, time.Nanosecond)
+	if fast.DurationMS <= 0 || fast.DurationMS >= 1 {
+		t.Fatalf("fast duration_ms = %v, want decimal below 1", fast.DurationMS)
+	}
+}
+
+func TestRequestEventIncludesDurationAndAllRequestHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/public/readme.txt?download=1", nil)
+	req.RemoteAddr = "127.0.0.1:8080"
+	req.Header.Set("X-Forwarded-For", "203.0.113.44, 127.0.0.1")
+	req.Header.Set("X-Real-IP", "203.0.113.44")
+	req.Header.Set("Referer", "https://example.test/from")
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.AddCookie(&http.Cookie{Name: cookieUnlock, Value: "true"})
+
+	evt := requestEvent(req, http.StatusSeeOther, 42*time.Millisecond)
+
+	if evt.Kind != explorerevents.KindRequest {
+		t.Fatalf("kind = %q, want %q", evt.Kind, explorerevents.KindRequest)
+	}
+	if evt.ClientIP != "203.0.113.44" {
+		t.Fatalf("client ip = %q, want forwarded client", evt.ClientIP)
+	}
+	if evt.Status != http.StatusSeeOther || evt.DurationMS != 42 {
+		t.Fatalf("unexpected request stats: status=%d duration_ms=%v", evt.Status, evt.DurationMS)
+	}
+	headers, ok := evt.Meta["headers"].(map[string][]string)
+	if !ok {
+		t.Fatalf("headers meta missing or wrong type: %#v", evt.Meta["headers"])
+	}
+	if got := headers["X-Forwarded-For"]; !slices.Equal(got, []string{"203.0.113.44, 127.0.0.1"}) {
+		t.Fatalf("X-Forwarded-For header = %#v", got)
+	}
+	if got := headers["Sec-Ch-Ua-Mobile"]; !slices.Equal(got, []string{"?0"}) {
+		t.Fatalf("Sec-CH-UA-Mobile header = %#v", got)
+	}
+	if unlocked, ok := evt.Meta["unlocked"].(bool); !ok || !unlocked {
+		t.Fatalf("unlocked meta = %#v, want true", evt.Meta["unlocked"])
+	}
+}
+
+func TestWriteFileAtomicReportsSizeAndPositiveDelta(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	target := filepath.Join(root, "overwrite.txt")
+	mustWriteFile(t, target, "0123456789")
+
+	finalPath, transferred, size, delta, _, err := writeFileAtomic(strings.NewReader("tiny"), target, false)
+	if err != nil {
+		t.Fatalf("writeFileAtomic overwrite: %v", err)
+	}
+	if finalPath != target || transferred != 4 || size != 4 || delta != 0 {
+		t.Fatalf("overwrite stats: final=%q transferred=%d size=%d delta=%d", finalPath, transferred, size, delta)
+	}
+
+	finalPath, transferred, size, delta, _, err = writeFileAtomic(strings.NewReader("larger"), target, false)
+	if err != nil {
+		t.Fatalf("writeFileAtomic grow: %v", err)
+	}
+	if finalPath != target || transferred != 6 || size != 6 || delta != 2 {
+		t.Fatalf("grow stats: final=%q transferred=%d size=%d delta=%d", finalPath, transferred, size, delta)
 	}
 }
 

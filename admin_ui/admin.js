@@ -73,6 +73,10 @@
     function formatMs(v) {
       const n = Number(v || 0);
       if (!isFinite(n) || n <= 0) return "0ms";
+      if (n < 1) {
+        const digits = n < 0.001 ? 6 : (n < 0.01 ? 5 : (n < 0.1 ? 4 : 3));
+        return n.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "") + "ms";
+      }
       return Math.round(n) + "ms";
     }
     function formatBytes(n) {
@@ -792,6 +796,101 @@
       setTabCount("audit", state.audit.length);
       renderAudit();
     }
+    function parseMeta(raw) {
+      const text = String(raw || "").trim();
+      if (!text) return null;
+      try {
+        const parsed = JSON.parse(text);
+        return parsed && typeof parsed === "object" ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    }
+    function nestedMeta(meta) {
+      const nested = meta && meta.explorer_meta;
+      return nested && typeof nested === "object" ? nested : {};
+    }
+    function metaField(meta, key) {
+      if (!meta) return "";
+      if (meta[key] != null && meta[key] !== "") return meta[key];
+      const nested = nestedMeta(meta);
+      return nested[key] == null ? "" : nested[key];
+    }
+    function metaNumber(meta, key) {
+      const n = Number(metaField(meta, key));
+      return isFinite(n) ? n : 0;
+    }
+    function metaHeaders(meta) {
+      const headers = metaField(meta, "headers");
+      return headers && typeof headers === "object" ? headers : null;
+    }
+    function renderHeaderList(headers) {
+      if (!headers) return "";
+      const names = Object.keys(headers).sort(function(a, b) { return a.localeCompare(b); });
+      if (!names.length) return "";
+      return "<div class=\"meta-section\"><div class=\"muted\">Headers</div>" +
+        names.map(function(name) {
+          const rawValues = Array.isArray(headers[name]) ? headers[name] : [headers[name]];
+          const values = rawValues.map(function(v) { return String(v == null ? "" : v); }).join(", ");
+          return "<div class=\"meta-kv\"><code>" + esc(name) + "</code><span>" + esc(values) + "</span></div>";
+        }).join("") +
+      "</div>";
+    }
+    function renderAuditMeta(raw, rowPath, eventName) {
+      const text = String(raw || "").trim();
+      if (!text) return "<span class=\"muted\">-</span>";
+      const meta = parseMeta(text);
+      if (!meta) return "<code>" + esc(text) + "</code>";
+
+      const nested = nestedMeta(meta);
+      const file = String(metaField(meta, "file") || rowPath || "").trim();
+      const filename = String(metaField(meta, "filename") || (file ? file.split("/").pop() : "") || "").trim();
+      const method = String(metaField(meta, "method") || "").trim();
+      const urlPath = String(metaField(meta, "url_path") || "").trim();
+      const query = String(metaField(meta, "query") || "").trim();
+      const status = metaNumber(meta, "status");
+      const bytes = metaNumber(meta, "bytes");
+      const size = metaNumber(meta, "size");
+      const delta = metaNumber(meta, "delta");
+      const duration = metaNumber(meta, "duration_ms");
+      const avg = metaNumber(meta, "avg_bytes_per_sec");
+      const source = String(metaField(meta, "source") || "").trim();
+      const headers = metaHeaders(meta);
+      const headerCount = headers ? Object.keys(headers).length : 0;
+
+      const chips = [];
+      if (file) chips.push("<span class=\"meta-chip meta-file\" title=\"" + esc(file) + "\">file " + esc(filename || file) + "</span>");
+      if (method) chips.push("<span class=\"meta-chip\">" + esc(method) + "</span>");
+      if (status) chips.push("<span class=\"meta-chip\">HTTP " + esc(status) + "</span>");
+      if (bytes) chips.push("<span class=\"meta-chip\">bytes " + esc(formatBytes(bytes)) + "</span>");
+      if (size) chips.push("<span class=\"meta-chip\">size " + esc(formatBytes(size)) + "</span>");
+      if (delta || String(eventName || "") === "upload") chips.push("<span class=\"meta-chip\">delta " + esc(formatBytes(delta)) + "</span>");
+      if (duration) chips.push("<span class=\"meta-chip\">duration " + esc(formatMs(duration)) + "</span>");
+      if (avg) chips.push("<span class=\"meta-chip\">avg " + esc(formatBytes(avg)) + "/s</span>");
+      if (headerCount) chips.push("<span class=\"meta-chip\">headers " + esc(headerCount) + "</span>");
+      if (source) chips.push("<span class=\"meta-chip\">" + esc(source) + "</span>");
+
+      const url = urlPath ? (urlPath + (query ? "?" + query : "")) : "";
+      const detailRows = [
+        ["file", file],
+        ["url", url],
+        ["client_ip", metaField(meta, "client_ip")],
+        ["remote_addr", metaField(meta, "remote_addr")],
+        ["user_agent", metaField(meta, "user_agent") || nested.user_agent]
+      ].filter(function(pair) { return String(pair[1] == null ? "" : pair[1]).trim() !== ""; });
+      const details = detailRows.length
+        ? "<div class=\"meta-section\">" + detailRows.map(function(pair) {
+            return "<div class=\"meta-kv\"><code>" + esc(pair[0]) + "</code><span>" + esc(pair[1]) + "</span></div>";
+          }).join("") + "</div>"
+        : "";
+      const pretty = JSON.stringify(meta, null, 2);
+      const summary = chips.length ? chips.join(" ") : "<span class=\"muted\">JSON meta</span>";
+      return "<details class=\"audit-meta\"><summary>" + summary + "</summary>" +
+        details +
+        renderHeaderList(headers) +
+        "<div class=\"meta-section\"><div class=\"muted\">Raw JSON</div><pre>" + esc(pretty) + "</pre></div>" +
+      "</details>";
+    }
     function renderAudit() {
       const rows = (state.audit || []).map(function(e) {
         return {
@@ -809,7 +908,7 @@
             ipCell(e.ip),
             sessionCell(e.session),
             pathWithExplorer(e.path || ""),
-            "<code>" + esc(e.meta || "") + "</code>"
+            renderAuditMeta(e.meta || "", e.path || "", e.event || "")
           ]
         };
       });

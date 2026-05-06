@@ -15,27 +15,59 @@ import (
 
 // serviceParams holds the values interpolated into serviceTemplate.
 type serviceParams struct {
-	Description string   // human-readable archive name
-	Name        string   // sanitized service / binary name
-	User        string   // system user the service runs as
-	Group       string   // system group the service runs as
-	InstallDir  string   // /var/lib/<name>
-	BinaryPath  string   // InstallDir/<name>
-	LogFile     string   // /var/log/<name>.log
-	Args        []string // flags to pass on restart (os.Args minus -install)
-	UseSyslog   bool
+	Description              string   // human-readable archive name
+	Name                     string   // sanitized service / binary name
+	User                     string   // system user the service runs as
+	Group                    string   // system group the service runs as
+	InstallDir               string   // /var/lib/<name>
+	BinaryPath               string   // InstallDir/<name>
+	LogFile                  string   // /var/log/<name>.log
+	Args                     []string // flags to pass on restart (os.Args minus -install)
+	UseSyslog                bool
+	SFTPSocketName           string
+	ExplorerEventsSocketName string
+}
+
+type tcpSocketParams struct {
+	Description string
+	ServiceName string
+	FDName      string
+	Port        int
+}
+
+type unixSocketParams struct {
+	Description string
+	ServiceName string
+	FDName      string
+	Path        string
+	User        string
+	Group       string
+}
+
+type explorerServiceParams struct {
+	Description      string
+	Name             string
+	User             string
+	Group            string
+	InstallDir       string
+	BinaryPath       string
+	Args             []string
+	SocketName       string
+	EventsSocketName string
 }
 
 // serviceTemplate is the systemd unit file template.
 var serviceTemplate = template.Must(template.New("service").Parse(`[Unit]
 Description={{.Description}} — Anonymous SFTP Server
-After=network.target
+Requires={{.SFTPSocketName}} {{.ExplorerEventsSocketName}}
+After=network.target {{.SFTPSocketName}} {{.ExplorerEventsSocketName}}
 
 [Service]
 Type=simple
 User={{.User}}
 Group={{.Group}}
 WorkingDirectory={{.InstallDir}}
+Sockets={{.SFTPSocketName}} {{.ExplorerEventsSocketName}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
 Restart=always
 RestartSec=5
@@ -43,6 +75,56 @@ RestartSec=5
 # If server handles syslog internally, discard stdout to avoid duplicate logs in journal
 StandardOutput={{if .UseSyslog}}null{{else}}journal{{end}}
 StandardError={{if .UseSyslog}}null{{else}}journal{{end}}
+SyslogIdentifier={{.Name}}
+
+[Install]
+WantedBy=multi-user.target
+`))
+
+var tcpSocketTemplate = template.Must(template.New("tcp-socket").Parse(`[Unit]
+Description={{.Description}}
+
+[Socket]
+ListenStream={{.Port}}
+FileDescriptorName={{.FDName}}
+Service={{.ServiceName}}
+
+[Install]
+WantedBy=sockets.target
+`))
+
+var unixSocketTemplate = template.Must(template.New("unix-socket").Parse(`[Unit]
+Description={{.Description}}
+
+[Socket]
+ListenStream={{.Path}}
+FileDescriptorName={{.FDName}}
+Service={{.ServiceName}}
+SocketUser={{.User}}
+SocketGroup={{.Group}}
+SocketMode=0660
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
+`))
+
+var explorerServiceTemplate = template.Must(template.New("explorer-service").Parse(`[Unit]
+Description={{.Description}} — HTTP Explorer
+Requires={{.SocketName}} {{.EventsSocketName}}
+After=network.target {{.SocketName}} {{.EventsSocketName}}
+
+[Service]
+Type=simple
+User={{.User}}
+Group={{.Group}}
+WorkingDirectory={{.InstallDir}}
+Sockets={{.SocketName}}
+ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier={{.Name}}
 
 [Install]
@@ -68,6 +150,9 @@ type installOptions struct {
 	// The sanitized service/binary name.
 	Name string
 
+	// TCP port exposed by the systemd SFTP socket.
+	Port int
+
 	// Service user and group.
 	User  string
 	Group string
@@ -79,6 +164,15 @@ type installOptions struct {
 	// Args are the flags forwarded verbatim into ExecStart — os.Args[1:]
 	// with all -install* flags stripped.
 	Args []string
+
+	// UploadDir is passed to the standalone explorer service when installed.
+	UploadDir string
+
+	// Optional standalone explorer binary and socket settings.
+	ExplorerBinary       string
+	ExplorerPort         int
+	ExplorerLogFile      string
+	ExplorerEventsSocket string
 }
 
 // runInstall installs this binary as a systemd service.  Must be run as root.
@@ -91,6 +185,21 @@ func runInstall(opts installOptions) error {
 	}
 	if opts.Name == "" {
 		opts.Name = "sftpguy"
+	}
+	if opts.Port == 0 {
+		opts.Port = 2222
+	}
+	if opts.ExplorerPort == 0 {
+		opts.ExplorerPort = 8080
+	}
+	if strings.TrimSpace(opts.UploadDir) == "" {
+		opts.UploadDir = "./uploads"
+	}
+	if strings.TrimSpace(opts.ExplorerLogFile) == "" {
+		opts.ExplorerLogFile = "/var/log/" + opts.Name + "-explorer.log"
+	}
+	if strings.TrimSpace(opts.ExplorerEventsSocket) == "" {
+		opts.ExplorerEventsSocket = "/run/" + opts.Name + "/explorer-events.sock"
 	}
 
 	self, err := os.Executable()
@@ -106,7 +215,15 @@ func runInstall(opts installOptions) error {
 	installDir := "/var/lib/" + opts.Name
 	binaryDst := filepath.Join(installDir, opts.Name)
 	serviceName := opts.Name + ".service"
+	socketName := opts.Name + ".socket"
+	explorerEventsSocketName := opts.Name + "-explorer-events.socket"
+	explorerServiceName := opts.Name + "-explorer.service"
+	explorerSocketName := opts.Name + "-explorer.socket"
 	serviceDst := "/etc/systemd/system/" + serviceName
+	socketDst := "/etc/systemd/system/" + socketName
+	explorerEventsSocketDst := "/etc/systemd/system/" + explorerEventsSocketName
+	explorerServiceDst := "/etc/systemd/system/" + explorerServiceName
+	explorerSocketDst := "/etc/systemd/system/" + explorerSocketName
 
 	useSyslog := false
 	for _, arg := range opts.Args {
@@ -118,19 +235,41 @@ func runInstall(opts installOptions) error {
 	}
 
 	params := serviceParams{
-		Description: opts.Name,
-		Name:        opts.Name,
-		User:        opts.User,
-		Group:       opts.Group,
-		InstallDir:  installDir,
-		BinaryPath:  binaryDst,
-		Args:        opts.Args,
-		UseSyslog:   useSyslog,
+		Description:              opts.Name,
+		Name:                     opts.Name,
+		User:                     opts.User,
+		Group:                    opts.Group,
+		InstallDir:               installDir,
+		BinaryPath:               binaryDst,
+		Args:                     opts.Args,
+		UseSyslog:                useSyslog,
+		SFTPSocketName:           socketName,
+		ExplorerEventsSocketName: explorerEventsSocketName,
 	}
 
-	var svcContent strings.Builder
-	if err := serviceTemplate.Execute(&svcContent, params); err != nil {
-		return fmt.Errorf("render service template: %w", err)
+	svcContent, err := renderUnit(serviceTemplate, params)
+	if err != nil {
+		return fmt.Errorf("render service unit: %w", err)
+	}
+	socketContent, err := renderUnit(tcpSocketTemplate, tcpSocketParams{
+		Description: opts.Name + " SFTP Socket",
+		ServiceName: serviceName,
+		FDName:      "sftp",
+		Port:        opts.Port,
+	})
+	if err != nil {
+		return fmt.Errorf("render sftp socket unit: %w", err)
+	}
+	eventSocketContent, err := renderUnit(unixSocketTemplate, unixSocketParams{
+		Description: opts.Name + " Explorer Event Socket",
+		ServiceName: serviceName,
+		FDName:      "explorer-events",
+		Path:        opts.ExplorerEventsSocket,
+		User:        opts.User,
+		Group:       opts.Group,
+	})
+	if err != nil {
+		return fmt.Errorf("render explorer event socket unit: %w", err)
 	}
 
 	run := func(name string, args ...string) error {
@@ -141,6 +280,10 @@ func runInstall(opts installOptions) error {
 
 	// Stop existing service (ignore error: may not exist yet).
 	_ = run("systemctl", "stop", serviceName)
+	_ = run("systemctl", "stop", socketName)
+	_ = run("systemctl", "stop", explorerServiceName)
+	_ = run("systemctl", "stop", explorerSocketName)
+	_ = run("systemctl", "stop", explorerEventsSocketName)
 
 	if err := os.MkdirAll(installDir, permDir); err != nil {
 		return fmt.Errorf("mkdir %s: %w", installDir, err)
@@ -148,8 +291,14 @@ func runInstall(opts installOptions) error {
 	if err := copyExecutable(self, binaryDst); err != nil {
 		return fmt.Errorf("copy binary: %w", err)
 	}
-	if err := os.WriteFile(serviceDst, []byte(svcContent.String()), 0644); err != nil {
+	if err := os.WriteFile(serviceDst, []byte(svcContent), 0644); err != nil {
 		return fmt.Errorf("write service file: %w", err)
+	}
+	if err := os.WriteFile(socketDst, []byte(socketContent), 0644); err != nil {
+		return fmt.Errorf("write sftp socket file: %w", err)
+	}
+	if err := os.WriteFile(explorerEventsSocketDst, []byte(eventSocketContent), 0644); err != nil {
+		return fmt.Errorf("write explorer event socket file: %w", err)
 	}
 
 	// Ensure the service user/group exist before we try to chown anything.
@@ -157,24 +306,129 @@ func runInstall(opts installOptions) error {
 		return fmt.Errorf("ensure user/group: %w", err)
 	}
 
+	explorerInstalled := false
+	explorerSrc, err := resolveExplorerBinary(self, opts.ExplorerBinary, opts.Name)
+	if err != nil {
+		return err
+	}
+	if explorerSrc != "" {
+		explorerDst := filepath.Join(installDir, opts.Name+"-explorer")
+		if err := copyExecutable(explorerSrc, explorerDst); err != nil {
+			return fmt.Errorf("copy explorer binary: %w", err)
+		}
+		explorerArgs := []string{
+			"-dir", opts.UploadDir,
+			"-log", opts.ExplorerLogFile,
+			"-events", opts.ExplorerEventsSocket,
+		}
+		explorerSvcContent, err := renderUnit(explorerServiceTemplate, explorerServiceParams{
+			Description:      opts.Name,
+			Name:             opts.Name + "-explorer",
+			User:             opts.User,
+			Group:            opts.Group,
+			InstallDir:       installDir,
+			BinaryPath:       explorerDst,
+			Args:             explorerArgs,
+			SocketName:       explorerSocketName,
+			EventsSocketName: explorerEventsSocketName,
+		})
+		if err != nil {
+			return fmt.Errorf("render explorer service unit: %w", err)
+		}
+		explorerSocketContent, err := renderUnit(tcpSocketTemplate, tcpSocketParams{
+			Description: opts.Name + " Explorer HTTP Socket",
+			ServiceName: explorerServiceName,
+			FDName:      "explorer",
+			Port:        opts.ExplorerPort,
+		})
+		if err != nil {
+			return fmt.Errorf("render explorer socket unit: %w", err)
+		}
+		if err := os.WriteFile(explorerServiceDst, []byte(explorerSvcContent), 0644); err != nil {
+			return fmt.Errorf("write explorer service file: %w", err)
+		}
+		if err := os.WriteFile(explorerSocketDst, []byte(explorerSocketContent), 0644); err != nil {
+			return fmt.Errorf("write explorer socket file: %w", err)
+		}
+		explorerInstalled = true
+	} else {
+		fmt.Fprintf(os.Stderr, "Explorer binary not found; skipping standalone explorer service. Build one with: go build -o explorer ./cmd/explorer\n")
+	}
+
 	if err := chownTree(opts.User, opts.Group, installDir); err != nil {
 		return fmt.Errorf("chown: %w", err)
 	}
 
-	for _, args := range [][]string{
-		{"daemon-reload"},
-		{"enable", serviceName},
-		{"start", serviceName},
-	} {
-		if err := run("systemctl", args...); err != nil {
-			return fmt.Errorf("systemctl %s: %w", args[0], err)
+	if err := run("systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("systemctl daemon-reload: %w", err)
+	}
+
+	units := []string{socketName, explorerEventsSocketName, serviceName}
+	startUnits := []string{socketName, explorerEventsSocketName, serviceName}
+	if explorerInstalled {
+		units = append(units, explorerSocketName, explorerServiceName)
+		startUnits = append(startUnits, explorerSocketName, explorerServiceName)
+	}
+
+	for _, unit := range units {
+		if err := run("systemctl", "enable", unit); err != nil {
+			return fmt.Errorf("systemctl enable %s: %w", unit, err)
+		}
+	}
+	for _, unit := range startUnits {
+		if err := run("systemctl", "start", unit); err != nil {
+			return fmt.Errorf("systemctl start %s: %w", unit, err)
 		}
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"Installed %s\n  binary:  %s\n  service: %s\n  status:  systemctl status %s\n",
-		opts.Name, binaryDst, serviceDst, serviceName)
+		"Installed %s\n  binary:  %s\n  service: %s\n  sockets: %s, %s\n  status:  systemctl status %s\n",
+		opts.Name, binaryDst, serviceDst, socketDst, explorerEventsSocketDst, serviceName)
+	if explorerInstalled {
+		fmt.Fprintf(os.Stderr,
+			"  explorer service: %s\n  explorer socket:  %s\n",
+			explorerServiceDst, explorerSocketDst)
+	}
 	return nil
+}
+
+func renderUnit(t *template.Template, data any) (string, error) {
+	var out strings.Builder
+	if err := t.Execute(&out, data); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+func resolveExplorerBinary(self, explicit, serviceName string) (string, error) {
+	if explicit = strings.TrimSpace(explicit); explicit != "" {
+		p, err := filepath.Abs(explicit)
+		if err != nil {
+			return "", fmt.Errorf("resolve explorer binary: %w", err)
+		}
+		p, err = filepath.EvalSymlinks(p)
+		if err != nil {
+			return "", fmt.Errorf("resolve explorer binary symlink: %w", err)
+		}
+		if st, err := os.Stat(p); err != nil {
+			return "", fmt.Errorf("stat explorer binary %q: %w", p, err)
+		} else if st.IsDir() {
+			return "", fmt.Errorf("explorer binary %q is a directory", p)
+		}
+		return p, nil
+	}
+
+	dir := filepath.Dir(self)
+	for _, name := range []string{serviceName + "-explorer", "sftpguy-explorer", "explorer"} {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			if resolved, err := filepath.EvalSymlinks(p); err == nil {
+				return resolved, nil
+			}
+			return p, nil
+		}
+	}
+	return "", nil
 }
 
 // ensureUserGroup creates the service user and group if they don't already

@@ -78,6 +78,7 @@ The SFTP surface is primarily shaped by these flags and env vars:
 - `-dir`: archive root directory
 - `-hostkey`: SSH host key path
 - `-db.path`: SQLite database path
+- `-explorer.events`: optional Unix socket path for standalone explorer upload/download/request events
 - `-banner` and `-banner.stats`: SSH banner source and optional banner stats
 - `-noauth`: enables SSH `none` auth
 - `-admin.sftp`: enables admin SFTP login
@@ -91,6 +92,8 @@ The SFTP surface is primarily shaped by these flags and env vars:
 - `-test` and `-test.continue`: startup self-test modes
 
 Admin web flags exist alongside the SFTP service but are covered separately in [spec/admin.md](admin.md) and [spec/web/admin.md](web/admin.md).
+
+On systemd installs, the built-in installer writes socket units for the SFTP TCP listener and the explorer event Unix socket. When the process starts with inherited systemd descriptors named `sftp` or `explorer-events`, it uses those listeners instead of binding the sockets itself.
 
 ## Authentication And Identity
 

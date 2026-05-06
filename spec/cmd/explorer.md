@@ -40,6 +40,7 @@ The command supports these flags:
 - `-port`: HTTP port, default `8080`
 - `-maxsize`: max upload size in MB, default `1000`
 - `-log`: log file path, default `explorer.log`
+- `-events`: optional Unix socket path used to send upload, download, and request events to `sftpguy`
 - `-header`: optional HTML fragment injected at the top of every page
 - `-footer`: optional HTML fragment injected at the bottom of every page
 - `-src`: prints the command source and exits
@@ -49,7 +50,8 @@ Startup behavior:
 - resolves the root directory to an absolute path
 - creates the root directory if missing
 - writes logs to both stdout and the configured log file
-- starts a plain `http.ListenAndServe` server on the configured port
+- uses a systemd-inherited TCP socket named `explorer` when present, otherwise starts a TCP listener on the configured port
+- if `-events` is set, sends structured JSON events to the Unix socket without blocking the request path
 
 ## Request Model
 

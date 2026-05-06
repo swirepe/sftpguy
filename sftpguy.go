@@ -61,7 +61,9 @@ import (
 	"time"
 
 	"sftpguy/caid"
+	"sftpguy/internal/explorerevents"
 	"sftpguy/internal/logutil"
+	"sftpguy/internal/socketactivation"
 
 	"github.com/charmbracelet/log"
 	"github.com/pkg/sftp"
@@ -243,6 +245,8 @@ const (
 	EventDeniedRateLimit       EventKind = "denied/rate-limit"
 	EventDeniedQuota           EventKind = "denied/quota"
 	EventDeniedPathTraversal   EventKind = "denied/path-traversal"
+	EventExplorerLog           EventKind = "explorer/log"
+	EventExplorerRequest       EventKind = "explorer/request"
 )
 
 var errorPrefix = struct {
@@ -951,6 +955,7 @@ type Config struct {
 	DBPath                  string
 	LogFile                 string
 	Syslog                  bool
+	ExplorerEventsSocket    string
 	UploadDir               string
 	BannerFile              string
 	BannerStats             bool
@@ -995,6 +1000,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
 	EnvFlag(&cfg.Syslog, "syslog", "SYSLOG", false, "Enable logging to local syslog (Linux only)")
+	EnvFlag(&cfg.ExplorerEventsSocket, "explorer.events", "EXPLORER_EVENTS", "", "Unix socket path for standalone explorer upload/download/log events")
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
 	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
@@ -1031,6 +1037,9 @@ func LoadConfig() (Config, error) {
 	installUser := flag.String("install.user", "anonymous", "System user the service runs as")
 	installGroup := flag.String("install.group", "ftp", "System group the service runs as")
 	installEnsure := flag.Bool("install.ensure", true, "Create user/group if they don't exist")
+	installExplorer := flag.String("install.explorer", "", "Optional path to standalone explorer binary to install with socket activation")
+	installExplorerPort := flag.Int("install.explorer.port", 8080, "Explorer HTTP port for the systemd socket")
+	installExplorerLog := flag.String("install.explorer.log", "", "Explorer log file path when installing")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -1052,11 +1061,17 @@ func LoadConfig() (Config, error) {
 
 	if *install {
 		opts := installOptions{
-			Name:   sanitizeName(*installService),
-			User:   *installUser,
-			Group:  *installGroup,
-			Ensure: *installEnsure,
-			Args:   stripInstallFlags(rawArgs),
+			Name:                 sanitizeName(*installService),
+			Port:                 cfg.Port,
+			User:                 *installUser,
+			Group:                *installGroup,
+			Ensure:               *installEnsure,
+			Args:                 stripInstallFlags(rawArgs),
+			UploadDir:            cfg.UploadDir,
+			ExplorerBinary:       *installExplorer,
+			ExplorerPort:         *installExplorerPort,
+			ExplorerLogFile:      *installExplorerLog,
+			ExplorerEventsSocket: cfg.ExplorerEventsSocket,
 		}
 		if err := runInstall(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
@@ -1189,28 +1204,29 @@ func (f *FortuneGenerator) Random() string {
 }
 
 type Server struct {
-	store              *Store
-	logger             *slog.Logger
-	metrics            *serverMetrics
-	mkdirLimiter       *rate.Limiter
-	fortuneGenerator   *FortuneGenerator
-	cfg                Config
-	adminHash          string
-	absUploadDir       string
-	listener           net.Listener
-	wg                 sync.WaitGroup
-	shutdown           chan struct{}
-	activeConnMu       sync.Mutex
-	activeConnByIP     map[string]int
-	ctx                context.Context
-	cancel             context.CancelFunc
-	adminShutdownMu    sync.Mutex
-	adminShutdown      func(context.Context) error
-	selfTestMu         sync.Mutex
-	selfTestState      adminSelfTestState
-	maintenanceRunMu   sync.Mutex
-	maintenanceStateMu sync.Mutex
-	maintenanceState   struct {
+	store                 *Store
+	logger                *slog.Logger
+	metrics               *serverMetrics
+	mkdirLimiter          *rate.Limiter
+	fortuneGenerator      *FortuneGenerator
+	cfg                   Config
+	adminHash             string
+	absUploadDir          string
+	listener              net.Listener
+	explorerEventListener net.Listener
+	wg                    sync.WaitGroup
+	shutdown              chan struct{}
+	activeConnMu          sync.Mutex
+	activeConnByIP        map[string]int
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	adminShutdownMu       sync.Mutex
+	adminShutdown         func(context.Context) error
+	selfTestMu            sync.Mutex
+	selfTestState         adminSelfTestState
+	maintenanceRunMu      sync.Mutex
+	maintenanceStateMu    sync.Mutex
+	maintenanceState      struct {
 		running          bool
 		currentTrigger   string
 		currentStartedAt time.Time
@@ -1362,6 +1378,9 @@ func (s *Server) Shutdown() error {
 	s.cancel()
 	if s.listener != nil {
 		s.listener.Close()
+	}
+	if s.explorerEventListener != nil {
+		s.explorerEventListener.Close()
 	}
 	s.adminShutdownMu.Lock()
 	adminShutdown := s.adminShutdown
@@ -1546,6 +1565,16 @@ func (s *Server) releaseIPConnection(ip string) {
 	s.activeConnByIP[ip] = active - 1
 }
 
+func (s *Server) sftpListener() (net.Listener, bool, error) {
+	if l, ok, err := socketactivation.ListenerByName("sftp"); err != nil {
+		return nil, false, err
+	} else if ok {
+		return l, true, nil
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
+	return l, false, err
+}
+
 func (s *Server) Listen() error {
 	if err := s.ensureHostKey(); err != nil {
 		return err
@@ -1566,13 +1595,13 @@ func (s *Server) Listen() error {
 	key, _ := ssh.ParsePrivateKey(keyBytes)
 	sshConfig.AddHostKey(key)
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
+	listener, inherited, err := s.sftpListener()
 	if err != nil {
 		return err
 	}
 	s.listener = listener
 
-	s.logger.Info("SFTP archive online", "port", s.cfg.Port)
+	s.logger.Info("SFTP archive online", "port", s.cfg.Port, "addr", listener.Addr().String(), "systemd_socket", inherited)
 	fmt.Fprintln(os.Stderr, green.Bold("==========  READY  =========="))
 
 	for {
@@ -1616,6 +1645,276 @@ func (s *Server) Listen() error {
 	}
 }
 
+func (s *Server) ListenExplorerEvents() error {
+	listener, inherited, err := s.explorerEventsListener()
+	if err != nil {
+		return err
+	}
+	if listener == nil {
+		return nil
+	}
+	s.explorerEventListener = listener
+	s.logger.Info("explorer event recorder online", "addr", listener.Addr().String(), "systemd_socket", inherited)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-s.shutdown:
+				return nil
+			default:
+				continue
+			}
+		}
+
+		s.wg.Add(1)
+		go func(c net.Conn) {
+			defer s.wg.Done()
+			defer c.Close()
+			defer recoverAndLogPanic(s.logger, "explorer event worker")
+			s.handleExplorerEventConn(c)
+		}(conn)
+	}
+}
+
+func (s *Server) explorerEventsListener() (net.Listener, bool, error) {
+	if l, ok, err := socketactivation.ListenerByName("explorer-events"); err != nil {
+		return nil, false, err
+	} else if ok {
+		return l, true, nil
+	}
+
+	socketPath := strings.TrimSpace(s.cfg.ExplorerEventsSocket)
+	if socketPath == "" {
+		return nil, false, nil
+	}
+	if err := removeStaleUnixSocket(socketPath); err != nil {
+		return nil, false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), permDir); err != nil {
+		return nil, false, err
+	}
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := os.Chmod(socketPath, 0660); err != nil {
+		_ = l.Close()
+		return nil, false, err
+	}
+	return l, false, nil
+}
+
+func removeStaleUnixSocket(socketPath string) error {
+	fi, err := os.Lstat(socketPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refusing to replace non-socket explorer event path %q", socketPath)
+	}
+	return os.Remove(socketPath)
+}
+
+func (s *Server) handleExplorerEventConn(conn net.Conn) {
+	dec := json.NewDecoder(io.LimitReader(conn, 1<<20))
+	for {
+		var evt explorerevents.Event
+		if err := dec.Decode(&evt); err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			s.logger.Warn("failed to decode explorer event", "remote_addr", conn.RemoteAddr(), "err", err)
+			return
+		}
+		if err := s.recordExplorerEvent(evt); err != nil {
+			s.logger.Warn("failed to record explorer event",
+				"kind", evt.Kind,
+				"path", evt.Path,
+				"client_ip", evt.ClientIP,
+				"err", err)
+		}
+	}
+}
+
+func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
+	ip := explorerEventIP(evt)
+	remoteAddr := explorerEventRemoteAddr(evt, ip)
+	pubHash := ""
+	if ip != "" {
+		pubHash = anonAuthHashForIP(ip)
+	}
+
+	switch evt.Kind {
+	case explorerevents.KindUpload:
+		return s.recordExplorerUpload(evt, pubHash, remoteAddr, ip)
+	case explorerevents.KindDownload:
+		return s.recordExplorerDownload(evt, pubHash, remoteAddr, ip)
+	case explorerevents.KindRequest:
+		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
+		s.store.LogEvent(EventExplorerRequest, pubHash, "explorer", remoteAddr,
+			explorerEventLogArgs(evt, rel, ip)...)
+		return nil
+	case explorerevents.KindLog:
+		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
+		s.store.LogEvent(EventExplorerLog, pubHash, "explorer", remoteAddr,
+			explorerEventLogArgs(evt, rel, ip)...)
+		return nil
+	default:
+		return fmt.Errorf("unknown explorer event kind %q", evt.Kind)
+	}
+}
+
+func (s *Server) recordExplorerUpload(evt explorerevents.Event, pubHash string, remoteAddr net.Addr, ip string) error {
+	if pubHash == "" {
+		return errors.New("explorer upload missing client ip")
+	}
+	if _, err := s.store.UpsertUserSession(pubHash, remoteAddr); err != nil {
+		return err
+	}
+	rel := cleanExplorerEventPath(evt.Path)
+	if rel == "" {
+		return errors.New("explorer upload missing path")
+	}
+	if dir := path.Dir(rel); dir != "." && dir != "" {
+		if err := s.store.EnsureDirectory(pubHash, dir); err != nil {
+			return err
+		}
+	}
+
+	size := evt.Size
+	if size < 0 {
+		size = 0
+	}
+	if size == 0 && evt.Bytes > 0 {
+		size = evt.Bytes
+	}
+	delta := evt.Delta
+	if delta == 0 {
+		delta = evt.Bytes
+	}
+	if delta < 0 {
+		delta = 0
+	}
+
+	if err := s.store.UpdateFileWrite(pubHash, pubHash, rel, size, delta); err != nil {
+		return err
+	}
+	s.store.LogEvent(EventUpload, pubHash, "explorer", remoteAddr,
+		explorerEventLogArgs(evt, rel, ip)...)
+	s.enqueueBadUploadCheck(rel, pubHash, ip)
+	return nil
+}
+
+func (s *Server) recordExplorerDownload(evt explorerevents.Event, pubHash string, remoteAddr net.Addr, ip string) error {
+	if pubHash == "" {
+		return errors.New("explorer download missing client ip")
+	}
+	if _, err := s.store.UpsertUserSession(pubHash, remoteAddr); err != nil {
+		return err
+	}
+	rel := cleanExplorerEventPath(evt.Path)
+	if rel == "" {
+		return errors.New("explorer download missing path")
+	}
+	if !s.store.FileExistsInDB(rel) {
+		size := evt.Size
+		if size <= 0 {
+			size = evt.Bytes
+		}
+		s.store.RegisterFile(rel, systemOwner, size, false)
+	}
+	if err := s.store.RecordDownload(pubHash, rel, evt.Bytes); err != nil {
+		return err
+	}
+	s.store.LogEvent(EventDownload, pubHash, "explorer", remoteAddr,
+		explorerEventLogArgs(evt, rel, ip)...)
+	return nil
+}
+
+func explorerEventLogArgs(evt explorerevents.Event, rel, ip string) []any {
+	args := []any{
+		"source", "explorer",
+		"client_ip", ip,
+		"remote_addr", evt.RemoteAddr,
+		"bytes", evt.Bytes,
+		"size", evt.Size,
+		"delta", evt.Delta,
+		"duration_ms", evt.DurationMS,
+		"avg_bytes_per_sec", evt.AvgBytesPerSec,
+		"status", evt.Status,
+		"method", evt.Method,
+		"url_path", evt.URLPath,
+		"query", evt.Query,
+		"level", evt.Level,
+		"message", evt.Message,
+	}
+	if rel != "" {
+		args = append([]any{"path", rel}, args...)
+		args = append(args, "file", rel, "filename", path.Base(rel))
+	}
+	if len(evt.Meta) > 0 {
+		args = append(args, "explorer_meta", evt.Meta)
+	}
+	return args
+}
+
+func explorerEventIP(evt explorerevents.Event) string {
+	if ip := normalizeExplorerIP(evt.ClientIP); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(evt.RemoteAddr))
+	if err == nil {
+		return normalizeExplorerIP(host)
+	}
+	return normalizeExplorerIP(evt.RemoteAddr)
+}
+
+func normalizeExplorerIP(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if ip := net.ParseIP(raw); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+func explorerEventRemoteAddr(evt explorerevents.Event, ip string) net.Addr {
+	if host, portStr, err := net.SplitHostPort(strings.TrimSpace(evt.RemoteAddr)); err == nil {
+		if parsed := net.ParseIP(host); parsed != nil {
+			port, _ := strconv.Atoi(portStr)
+			return &net.TCPAddr{IP: parsed, Port: port}
+		}
+	}
+	if parsed := net.ParseIP(ip); parsed != nil {
+		return &net.TCPAddr{IP: parsed}
+	}
+	return nil
+}
+
+func cleanExplorerEventPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	rel := strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(raw)), "/")
+	if rel == "." {
+		return ""
+	}
+	return rel
+}
+
+func firstExplorerEventNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 	isAdmin := s.cfg.AdminSFTP && s.checkAdminKey(key)
@@ -1631,9 +1930,7 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 func (s *Server) noClientAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
 	ip := getHostIp(conn)
 	s.observeAuthAttempt("none", false)
-
-	data := fmt.Sprintf("anon-auth:%s", ip)
-	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
+	hash := anonAuthHashForIP(ip)
 
 	s.logger.Debug("anonymous login attempt", "ip", ip, "generated_hash", hash)
 
@@ -1642,9 +1939,12 @@ func (s *Server) noClientAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, 
 
 func remoteToPubhash(remoteAddr net.Addr) string {
 	ip, _, _ := net.SplitHostPort(remoteAddr.String())
-	data := fmt.Sprintf("anon-auth:%s", ip)
-	hash := fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
-	return hash
+	return anonAuthHashForIP(ip)
+}
+
+func anonAuthHashForIP(ip string) string {
+	data := fmt.Sprintf("anon-auth:%s", strings.TrimSpace(ip))
+	return fmt.Sprintf("anon-auth:%x", sha256.Sum256([]byte(data)))
 }
 
 func remoteAddrHost(remoteAddr net.Addr) string {
@@ -1812,7 +2112,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 		duration := time.Since(sessionStarted)
 		observeSession(duration)
 		s.store.LogEvent(EventSessionEnd, effectivePubHash, sessionID, sConn.RemoteAddr(),
-			"duration_ms", duration.Milliseconds(),
+			"duration_ms", durationMillis(duration),
 			"login_type", loginType,
 			"admin_sftp", isAdminSFTP,
 			"ops", sessionCounts.totalOps.Load(),
@@ -2489,7 +2789,7 @@ func (h *fsHandler) logDownload(rel string, transferred int64, duration time.Dur
 	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
 		"path", rel,
 		"size", transferred,
-		"duration_ms", duration.Milliseconds(),
+		"duration_ms", durationMillis(duration),
 		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
 	)
 	_ = h.srv.store.RecordDownload(h.pubHash, rel, transferred)
@@ -2510,7 +2810,7 @@ func (h *fsHandler) logUpload(rel string, size, delta, transferred int64, durati
 		"size", size,
 		"delta", delta,
 		"transferred", transferred,
-		"duration_ms", duration.Milliseconds(),
+		"duration_ms", durationMillis(duration),
 		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
 	)
 }
@@ -3116,6 +3416,17 @@ func averageBytesPerSecond(bytes int64, duration time.Duration) int64 {
 	return int64(float64(bytes)/duration.Seconds() + 0.5)
 }
 
+func durationMillis(duration time.Duration) float64 {
+	if duration <= 0 {
+		return 0
+	}
+	ms := float64(duration) / float64(time.Millisecond)
+	if ms < 1 {
+		return ms
+	}
+	return float64(duration.Milliseconds())
+}
+
 func formatBytesFloat(b float64) string {
 	if b < 1024 {
 		return fmt.Sprintf("%.0f B", b)
@@ -3449,6 +3760,7 @@ func setupLogger(cfg Config) (*slog.Logger, *logutil.FileWriter, error) {
 		"admin.http.token", cfg.AdminHTTPToken != "",
 		"admin.http.token.file", cfg.AdminHTTPTokenFile != "",
 		"admin.explorer.warm.max", cfg.AdminExplorerWarmMax,
+		"explorer.events", cfg.ExplorerEventsSocket,
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"caid_db", cfg.CAIDDBPath,
@@ -3601,6 +3913,13 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	srv.startMaintenanceLoop(time.Hour)
+	go func() {
+		defer recoverAndLogPanic(logger, "explorer event listener")
+		if err := srv.ListenExplorerEvents(); err != nil {
+			logger.Error("explorer event listener failed", "err", err)
+		}
+	}()
+
 	go func() {
 		defer recoverAndLogPanic(logger, "ssh listener")
 		if err := srv.Listen(); err != nil {
