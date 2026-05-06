@@ -125,6 +125,7 @@ const (
 	// System defaults
 	defaultUID            = 1000
 	defaultGID            = 1000
+	defaultMaxConnsPerIP  = 50
 	unrestrictedUID       = 1337
 	unrestrictedGID       = 1337
 	badFileCheckQueueSize = 256
@@ -941,6 +942,7 @@ func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr n
 type Config struct {
 	Name                    string
 	Port                    int
+	MaxConnectionsPerIP     int
 	AdminHTTP               string
 	AdminHTTPToken          string
 	AdminHTTPTokenFile      string
@@ -984,6 +986,7 @@ func LoadConfig() (Config, error) {
 
 	EnvFlag(&cfg.Name, "name", "ARCHIVE_NAME", "sftpguy", "Archive name", "n")
 	EnvFlag(&cfg.Port, "port", "PORT", 2222, "SSH port", "p")
+	EnvFlag(&cfg.MaxConnectionsPerIP, "conn.max_per_ip", "MAX_CONNECTIONS_PER_IP", defaultMaxConnsPerIP, "Maximum simultaneous SSH connections per IP address (0 disables)")
 	EnvFlag(&cfg.AdminHTTP, "admin.http", "ADMIN_HTTP", "", "Enable web admin console on this address (example: 127.0.0.1:8080)")
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
 	EnvFlag(&cfg.AdminHTTPTokenFile, "admin.http.token.file", "ADMIN_HTTP_TOKEN_FILE", "", "Optional file to load admin bearer token from; generates one when file is missing or empty")
@@ -1135,6 +1138,9 @@ func (c Config) Validate() error {
 	if c.Port < minPort || c.Port > maxPort {
 		return fmt.Errorf("port must be between %d and %d", minPort, maxPort)
 	}
+	if c.MaxConnectionsPerIP < 0 {
+		return fmt.Errorf("conn.max_per_ip must be >= 0")
+	}
 	if c.AdminHTTP != "" {
 		if _, _, err := net.SplitHostPort(c.AdminHTTP); err != nil {
 			return fmt.Errorf("admin.http must be host:port, got %q: %w", c.AdminHTTP, err)
@@ -1194,6 +1200,8 @@ type Server struct {
 	listener           net.Listener
 	wg                 sync.WaitGroup
 	shutdown           chan struct{}
+	activeConnMu       sync.Mutex
+	activeConnByIP     map[string]int
 	ctx                context.Context
 	cancel             context.CancelFunc
 	adminShutdownMu    sync.Mutex
@@ -1249,6 +1257,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		cfg:              cfg,
 		absUploadDir:     absDir,
 		shutdown:         make(chan struct{}),
+		activeConnByIP:   make(map[string]int),
 		ctx:              ctx,
 		cancel:           cancel,
 		adminOneTime:     make(map[string]time.Time),
@@ -1498,6 +1507,45 @@ func (s *Server) processBadUploadCheck(logger *slog.Logger, check badUploadCheck
 	}
 }
 
+func (s *Server) acquireIPConnection(remoteAddr net.Addr) (string, int, bool) {
+	ip := remoteAddrHost(remoteAddr)
+	if s == nil || s.cfg.MaxConnectionsPerIP <= 0 || ip == "" {
+		return ip, 0, true
+	}
+
+	s.activeConnMu.Lock()
+	defer s.activeConnMu.Unlock()
+
+	if s.activeConnByIP == nil {
+		s.activeConnByIP = make(map[string]int)
+	}
+
+	active := s.activeConnByIP[ip]
+	if active >= s.cfg.MaxConnectionsPerIP {
+		return ip, active, false
+	}
+
+	active++
+	s.activeConnByIP[ip] = active
+	return ip, active, true
+}
+
+func (s *Server) releaseIPConnection(ip string) {
+	if s == nil || s.cfg.MaxConnectionsPerIP <= 0 || ip == "" {
+		return
+	}
+
+	s.activeConnMu.Lock()
+	defer s.activeConnMu.Unlock()
+
+	active := s.activeConnByIP[ip]
+	if active <= 1 {
+		delete(s.activeConnByIP, ip)
+		return
+	}
+	s.activeConnByIP[ip] = active - 1
+}
+
 func (s *Server) Listen() error {
 	if err := s.ensureHostKey(); err != nil {
 		return err
@@ -1540,6 +1588,16 @@ func (s *Server) Listen() error {
 
 		addr := conn.RemoteAddr()
 		log.Info("new connection", "remote_addr", addr)
+		ip, active, ok := s.acquireIPConnection(addr)
+		if !ok {
+			s.logger.Warn("connection limit exceeded",
+				"remote_addr", addr,
+				"ip", ip,
+				"active", active,
+				"limit", s.cfg.MaxConnectionsPerIP)
+			conn.Close()
+			continue
+		}
 		throttled := s.store.IsBannedByIp(addr)
 		s.observeAcceptedConnection(throttled)
 		if throttled {
@@ -1550,6 +1608,7 @@ func (s *Server) Listen() error {
 		connLogger := s.logger.With("remote_addr", addr.String())
 		go func(c net.Conn, workerLogger *slog.Logger) {
 			defer s.wg.Done()
+			defer s.releaseIPConnection(ip)
 			defer s.closeObservedConnection()
 			defer recoverAndLogPanic(workerLogger, "ssh connection worker")
 			s.handleSSH(c, sshConfig)
@@ -3383,6 +3442,7 @@ func setupLogger(cfg Config) (*slog.Logger, *logutil.FileWriter, error) {
 		"name", cfg.Name,
 		"version", AppVersion,
 		"port", cfg.Port,
+		"conn.max_per_ip", cfg.MaxConnectionsPerIP,
 		"admin.sftp", cfg.AdminSFTP,
 		"admin.keys", cfg.AdminKeysPath,
 		"admin.http", cfg.AdminHTTP,

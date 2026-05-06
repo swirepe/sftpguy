@@ -139,6 +139,7 @@ Run `go run . -h` for the full list. The flags most operators care about are:
 | Flag | Purpose |
 | --- | --- |
 | `-port` | SSH listen port. Default: `2222`. |
+| `-conn.max_per_ip` | Maximum simultaneous SSH connections from one IP address. Default: `50`; `0` disables the cap. |
 | `-dir` | Upload directory on disk. Default: `./uploads`. |
 | `-db.path` | SQLite database path. Default: `sftp.db`. |
 | `-hostkey` | SSH host key path. Default: `id_ed25519`. |

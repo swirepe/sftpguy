@@ -74,6 +74,7 @@ On startup the store:
 The SFTP surface is primarily shaped by these flags and env vars:
 
 - `-port`: SSH listen port
+- `-conn.max_per_ip`: maximum simultaneous SSH connections from one IP address, `0` disables the cap
 - `-dir`: archive root directory
 - `-hostkey`: SSH host key path
 - `-db.path`: SQLite database path
@@ -126,6 +127,7 @@ This service is not a conventional authenticated multi-user SFTP server. In the 
 
 ## Session Behavior
 
+- Connections above `-conn.max_per_ip` for the same remote IP are closed before SSH auth.
 - IP-blacklisted connections are accepted and immediately wrapped in a throttled TCP connection before SSH auth completes.
 - Successful sessions log `session/start` and `session/end` events with duration, login type, admin flag, ban flag, and operation counters.
 - User stats are upserted on login, including `last_login`, `last_address`, and `seen`.
