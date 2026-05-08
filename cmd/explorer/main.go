@@ -266,6 +266,12 @@ func main() {
 	}()
 	eventClient = explorerevents.NewClient(eventsSocket, logger)
 
+	policy, err := eventClient.CheckIP(context.Background(), "188.166.211.175")
+	logger.Info("checking ip blacklist", "policy", policy, "error", err)
+
+	policy, err = eventClient.CheckIP(context.Background(), "127.0.0.1")
+	logger.Info("checking ip whitelist", "policy", policy, "error", err)
+
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
 		fatalLog("resolve root", "err", err)
