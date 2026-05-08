@@ -1896,14 +1896,14 @@ func normalizeExplorerIP(raw string) string {
 }
 
 func explorerEventRemoteAddr(evt explorerevents.Event, ip string) net.Addr {
+	if parsed := net.ParseIP(ip); parsed != nil {
+		return &net.TCPAddr{IP: parsed}
+	}
 	if host, portStr, err := net.SplitHostPort(strings.TrimSpace(evt.RemoteAddr)); err == nil {
 		if parsed := net.ParseIP(host); parsed != nil {
 			port, _ := strconv.Atoi(portStr)
 			return &net.TCPAddr{IP: parsed, Port: port}
 		}
-	}
-	if parsed := net.ParseIP(ip); parsed != nil {
-		return &net.TCPAddr{IP: parsed}
 	}
 	return nil
 }

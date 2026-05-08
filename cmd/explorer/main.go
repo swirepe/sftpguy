@@ -397,6 +397,10 @@ func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
 		l = l.With(clientLogGroup(r))
 	}
 
+	if r.URL.Query().Has("please") {
+		l = l.With("plz", true)
+	}
+
 	return l
 }
 
