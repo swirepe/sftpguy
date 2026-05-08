@@ -9,7 +9,7 @@
 //   -port       Server port (default: 2222)
 //   -hostkey    Server public key .pub file (optional)
 //   -adminkey   Private key for admin-sftp checks (host key or configured admin key)
-//   -system     A system-owned file on the server (default: README.txt)
+//   -system     A system-owned path on the server (default: public)
 //   -threshold  Contributor threshold bytes, match -contrib (default: 1048576)
 //   -noauth     Run noClientAuth suite, server needs -noauth (default: true)
 //   -v          Verbose error detail for all steps
@@ -40,7 +40,7 @@ var (
 	flagPort      = flag.Int("port", 2222, "Server port")
 	flagHostKey   = flag.String("hostkey", "", "Path to server public key file (optional)")
 	flagAdminKey  = flag.String("adminkey", "", "Path to private key for admin-sftp checks (host key or configured admin key)")
-	flagSystem    = flag.String("system", "README.txt", "A system-owned file present on the server")
+	flagSystem    = flag.String("system", "public", "A system-owned path present on the server")
 	flagThreshold = flag.Int64("threshold", 1048576, "Contributor threshold bytes")
 	flagNoAuth    = flag.Bool("noauth", true, "Run noClientAuth suite")
 	flagVerbose   = flag.Bool("v", false, "Verbose error detail")
@@ -575,7 +575,7 @@ func runResumeSuite(label string, auth ssh.AuthMethod) *suite {
 }
 
 func runSystemFileSuite(auth ssh.AuthMethod) *suite {
-	s := &suite{name: fmt.Sprintf("System file protection (%s)", *flagSystem)}
+	s := &suite{name: fmt.Sprintf("System path protection (%s)", *flagSystem)}
 	sshCli, sftpCli, err := openSFTP(auth)
 	s.check("connect to server (SFTP)", "ok", err)
 	if err != nil {
@@ -614,6 +614,7 @@ func runAdminSuite(adminKeyPath string) *suite {
 	}
 
 	victimFile := "testclient_admin_victim_" + randSuffix() + ".txt"
+	victimContent := payload(*flagThreshold)
 	victimSSH, victimSFTP, err := openSFTP(victimAuth)
 	s.check("setup victim connection ("+victimLabel+")", "ok", err)
 	if err != nil {
@@ -622,8 +623,8 @@ func runAdminSuite(adminKeyPath string) *suite {
 		}
 		return s
 	}
-	s.check("setup victim write file", "ok", sftpWrite(victimSFTP, victimFile, []byte("victim file contents")))
-	s.check("setup victim verify file", "ok", sftpCheckContent(victimSFTP, victimFile, []byte("victim file contents")))
+	s.check("setup victim write file", "ok", sftpWrite(victimSFTP, victimFile, victimContent))
+	s.check("setup victim verify file", "ok", sftpCheckContent(victimSFTP, victimFile, victimContent))
 	_ = victimSFTP.Close()
 	_ = victimSSH.Close()
 

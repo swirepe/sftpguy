@@ -98,6 +98,72 @@ func TestHandlePublicDirectoryRendersBannerAndPublicDownloads(t *testing.T) {
 	}
 }
 
+func TestHandleDirectoryListingRendersHeaderAndFooterTemplateFilesWithNonce(t *testing.T) {
+	setupExplorerTestRoot(t)
+
+	fragmentDir := t.TempDir()
+	headerPath := filepath.Join(fragmentDir, "header.html")
+	footerPath := filepath.Join(fragmentDir, "footer.html")
+	mustWriteFile(t, headerPath, `<script nonce="{{.Nonce}}">window.headerLoaded = true;</script>`)
+	mustWriteFile(t, footerPath, `<script nonce="{{.Nonce}}">window.footerLoaded = true;</script>`)
+	headerFragment = &htmlFragmentSource{name: "header", path: headerPath}
+	footerFragment = &htmlFragmentSource{name: "footer", path: footerPath}
+
+	w := serveExplorerRequest(http.MethodGet, "/", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`<script nonce="test-nonce">window.headerLoaded = true;</script>`,
+		`<script nonce="test-nonce">window.footerLoaded = true;</script>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected rendered fragment %q, body=%s", want, body)
+		}
+	}
+	if strings.Contains(body, "{{.Nonce}}") {
+		t.Fatalf("fragment template nonce was not evaluated, body=%s", body)
+	}
+
+	mustWriteFile(t, headerPath, `<script nonce="{{.Nonce}}">window.headerReloaded = true;</script>`)
+	w = serveExplorerRequest(http.MethodGet, "/", nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET / after header change status = %d, body=%s", w.Code, w.Body.String())
+	}
+	body = w.Body.String()
+	if !strings.Contains(body, `<script nonce="test-nonce">window.headerReloaded = true;</script>`) {
+		t.Fatalf("expected reloaded header fragment, body=%s", body)
+	}
+	if strings.Contains(body, "window.headerLoaded = true") {
+		t.Fatalf("expected updated header fragment to replace old contents, body=%s", body)
+	}
+}
+
+func TestHandleDirectoryListingSkipsMissingFragmentAndLogsFirstFailure(t *testing.T) {
+	setupExplorerTestRoot(t)
+
+	headerFragment = &htmlFragmentSource{name: "header", path: filepath.Join(t.TempDir(), "missing-header.html")}
+	logBuf := captureExplorerLogs(t)
+
+	for i := 0; i < 2; i++ {
+		w := serveExplorerRequest(http.MethodGet, "/", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET / attempt %d status = %d, body=%s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	logs := logBuf.String()
+	if got := strings.Count(logs, "optional template fragment unavailable"); got != 1 {
+		t.Fatalf("fragment failure log count = %d, want 1; logs=%s", got, logs)
+	}
+	if !strings.Contains(logs, "fragment=header") {
+		t.Fatalf("fragment failure log missing header name, logs=%s", logs)
+	}
+}
+
 func TestHandleLockedFileRedirectsToParentDirectory(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 	mustWriteFile(t, filepath.Join(root, "docs", "private.txt"), "secret")
@@ -911,19 +977,19 @@ func setupExplorerTestRoot(t *testing.T) string {
 	t.Helper()
 
 	oldRootDir := rootDir
-	oldHeaderHTML := headerHTML
-	oldFooterHTML := footerHTML
+	oldHeaderFragment := headerFragment
+	oldFooterFragment := footerFragment
 	oldMaxFileSize := maxFileSize
 
 	rootDir = t.TempDir()
-	headerHTML = ""
-	footerHTML = ""
+	headerFragment = &htmlFragmentSource{name: "header"}
+	footerFragment = &htmlFragmentSource{name: "footer"}
 	maxFileSize = 10 << 20
 
 	t.Cleanup(func() {
 		rootDir = oldRootDir
-		headerHTML = oldHeaderHTML
-		footerHTML = oldFooterHTML
+		headerFragment = oldHeaderFragment
+		footerFragment = oldFooterFragment
 		maxFileSize = oldMaxFileSize
 	})
 

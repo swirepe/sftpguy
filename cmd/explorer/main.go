@@ -46,8 +46,8 @@ const (
 var (
 	rootDir             string
 	maxFileSize         int64
-	headerHTML          template.HTML
-	footerHTML          template.HTML
+	headerFragment      = &htmlFragmentSource{name: "header"}
+	footerFragment      = &htmlFragmentSource{name: "footer"}
 	logger              = newLogger(os.Stderr)
 	eventClient         *explorerevents.Client
 	errUploadBadRequest = errors.New("upload bad request")
@@ -231,8 +231,8 @@ func main() {
 	flag.Int64Var(&maxSizeMB, "maxsize", 1000, "Max upload size in MB")
 	flag.StringVar(&logPath, "log", "explorer.log", "Log file path")
 	flag.StringVar(&eventsSocket, "events", "", "Unix socket path for sending upload/download/request events to sftpguy")
-	flag.StringVar(&headerPath, "header", "", "Path to an HTML fragment to inject at the top of every page")
-	flag.StringVar(&footerPath, "footer", "", "Path to an HTML fragment to inject at the bottom of every page")
+	flag.StringVar(&headerPath, "header", "header.html", "Path to an HTML template fragment to inject at the top of directory pages; read per request")
+	flag.StringVar(&footerPath, "footer", "footer.html", "Path to an HTML template fragment to inject at the bottom of directory pages; read per request")
 	src := flag.Bool("src", false, "Print this program's source and exit")
 	flag.Parse()
 
@@ -243,20 +243,8 @@ func main() {
 
 	maxFileSize = maxSizeMB << 20
 
-	if headerPath != "" {
-		b, err := os.ReadFile(headerPath)
-		if err != nil {
-			fatalLog("read header file", "path", headerPath, "err", err)
-		}
-		headerHTML = template.HTML(b)
-	}
-	if footerPath != "" {
-		b, err := os.ReadFile(footerPath)
-		if err != nil {
-			fatalLog("read footer file", "path", footerPath, "err", err)
-		}
-		footerHTML = template.HTML(b)
-	}
+	headerFragment = &htmlFragmentSource{name: "header", path: headerPath}
+	footerFragment = &htmlFragmentSource{name: "footer", path: footerPath}
 
 	start := time.Now()
 	lf, stop, err := initLogger(logPath)
@@ -828,10 +816,11 @@ func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullP
 		DirectoryLink: directoryLink,
 		Arrow:         arrow,
 		UploadPath:    (&url.URL{Path: "/" + relPath}).EscapedPath(),
-		Header:        headerHTML,
-		Footer:        footerHTML,
 		RenderTime:    time.Since(start),
 	}
+
+	data.Header = headerFragment.Render(data, reqLog)
+	data.Footer = footerFragment.Render(data, reqLog)
 
 	var body bytes.Buffer
 	if err := tmpl.Execute(&body, data); err != nil {
@@ -848,6 +837,73 @@ func serveDir(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, fullP
 	if _, err := body.WriteTo(w); err != nil {
 		reqLog.Error("write directory", "dir", relPath, "err", err)
 	}
+}
+
+func readHTMLFragmentTemplate(name, path string) (*template.Template, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s file: %w", name, err)
+	}
+	return parseHTMLFragmentTemplate(name, string(b))
+}
+
+func parseHTMLFragmentTemplate(name, text string) (*template.Template, error) {
+	t, err := template.New(name).Parse(text)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s template: %w", name, err)
+	}
+	return t, nil
+}
+
+type htmlFragmentSource struct {
+	name    string
+	path    string
+	mu      sync.Mutex
+	failing bool
+}
+
+func (s *htmlFragmentSource) Render(data any, log *slog.Logger) template.HTML {
+	if s == nil || s.path == "" {
+		return ""
+	}
+
+	t, err := readHTMLFragmentTemplate(s.name, s.path)
+	if err != nil {
+		s.recordFailure(log, err)
+		return ""
+	}
+
+	var body bytes.Buffer
+	if err := t.Execute(&body, data); err != nil {
+		s.recordFailure(log, fmt.Errorf("execute %s template: %w", s.name, err))
+		return ""
+	}
+	s.recordSuccess()
+	return template.HTML(body.String())
+}
+
+func (s *htmlFragmentSource) recordFailure(log *slog.Logger, err error) {
+	s.mu.Lock()
+	shouldLog := !s.failing
+	s.failing = true
+	s.mu.Unlock()
+
+	if !shouldLog {
+		return
+	}
+	if log == nil {
+		log = logger
+	}
+	log.Warn("optional template fragment unavailable",
+		"fragment", s.name,
+		"fragment_path", s.path,
+		"err", err)
+}
+
+func (s *htmlFragmentSource) recordSuccess() {
+	s.mu.Lock()
+	s.failing = false
+	s.mu.Unlock()
 }
 
 func readDir(fullPath, relPath string) ([]entry, error) {

@@ -41,8 +41,8 @@ The command supports these flags:
 - `-maxsize`: max upload size in MB, default `1000`
 - `-log`: log file path, default `explorer.log`
 - `-events`: optional Unix socket path used to send upload, download, and request events to `sftpguy`
-- `-header`: optional HTML fragment injected at the top of every page
-- `-footer`: optional HTML fragment injected at the bottom of every page
+- `-header`: optional HTML template fragment read and injected at the top of every directory page
+- `-footer`: optional HTML template fragment read and injected at the bottom of every directory page
 - `-src`: prints the command source and exits
 
 Startup behavior:
@@ -51,6 +51,7 @@ Startup behavior:
 - creates the root directory if missing
 - writes logs to both stdout and the configured log file
 - uses a systemd-inherited TCP socket named `explorer` when present, otherwise starts a TCP listener on the configured port
+- stores optional header/footer paths without requiring them to be readable at startup
 - if `-events` is set, sends structured JSON events to the Unix socket without blocking the request path
 
 ## Request Model
@@ -123,7 +124,8 @@ The directory view includes:
 - separate directory and file rows, with directories always sorted first
 - highlighting of public entries
 - upload controls including drag-and-drop and folder upload
-- optional injected header and footer fragments
+- optional injected header and footer template fragments; fragments are read and rendered per request with the page data, including `.Nonce` for inline scripts allowed by the page CSP
+- unreadable or invalid header/footer fragments are skipped without failing the page; the first failure in a failing streak is logged
 
 ### Hidden directories
 

@@ -280,6 +280,29 @@ sudo ./sftpguy \
 
 The explorer service gets its own TCP socket and sends upload, download, and request events over the systemd-owned Unix socket at `/run/<service>/explorer-events.sock`. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
 
+### Testing the systemd Installer With Lima
+
+If you have Lima installed on macOS, the repository includes a smoke test that exercises the real systemd installer inside an Ubuntu VM:
+
+```bash
+scripts/test-systemd-install-lima.sh
+```
+
+The script creates or starts a Lima instance named `sftpguy-install-test`, cross-compiles Linux binaries, copies them into the guest, runs `sudo ./sftpguy -install`, verifies the generated unit files with `systemd-analyze verify`, checks the units are enabled and active, stops the services and connects through the SFTP and explorer sockets to prove socket activation works, then runs the standalone SFTP test client against the installed service.
+
+Useful overrides:
+
+```bash
+LIMA_INSTANCE=default scripts/test-systemd-install-lima.sh
+WITH_EXPLORER=0 scripts/test-systemd-install-lima.sh
+KEEP_INSTALL=1 scripts/test-systemd-install-lima.sh
+SERVER_EXTRA_ARGS="-admin.sftp" KEEP_INSTALL=1 scripts/test-systemd-install-lima.sh
+RUN_TEST_CLIENT=0 SERVER_EXTRA_ARGS="-noauth -admin.sftp" scripts/test-systemd-install-lima.sh
+DESTROY_LIMA=1 scripts/test-systemd-install-lima.sh
+```
+
+By default it cleans up the installed units and `/var/lib/sftpguy-install-test` in the guest, but it leaves the Lima VM itself in place. The full standalone client suite is skipped automatically when `SERVER_EXTRA_ARGS` includes `-noauth`, because no-auth local sessions use the same anonymous-by-IP identity and cannot exercise per-key ownership rules.
+
 ## Repository Extras
 
 This repo also contains a couple of related helper binaries:
