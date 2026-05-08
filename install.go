@@ -69,16 +69,11 @@ Group={{.Group}}
 WorkingDirectory={{.InstallDir}}
 Sockets={{.SFTPSocketName}} {{.ExplorerEventsSocketName}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
-Restart=always
-RestartSec=5
 
 # If server handles syslog internally, discard stdout to avoid duplicate logs in journal
 StandardOutput={{if .UseSyslog}}null{{else}}journal{{end}}
 StandardError={{if .UseSyslog}}null{{else}}journal{{end}}
 SyslogIdentifier={{.Name}}
-
-[Install]
-WantedBy=multi-user.target
 `))
 
 var tcpSocketTemplate = template.Must(template.New("tcp-socket").Parse(`[Unit]
@@ -121,14 +116,9 @@ Group={{.Group}}
 WorkingDirectory={{.InstallDir}}
 Sockets={{.SocketName}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
-Restart=always
-RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier={{.Name}}
-
-[Install]
-WantedBy=multi-user.target
 `))
 
 // sanitizeName returns a filesystem/service-safe version of the archive name:
@@ -173,6 +163,9 @@ type installOptions struct {
 	ExplorerPort         int
 	ExplorerLogFile      string
 	ExplorerEventsSocket string
+	ExplorerHeaderPath   string
+	ExplorerFooterPath   string
+	ExplorerMaxSizeMB    int64
 }
 
 // runInstall installs this binary as a systemd service.  Must be run as root.
@@ -191,6 +184,9 @@ func runInstall(opts installOptions) error {
 	}
 	if opts.ExplorerPort == 0 {
 		opts.ExplorerPort = 8080
+	}
+	if opts.ExplorerMaxSizeMB < 0 {
+		return fmt.Errorf("explorer maxsize must be >= 0")
 	}
 	if strings.TrimSpace(opts.UploadDir) == "" {
 		opts.UploadDir = "./uploads"
@@ -233,6 +229,8 @@ func runInstall(opts installOptions) error {
 			break
 		}
 	}
+	serviceArgs := append([]string{}, opts.Args...)
+	serviceArgs = append(serviceArgs, "-systemd.socket")
 
 	params := serviceParams{
 		Description:              opts.Name,
@@ -241,7 +239,7 @@ func runInstall(opts installOptions) error {
 		Group:                    opts.Group,
 		InstallDir:               installDir,
 		BinaryPath:               binaryDst,
-		Args:                     opts.Args,
+		Args:                     serviceArgs,
 		UseSyslog:                useSyslog,
 		SFTPSocketName:           socketName,
 		ExplorerEventsSocketName: explorerEventsSocketName,
@@ -316,10 +314,9 @@ func runInstall(opts installOptions) error {
 		if err := copyExecutable(explorerSrc, explorerDst); err != nil {
 			return fmt.Errorf("copy explorer binary: %w", err)
 		}
-		explorerArgs := []string{
-			"-dir", opts.UploadDir,
-			"-log", opts.ExplorerLogFile,
-			"-events", opts.ExplorerEventsSocket,
+		explorerArgs, err := installExplorerArgs(opts, installDir)
+		if err != nil {
+			return err
 		}
 		explorerSvcContent, err := renderUnit(explorerServiceTemplate, explorerServiceParams{
 			Description:      opts.Name,
@@ -363,11 +360,23 @@ func runInstall(opts installOptions) error {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	units := []string{socketName, explorerEventsSocketName, serviceName}
-	startUnits := []string{socketName, explorerEventsSocketName, serviceName}
+	_ = run("systemctl", "stop", serviceName)
+	_ = run("systemctl", "disable", serviceName)
+	_ = os.Remove(filepath.Join("/etc/systemd/system/multi-user.target.wants", serviceName))
+	_ = run("systemctl", "reset-failed", serviceName)
+
+	units := []string{socketName, explorerEventsSocketName}
+	startUnits := []string{socketName, explorerEventsSocketName}
 	if explorerInstalled {
-		units = append(units, explorerSocketName, explorerServiceName)
-		startUnits = append(startUnits, explorerSocketName, explorerServiceName)
+		_ = run("systemctl", "stop", explorerServiceName)
+		_ = run("systemctl", "disable", explorerServiceName)
+		_ = os.Remove(filepath.Join("/etc/systemd/system/multi-user.target.wants", explorerServiceName))
+		_ = run("systemctl", "reset-failed", explorerServiceName)
+		units = append(units, explorerSocketName)
+		startUnits = append(startUnits, explorerSocketName)
+	}
+	if err := run("systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("systemctl daemon-reload after service cleanup: %w", err)
 	}
 
 	for _, unit := range units {
@@ -382,12 +391,12 @@ func runInstall(opts installOptions) error {
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"Installed %s\n  binary:  %s\n  service: %s\n  sockets: %s, %s\n  status:  systemctl status %s\n",
-		opts.Name, binaryDst, serviceDst, socketDst, explorerEventsSocketDst, serviceName)
+		"Installed %s\n  binary:  %s\n  service: %s\n  sockets: %s, %s\n  status:  systemctl status %s %s\n",
+		opts.Name, binaryDst, serviceDst, socketDst, explorerEventsSocketDst, socketName, explorerEventsSocketName)
 	if explorerInstalled {
 		fmt.Fprintf(os.Stderr,
-			"  explorer service: %s\n  explorer socket:  %s\n",
-			explorerServiceDst, explorerSocketDst)
+			"  explorer service: %s\n  explorer socket:  %s\n  explorer status:  systemctl status %s\n",
+			explorerServiceDst, explorerSocketDst, explorerSocketName)
 	}
 	return nil
 }
@@ -431,6 +440,57 @@ func resolveExplorerBinary(self, explicit, serviceName string) (string, error) {
 	return "", nil
 }
 
+func installExplorerArgs(opts installOptions, installDir string) ([]string, error) {
+	if opts.ExplorerMaxSizeMB < 0 {
+		return nil, fmt.Errorf("explorer maxsize must be >= 0")
+	}
+	args := []string{
+		"-dir", opts.UploadDir,
+		"-log", opts.ExplorerLogFile,
+		"-events", opts.ExplorerEventsSocket,
+		"-maxsize", strconv.FormatInt(opts.ExplorerMaxSizeMB, 10),
+		"-systemd.socket",
+	}
+	if headerPath, err := installExplorerFragment(opts.ExplorerHeaderPath, installDir, "header"); err != nil {
+		return nil, err
+	} else if headerPath != "" {
+		args = append(args, "-header", headerPath)
+	}
+	if footerPath, err := installExplorerFragment(opts.ExplorerFooterPath, installDir, "footer"); err != nil {
+		return nil, err
+	} else if footerPath != "" {
+		args = append(args, "-footer", footerPath)
+	}
+	return args, nil
+}
+
+func installExplorerFragment(explicitPath, installDir, kind string) (string, error) {
+	src := strings.TrimSpace(explicitPath)
+	required := src != ""
+	if src == "" {
+		src = kind + ".html"
+	}
+	srcAbs, err := filepath.Abs(src)
+	if err != nil {
+		return "", fmt.Errorf("resolve explorer %s fragment: %w", kind, err)
+	}
+	st, err := os.Stat(srcAbs)
+	if err != nil {
+		if !required && os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat explorer %s fragment %q: %w", kind, srcAbs, err)
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("explorer %s fragment %q is a directory", kind, srcAbs)
+	}
+	dst := filepath.Join(installDir, "explorer-"+kind+filepath.Ext(srcAbs))
+	if err := copyFile(srcAbs, dst, 0644); err != nil {
+		return "", fmt.Errorf("copy explorer %s fragment: %w", kind, err)
+	}
+	return dst, nil
+}
+
 // ensureUserGroup creates the service user and group if they don't already
 // exist (when ensure is true), or returns an error if they are missing (when
 // ensure is false).
@@ -461,13 +521,17 @@ func ensureUserGroup(user, group string, ensure bool) error {
 }
 
 func copyExecutable(src, dst string) error {
+	return copyFile(src, dst, 0755)
+}
+
+func copyFile(src, dst string, mode fs.FileMode) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
 	// Write to a temp file beside dst, then rename for atomicity.
 	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, data, 0755); err != nil {
+	if err := os.WriteFile(tmp, data, mode); err != nil {
 		return err
 	}
 	return os.Rename(tmp, dst)

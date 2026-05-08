@@ -271,12 +271,16 @@ verify_units() {
 	log "Verifying systemd unit files"
 	guest sudo systemd-analyze verify "${units[@]}"
 
-	log "Checking installed units are enabled and active"
-	guest sudo systemctl is-enabled "${service_name}.service" "${service_name}.socket" "${service_name}-explorer-events.socket"
-	guest sudo systemctl is-active "${service_name}.service" "${service_name}.socket" "${service_name}-explorer-events.socket"
+	log "Checking installed socket units are enabled and active"
+	guest sudo systemctl is-enabled "${service_name}.socket" "${service_name}-explorer-events.socket"
+	guest sudo systemctl is-active "${service_name}.socket" "${service_name}-explorer-events.socket"
+	guest_bash "state=\"\$(sudo systemctl is-enabled '${service_name}.service' 2>/dev/null || true)\"; [[ \"\$state\" != enabled ]]"
+	guest_bash "! sudo systemctl is-active --quiet '${service_name}.service'"
 	if [[ "$with_explorer" == "1" ]]; then
-		guest sudo systemctl is-enabled "${service_name}-explorer.service" "${service_name}-explorer.socket"
-		guest sudo systemctl is-active "${service_name}-explorer.service" "${service_name}-explorer.socket"
+		guest sudo systemctl is-enabled "${service_name}-explorer.socket"
+		guest sudo systemctl is-active "${service_name}-explorer.socket"
+		guest_bash "state=\"\$(sudo systemctl is-enabled '${service_name}-explorer.service' 2>/dev/null || true)\"; [[ \"\$state\" != enabled ]]"
+		guest_bash "! sudo systemctl is-active --quiet '${service_name}-explorer.service'"
 	fi
 }
 

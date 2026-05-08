@@ -956,6 +956,7 @@ type Config struct {
 	LogFile                 string
 	Syslog                  bool
 	ExplorerEventsSocket    string
+	RequireSystemdSockets   bool
 	UploadDir               string
 	BannerFile              string
 	BannerStats             bool
@@ -1001,6 +1002,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
 	EnvFlag(&cfg.Syslog, "syslog", "SYSLOG", false, "Enable logging to local syslog (Linux only)")
 	EnvFlag(&cfg.ExplorerEventsSocket, "explorer.events", "EXPLORER_EVENTS", "", "Unix socket path for standalone explorer upload/download/log events")
+	EnvFlag(&cfg.RequireSystemdSockets, "systemd.socket", "SYSTEMD_SOCKET", false, "Require inherited systemd sockets instead of binding configured ports/paths")
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
 	EnvFlag(&cfg.BannerStats, "banner.stats", "BANNER_STATS", false, "Show file statistics in the banner")
@@ -1040,6 +1042,9 @@ func LoadConfig() (Config, error) {
 	installExplorer := flag.String("install.explorer", "", "Optional path to standalone explorer binary to install with socket activation")
 	installExplorerPort := flag.Int("install.explorer.port", 8080, "Explorer HTTP port for the systemd socket")
 	installExplorerLog := flag.String("install.explorer.log", "", "Explorer log file path when installing")
+	installExplorerHeader := flag.String("install.explorer.header", "", "Optional explorer header fragment to copy and pass as -header when installing")
+	installExplorerFooter := flag.String("install.explorer.footer", "", "Optional explorer footer fragment to copy and pass as -footer when installing")
+	installExplorerMaxSize := flag.Int64("install.explorer.maxsize", 1000, "Explorer max upload size in MB when installing; 0 means unlimited")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -1072,6 +1077,9 @@ func LoadConfig() (Config, error) {
 			ExplorerPort:         *installExplorerPort,
 			ExplorerLogFile:      *installExplorerLog,
 			ExplorerEventsSocket: cfg.ExplorerEventsSocket,
+			ExplorerHeaderPath:   *installExplorerHeader,
+			ExplorerFooterPath:   *installExplorerFooter,
+			ExplorerMaxSizeMB:    *installExplorerMaxSize,
 		}
 		if err := runInstall(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
@@ -1566,10 +1574,13 @@ func (s *Server) releaseIPConnection(ip string) {
 }
 
 func (s *Server) sftpListener() (net.Listener, bool, error) {
-	if l, ok, err := socketactivation.ListenerByName("sftp"); err != nil {
+	if l, ok, err := socketactivation.ListenerByNameOrNetwork("sftp", "tcp", "tcp4", "tcp6"); err != nil {
 		return nil, false, err
 	} else if ok {
 		return l, true, nil
+	}
+	if s.cfg.RequireSystemdSockets {
+		return nil, false, fmt.Errorf("systemd socket activation required but socket %q was not inherited", "sftp")
 	}
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.Port))
 	return l, false, err
@@ -1678,10 +1689,13 @@ func (s *Server) ListenExplorerEvents() error {
 }
 
 func (s *Server) explorerEventsListener() (net.Listener, bool, error) {
-	if l, ok, err := socketactivation.ListenerByName("explorer-events"); err != nil {
+	if l, ok, err := socketactivation.ListenerByNameOrNetwork("explorer-events", "unix"); err != nil {
 		return nil, false, err
 	} else if ok {
 		return l, true, nil
+	}
+	if s.cfg.RequireSystemdSockets {
+		return nil, false, fmt.Errorf("systemd socket activation required but socket %q was not inherited", "explorer-events")
 	}
 
 	socketPath := strings.TrimSpace(s.cfg.ExplorerEventsSocket)

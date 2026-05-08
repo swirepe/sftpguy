@@ -262,7 +262,7 @@ sudo ./sftpguy \
   -logfile /var/log/sftpguy.log
 ```
 
-This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, `<service>.socket`, and `<service>-explorer-events.socket`, optionally creates the service user and group, reloads systemd, enables the units, and starts them.
+This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, `<service>.socket`, and `<service>-explorer-events.socket`, optionally creates the service user and group, reloads systemd, enables and starts the socket units, and leaves the service to be started by systemd socket activation. Installed services use `-systemd.socket`, so they require inherited sockets instead of binding the configured ports themselves.
 
 To install the standalone HTTP explorer too, build it beside the main binary and point the installer at it:
 
@@ -273,12 +273,13 @@ sudo ./sftpguy \
   -install \
   -install.explorer ./explorer \
   -install.explorer.port 8080 \
+  -install.explorer.maxsize 1000 \
   -dir /var/lib/sftpguy/uploads \
   -db.path /var/lib/sftpguy/sftp.db \
   -logfile /var/log/sftpguy.log
 ```
 
-The explorer service gets its own TCP socket and sends upload, download, and request events over the systemd-owned Unix socket at `/run/<service>/explorer-events.sock`. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
+The explorer gets its own enabled TCP socket and starts through systemd socket activation when traffic arrives. It sends upload, download, and request events over the systemd-owned Unix socket at `/run/<service>/explorer-events.sock`. The installer passes the explorer-specific `-maxsize` value independently from the SFTP `-maxsize`. Add `-install.explorer.header ./header.html` and/or `-install.explorer.footer ./footer.html` to copy custom fragments into `/var/lib/<service>/` and wire them into the explorer service. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
 
 ### Testing the systemd Installer With Lima
 
@@ -288,7 +289,7 @@ If you have Lima installed on macOS, the repository includes a smoke test that e
 scripts/test-systemd-install-lima.sh
 ```
 
-The script creates or starts a Lima instance named `sftpguy-install-test`, cross-compiles Linux binaries, copies them into the guest, runs `sudo ./sftpguy -install`, verifies the generated unit files with `systemd-analyze verify`, checks the units are enabled and active, stops the services and connects through the SFTP and explorer sockets to prove socket activation works, then runs the standalone SFTP test client against the installed service.
+The script creates or starts a Lima instance named `sftpguy-install-test`, cross-compiles Linux binaries, copies them into the guest, runs `sudo ./sftpguy -install`, verifies the generated unit files with `systemd-analyze verify`, checks the socket units are enabled and active, connects through the SFTP and explorer sockets to prove socket activation works, then runs the standalone SFTP test client against the installed service.
 
 Useful overrides:
 

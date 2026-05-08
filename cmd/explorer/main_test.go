@@ -715,6 +715,32 @@ func TestHandleUploadRejectsOversizeContentLengthEarly(t *testing.T) {
 	}
 }
 
+func TestHandleUploadAllowsUnlimitedMaxSize(t *testing.T) {
+	root := setupExplorerTestRoot(t)
+	maxFileSize = 0
+
+	body, contentType := buildMultipartBody(t, func(writer *multipart.Writer) {
+		fw, err := writer.CreateFormFile("uploadFiles", "large.txt")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write([]byte(strings.Repeat("x", 256))); err != nil {
+			t.Fatalf("write form file: %v", err)
+		}
+	})
+
+	w := serveExplorerBodyRequest(http.MethodPost, "/", bytes.NewReader(body), contentType, []*http.Cookie{
+		{Name: cookieCSRF, Value: "csrf-unlimited"},
+	}, csrfHeaders("csrf-unlimited"))
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := mustReadFile(t, filepath.Join(root, "large.txt")); got != strings.Repeat("x", 256) {
+		t.Fatalf("uploaded file contents length = %d, want 256", len(got))
+	}
+}
+
 func TestHandleUploadDoesNotUnlockOnTruncatedMultipart(t *testing.T) {
 	root := setupExplorerTestRoot(t)
 

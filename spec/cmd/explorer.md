@@ -38,9 +38,10 @@ The command supports these flags:
 
 - `-dir`: root directory to serve, default `./shared`
 - `-port`: HTTP port, default `8080`
-- `-maxsize`: max upload size in MB, default `1000`
+- `-maxsize`: max upload size in MB, default `1000`; `0` means unlimited
 - `-log`: log file path, default `explorer.log`
 - `-events`: optional Unix socket path used to send upload, download, and request events to `sftpguy`
+- `-systemd.socket`: require an inherited systemd socket named `explorer` instead of binding `-port`
 - `-header`: optional HTML template fragment read and injected at the top of every directory page
 - `-footer`: optional HTML template fragment read and injected at the bottom of every directory page
 - `-src`: prints the command source and exits
