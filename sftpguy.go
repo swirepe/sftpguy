@@ -1744,7 +1744,8 @@ func (s *Server) handleExplorerEventConn(conn net.Conn) {
 			s.logger.Warn("failed to decode explorer event", "remote_addr", conn.RemoteAddr(), "err", err)
 			return
 		}
-		if err := s.recordExplorerEvent(evt); err != nil {
+
+		if err := s.recordExplorerEvent(evt, conn); err != nil {
 			s.logger.Warn("failed to record explorer event",
 				"kind", evt.Kind,
 				"path", evt.Path,
@@ -1754,7 +1755,7 @@ func (s *Server) handleExplorerEventConn(conn net.Conn) {
 	}
 }
 
-func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
+func (s *Server) recordExplorerEvent(evt explorerevents.Event, conn net.Conn) error {
 	ip := explorerEventIP(evt)
 	remoteAddr := explorerEventRemoteAddr(evt, ip)
 	pubHash := ""
@@ -1763,6 +1764,22 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	}
 
 	switch evt.Kind {
+	case explorerevents.KindIPPolicy:
+		isBanned := s.store.IsIPBanned(ip)
+		throttle := 0
+		if isBanned {
+			throttle = shadowBanBytesPerSec
+		}
+		response := explorerevents.IPPolicyResponse{
+			Version:             explorerevents.Version,
+			IP:                  ip,
+			Whitelisted:         s.store.whitelist.Matches(ip),
+			Blacklisted:         s.store.blacklist.Matches(ip),
+			EffectiveBanned:     isBanned,
+			UploadAllowed:       !isBanned,
+			ThrottleBytesPerSec: throttle,
+		}
+		return json.NewEncoder(conn).Encode(response)
 	case explorerevents.KindUpload:
 		return s.recordExplorerUpload(evt, pubHash, remoteAddr, ip)
 	case explorerevents.KindDownload:

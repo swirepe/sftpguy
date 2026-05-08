@@ -1,6 +1,7 @@
 package explorerevents
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 const (
 	defaultQueueSize = 256
 	defaultTimeout   = 750 * time.Millisecond
+	defaultPolicyTTL = 1 * time.Minute // How long to cache IPs
 )
 
 type Client struct {
@@ -21,6 +23,15 @@ type Client struct {
 	queue   chan Event
 	done    chan struct{}
 	once    sync.Once
+
+	policyCache   map[string]ipPolicyCacheEntry
+	policyCacheMu sync.RWMutex
+	policyTTL     time.Duration
+}
+
+type ipPolicyCacheEntry struct {
+	response  IPPolicyResponse // Stored by value to prevent pointer mutation
+	expiresAt time.Time
 }
 
 func NewClient(path string, logger *slog.Logger) *Client {
@@ -29,11 +40,13 @@ func NewClient(path string, logger *slog.Logger) *Client {
 		return nil
 	}
 	c := &Client{
-		path:    path,
-		logger:  logger,
-		timeout: defaultTimeout,
-		queue:   make(chan Event, defaultQueueSize),
-		done:    make(chan struct{}),
+		path:        path,
+		logger:      logger,
+		timeout:     defaultTimeout,
+		queue:       make(chan Event, defaultQueueSize),
+		done:        make(chan struct{}),
+		policyCache: make(map[string]ipPolicyCacheEntry),
+		policyTTL:   defaultPolicyTTL,
 	}
 	go c.run()
 	return c
@@ -96,4 +109,63 @@ func (c *Client) send(evt Event) error {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(c.timeout))
 	return json.NewEncoder(conn).Encode(evt)
+}
+
+func (c *Client) CheckIP(ctx context.Context, ip string) (*IPPolicyResponse, error) {
+	if c == nil {
+		return nil, net.ErrClosed
+	}
+
+	c.policyCacheMu.RLock()
+	entry, exists := c.policyCache[ip]
+	c.policyCacheMu.RUnlock()
+
+	if exists && time.Now().Before(entry.expiresAt) {
+		resp := entry.response
+		return &resp, nil
+	}
+
+	evt := Event{
+		Version:  Version,
+		Kind:     KindIPPolicy,
+		ClientIP: ip,
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", c.path)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(c.timeout))
+	}
+
+	if err := json.NewEncoder(conn).Encode(evt); err != nil {
+		return nil, err
+	}
+
+	response := &IPPolicyResponse{}
+	if err := json.NewDecoder(conn).Decode(response); err != nil {
+		return nil, err
+	}
+
+	c.policyCacheMu.Lock()
+	defer c.policyCacheMu.Unlock()
+
+	// OOM Protection: If the cache grows too large (e.g. from an IP spoofing attack),
+	// dump it entirely. This is a cheap and effective alternative to a complex LRU.
+	if len(c.policyCache) > 10000 {
+		c.policyCache = make(map[string]ipPolicyCacheEntry)
+	}
+
+	c.policyCache[ip] = ipPolicyCacheEntry{
+		response:  *response,
+		expiresAt: time.Now().Add(c.policyTTL),
+	}
+
+	return response, nil
 }

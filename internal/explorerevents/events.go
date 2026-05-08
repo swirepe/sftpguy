@@ -7,6 +7,7 @@ const (
 	KindDownload = "download"
 	KindLog      = "log"
 	KindRequest  = "request"
+	KindIPPolicy = "ip-policy"
 )
 
 type Event struct {
@@ -28,4 +29,14 @@ type Event struct {
 	Level          string         `json:"level,omitempty"`
 	Message        string         `json:"message,omitempty"`
 	Meta           map[string]any `json:"meta,omitempty"`
+}
+
+type IPPolicyResponse struct {
+	Version             int    `json:"version"`
+	IP                  string `json:"ip,omitempty"`
+	Whitelisted         bool   `json:"whitelisted,omitempty"`
+	Blacklisted         bool   `json:"blacklisted,omitempty"`
+	EffectiveBanned     bool   `json:"effective_banned,omitempty"`
+	UploadAllowed       bool   `json:"upload_allowed,omitempty"`
+	ThrottleBytesPerSec int    `json:"throttle_bytes_per_sec,omitempty"`
 }

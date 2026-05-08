@@ -28,6 +28,8 @@ import (
 
 	"sftpguy/internal/explorerevents"
 	"sftpguy/internal/socketactivation"
+
+	"golang.org/x/time/rate"
 )
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -478,6 +480,23 @@ func normalizeIP(ip string) string {
 	return ""
 }
 
+func getIPPolicy(ctx context.Context, ip string) *explorerevents.IPPolicyResponse {
+	if eventClient == nil {
+		return nil
+	}
+
+	// Fast timeout so checking the policy never hangs the explorer application
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	policy, err := eventClient.CheckIP(ctx, ip)
+	if err != nil {
+		logger.Debug("failed to check IP policy", "ip", ip, "err", err)
+		return nil
+	}
+	return policy
+}
+
 // ── routing ───────────────────────────────────────────────────────────────────
 
 func handle(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, nonce string) {
@@ -567,9 +586,30 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
+
+	ip := clientIdentityIP(r)
+	policy := getIPPolicy(r.Context(), ip)
+
+	var limiter *rate.Limiter
+	if policy != nil && policy.EffectiveBanned {
+		rateLimit := policy.ThrottleBytesPerSec
+		if rateLimit <= 0 {
+			rateLimit = 1024 * 50 // 50 KB/s
+		}
+		// Allow bursts of up to 16KB
+		limiter = rate.NewLimiter(rate.Limit(rateLimit), 16*1024)
+		reqLog.Info("download throttled", "ip", ip, "rateLimit", rateLimit)
+	}
+
+	tw := &transferLogWriter{
+		ResponseWriter: w,
+		limiter:        limiter,
+		ctx:            r.Context(),
+	}
+
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
 	start := time.Now()
-	tw := &transferLogWriter{ResponseWriter: w}
+
 	http.ServeFile(tw, r, fullPath)
 	dur := time.Since(start)
 
@@ -1403,13 +1443,44 @@ func fmtBytesFloat(b float64) string {
 
 type transferLogWriter struct {
 	http.ResponseWriter
-	bytes int64
+	bytes   int64
+	limiter *rate.Limiter
+	ctx     context.Context // Needed for limiter.WaitN
 }
 
 func (w *transferLogWriter) Write(p []byte) (int, error) {
-	n, err := w.ResponseWriter.Write(p)
-	w.bytes += int64(n)
-	return n, err
+	if w.limiter == nil {
+		n, err := w.ResponseWriter.Write(p)
+		w.bytes += int64(n)
+		return n, err
+	}
+
+	var total int
+	burst := w.limiter.Burst()
+
+	for len(p) > 0 {
+		writeSize := len(p)
+		if writeSize > burst {
+			writeSize = burst
+		}
+
+		// Wait for enough tokens to write this chunk.
+		// If the client disconnects, ctx is canceled and WaitN returns an error.
+		if err := w.limiter.WaitN(w.ctx, writeSize); err != nil {
+			return total, err
+		}
+
+		n, err := w.ResponseWriter.Write(p[:writeSize])
+		total += n
+		w.bytes += int64(n)
+		if err != nil {
+			return total, err
+		}
+
+		p = p[writeSize:]
+	}
+
+	return total, nil
 }
 
 func (w *transferLogWriter) ReadFrom(r io.Reader) (int64, error) {
