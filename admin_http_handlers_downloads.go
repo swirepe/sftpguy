@@ -221,16 +221,17 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type recentDownloadRow struct {
-		ID             int64  `json:"id"`
-		Timestamp      int64  `json:"timestamp"`
-		Time           string `json:"time"`
-		UserID         string `json:"user_id"`
-		IP             string `json:"ip"`
-		Path           string `json:"path"`
-		Size           int64  `json:"size"`
+		ID             int64   `json:"id"`
+		Timestamp      int64   `json:"timestamp"`
+		Time           string  `json:"time"`
+		UserID         string  `json:"user_id"`
+		IP             string  `json:"ip"`
+		Path           string  `json:"path"`
+		Size           int64   `json:"size"`
 		DurationMS     float64 `json:"duration_ms"`
-		AvgBytesPerSec int64  `json:"avg_bytes_per_sec"`
-		Session        string `json:"session"`
+		AvgBytesPerSec int64   `json:"avg_bytes_per_sec"`
+		Session        string  `json:"session"`
+		Meta           string  `json:"meta"`
 	}
 
 	recentArgs := append([]any{window.SinceUnix}, filterArgs...)
@@ -273,6 +274,7 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		metaObj := parseJSONMap(meta)
+		row.Meta = meta
 		row.Size = int64FromAny(metaObj["size"])
 		row.DurationMS = float64FromAny(metaObj["duration_ms"])
 		row.AvgBytesPerSec = int64FromAny(metaObj["avg_bytes_per_sec"])
@@ -354,6 +356,7 @@ func (s *Server) handleAdminDownloads(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			metaObj := parseJSONMap(meta)
+			row.Meta = meta
 			row.Size = int64FromAny(metaObj["size"])
 			row.DurationMS = float64FromAny(metaObj["duration_ms"])
 			row.AvgBytesPerSec = int64FromAny(metaObj["avg_bytes_per_sec"])

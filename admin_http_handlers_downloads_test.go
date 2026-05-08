@@ -62,14 +62,16 @@ func TestHandleAdminDownloadsReturnsFileAndRecentDownloadStats(t *testing.T) {
 		}
 	}
 
-	recordDownload := func(hash string, addr net.Addr, sessionID, relPath string, size int64) {
+	recordDownload := func(hash string, addr net.Addr, sessionID, relPath string, size int64, extra ...any) {
 		t.Helper()
-		srv.store.LogEvent(EventDownload, hash, sessionID, addr,
+		args := []any{
 			"path", relPath,
 			"size", size,
 			"duration_ms", 25,
-			"avg_bytes_per_sec", size*40,
-		)
+			"avg_bytes_per_sec", size * 40,
+		}
+		args = append(args, extra...)
+		srv.store.LogEvent(EventDownload, hash, sessionID, addr, args...)
 		if err := srv.store.RecordDownload(hash, relPath, size); err != nil {
 			t.Fatalf("record download for %s: %v", relPath, err)
 		}
@@ -77,7 +79,14 @@ func TestHandleAdminDownloadsReturnsFileAndRecentDownloadStats(t *testing.T) {
 
 	recordDownload(downloaderA, userAAddr, "sess-a-1", "reports/q1.csv", 12)
 	recordDownload(downloaderB, userBAddr, "sess-b-1", "reports/q1.csv", 12)
-	recordDownload(downloaderA, userAAddr, "sess-a-2", "reports/q2.csv", 18)
+	recordDownload(downloaderA, userAAddr, "sess-a-2", "reports/q2.csv", 18,
+		"source", "explorer",
+		"explorer_meta", map[string]any{
+			"headers": map[string][]string{
+				"X-Explorer-Test": []string{"recent-download"},
+			},
+		},
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/downloads?range=24h", nil)
 	w := httptest.NewRecorder()
@@ -115,6 +124,7 @@ func TestHandleAdminDownloadsReturnsFileAndRecentDownloadStats(t *testing.T) {
 			DurationMS     int64  `json:"duration_ms"`
 			AvgBytesPerSec int64  `json:"avg_bytes_per_sec"`
 			Session        string `json:"session"`
+			Meta           string `json:"meta"`
 		} `json:"recent"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
@@ -183,6 +193,7 @@ func TestHandleAdminDownloadsReturnsFileAndRecentDownloadStats(t *testing.T) {
 	if payload.Recent[0].Size != 18 || payload.Recent[0].DurationMS != 25 || payload.Recent[0].AvgBytesPerSec != 720 || payload.Recent[0].Session != "sess-a-2" {
 		t.Fatalf("unexpected recent row payload: %#v", payload.Recent[0])
 	}
+	assertMetaHeader(t, payload.Recent[0].Meta, "X-Explorer-Test", "recent-download")
 }
 
 func TestHandleAdminDownloadsIncludesSelectedFileHistory(t *testing.T) {
@@ -225,21 +236,30 @@ func TestHandleAdminDownloadsIncludesSelectedFileHistory(t *testing.T) {
 		t.Fatalf("register file %s: %v", relPath, err)
 	}
 
-	recordDownload := func(hash string, addr net.Addr, sessionID string, size int64) {
+	recordDownload := func(hash string, addr net.Addr, sessionID string, size int64, extra ...any) {
 		t.Helper()
-		srv.store.LogEvent(EventDownload, hash, sessionID, addr,
+		args := []any{
 			"path", relPath,
 			"size", size,
 			"duration_ms", 25,
-			"avg_bytes_per_sec", size*40,
-		)
+			"avg_bytes_per_sec", size * 40,
+		}
+		args = append(args, extra...)
+		srv.store.LogEvent(EventDownload, hash, sessionID, addr, args...)
 		if err := srv.store.RecordDownload(hash, relPath, size); err != nil {
 			t.Fatalf("record download for %s: %v", relPath, err)
 		}
 	}
 
 	recordDownload(downloaderA, userAAddr, "sess-a-1", 16)
-	recordDownload(downloaderB, userBAddr, "sess-b-1", 16)
+	recordDownload(downloaderB, userBAddr, "sess-b-1", 16,
+		"source", "explorer",
+		"explorer_meta", map[string]any{
+			"headers": map[string][]string{
+				"X-Explorer-Test": []string{"selected-download"},
+			},
+		},
+	)
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/downloads?range=24h&path=reports/q1.csv&download_history_limit=1", nil)
 	w := httptest.NewRecorder()
@@ -266,6 +286,7 @@ func TestHandleAdminDownloadsIncludesSelectedFileHistory(t *testing.T) {
 			IP      string `json:"ip"`
 			Path    string `json:"path"`
 			Session string `json:"session"`
+			Meta    string `json:"meta"`
 		} `json:"selected_history"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
@@ -301,5 +322,23 @@ func TestHandleAdminDownloadsIncludesSelectedFileHistory(t *testing.T) {
 	}
 	if payload.SelectedHistory[0].UserID != downloaderB || payload.SelectedHistory[0].Session != "sess-b-1" || payload.SelectedHistory[0].Path != relPath || payload.SelectedHistory[0].IP != "198.51.100.11" {
 		t.Fatalf("unexpected selected history row: %#v", payload.SelectedHistory[0])
+	}
+	assertMetaHeader(t, payload.SelectedHistory[0].Meta, "X-Explorer-Test", "selected-download")
+}
+
+func assertMetaHeader(t *testing.T, raw, name, want string) {
+	t.Helper()
+	metaObj := parseJSONMap(raw)
+	explorerMeta, ok := metaObj["explorer_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("explorer_meta missing or wrong type: %#v", metaObj["explorer_meta"])
+	}
+	headers, ok := explorerMeta["headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("headers missing or wrong type: %#v", explorerMeta["headers"])
+	}
+	values, ok := headers[name].([]any)
+	if !ok || len(values) != 1 || values[0] != want {
+		t.Fatalf("unexpected header %q values: got=%#v want=%q", name, headers[name], want)
 	}
 }

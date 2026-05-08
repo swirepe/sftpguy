@@ -1243,7 +1243,8 @@
             ip: u.ip || "",
             delta: Number(u.delta || 0),
             size: Number(u.size || 0),
-            path: u.path || ""
+            path: u.path || "",
+            meta: u.meta || ""
           },
           cells: [
             "<code>" + esc(u.time || "") + "</code>",
@@ -1252,7 +1253,8 @@
             pathWithExplorer(u.path || "", false),
             esc(formatBytes(u.delta || 0)),
             esc(formatBytes(u.size || 0)),
-            sessionCell(u.session)
+            sessionCell(u.session),
+            renderAuditMeta(u.meta || "", u.path || "", "upload")
           ]
         };
       });
@@ -1265,7 +1267,8 @@
           {label:"Path", key:"path"},
           {label:"Delta", key:"delta"},
           {label:"Size", key:"size"},
-          {label:"Session", key:"id"}
+          {label:"Session", key:"id"},
+          {label:"Meta", key:"meta"}
         ],
         rows,
         "time",
@@ -1379,7 +1382,8 @@
             size: Number(row.size || 0),
             duration_ms: Number(row.duration_ms || 0),
             avg_bytes_per_sec: Number(row.avg_bytes_per_sec || 0),
-            session: row.session || ""
+            session: row.session || "",
+            meta: row.meta || ""
           },
           cells: [
             "<code>" + esc(row.time || "") + "</code>",
@@ -1389,7 +1393,8 @@
             esc(formatBytes(row.size || 0)),
             esc(formatMs(row.duration_ms || 0)),
             esc(formatBytes(row.avg_bytes_per_sec || 0) + "/s"),
-            sessionCell(row.session)
+            sessionCell(row.session),
+            renderAuditMeta(row.meta || "", row.path || "", "download")
           ]
         };
       });
@@ -1403,7 +1408,8 @@
             size: Number(row.size || 0),
             duration_ms: Number(row.duration_ms || 0),
             avg_bytes_per_sec: Number(row.avg_bytes_per_sec || 0),
-            session: row.session || ""
+            session: row.session || "",
+            meta: row.meta || ""
           },
           cells: [
             "<code>" + esc(row.time || "") + "</code>",
@@ -1412,7 +1418,8 @@
             esc(formatBytes(row.size || 0)),
             esc(formatMs(row.duration_ms || 0)),
             esc(formatBytes(row.avg_bytes_per_sec || 0) + "/s"),
-            sessionCell(row.session)
+            sessionCell(row.session),
+            renderAuditMeta(row.meta || "", row.path || selectedPath || "", "download")
           ]
         };
       });
@@ -1444,7 +1451,8 @@
               {label:"Size", key:"size"},
               {label:"Duration", key:"duration_ms"},
               {label:"Rate", key:"avg_bytes_per_sec"},
-              {label:"Session", key:"session"}
+              {label:"Session", key:"session"},
+              {label:"Meta", key:"meta"}
             ],
             selectedHistoryRows,
             "time",
@@ -1500,7 +1508,8 @@
             {label:"Size", key:"size"},
             {label:"Duration", key:"duration_ms"},
             {label:"Rate", key:"avg_bytes_per_sec"},
-            {label:"Session", key:"session"}
+            {label:"Session", key:"session"},
+            {label:"Meta", key:"meta"}
           ],
           recentRows,
           "time",
@@ -2083,13 +2092,13 @@
       const actorDisplay = isUser ? ownerCell(d.actor) : ipCell(d.actor);
 
       const uploadRows = (d.recent_uploads || []).slice(0, 20).map(function(u) {
-        return ["<code>" + esc(u.time || "") + "</code>", pathWithExplorer(u.path || "", false), esc(formatBytes(u.delta || 0)), sessionCell(u.session)];
+        return ["<code>" + esc(u.time || "") + "</code>", pathWithExplorer(u.path || "", false), esc(formatBytes(u.delta || 0)), sessionCell(u.session), renderAuditMeta(u.meta || "", u.path || "", "upload")];
       });
       const sessionRows = (d.sessions || []).slice(0, 20).map(function(x) {
         return [sessionCell(x.session), esc((x.event_count || 0)), esc((x.duration_sec || 0) + "s"), esc(x.denied_count || 0)];
       });
       const eventRows = (d.events || []).slice(0, 30).map(function(e) {
-        return ["<code>" + esc(e.time || "") + "</code>", "<code>" + esc(e.event || "") + "</code>", pathWithExplorer(e.path || ""), sessionCell(e.session)];
+        return ["<code>" + esc(e.time || "") + "</code>", "<code>" + esc(e.event || "") + "</code>", pathWithExplorer(e.path || ""), sessionCell(e.session), renderAuditMeta(e.meta || "", e.path || "", e.event || "")];
       });
 
       const actionButtons = isUser ?
@@ -2111,9 +2120,9 @@
           " download_count=" + esc(stats.download_count || 0) + " download_bytes=" + esc(formatBytes(stats.download_bytes || 0)) +
           " last_login=<code>" + esc(stats.last_login || "") + "</code>" +
           " last_address=<code>" + esc(stats.last_address || "") + "</code></div>" : "") +
-        "<h3>Recent Uploads</h3>" + renderSimpleTable(["Time", "Path", "Delta", "Session"], uploadRows) +
+        "<h3>Recent Uploads</h3>" + renderSimpleTable(["Time", "Path", "Delta", "Session", "Meta"], uploadRows) +
         "<h3>Sessions</h3>" + renderSimpleTable(["Session", "Events", "Duration", "Denied"], sessionRows) +
-        "<h3>Recent Events</h3>" + renderSimpleTable(["Time", "Event", "Path", "Session"], eventRows);
+        "<h3>Recent Events</h3>" + renderSimpleTable(["Time", "Event", "Path", "Session", "Meta"], eventRows);
     }
 
     async function userAction(hash, action) {

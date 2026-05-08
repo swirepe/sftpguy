@@ -543,6 +543,7 @@ func (s *Server) handleAdminRecentUploads(w http.ResponseWriter, r *http.Request
 		Size      int64  `json:"size"`
 		Delta     int64  `json:"delta"`
 		Session   string `json:"session"`
+		Meta      string `json:"meta"`
 	}
 
 	out := make([]uploadRow, 0, limit)
@@ -554,6 +555,7 @@ func (s *Server) handleAdminRecentUploads(w http.ResponseWriter, r *http.Request
 			return
 		}
 		metaObj := parseJSONMap(meta)
+		row.Meta = meta
 		row.Size = int64FromAny(metaObj["size"])
 		row.Delta = int64FromAny(metaObj["delta"])
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
@@ -611,6 +613,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		Size      int64  `json:"size"`
 		Delta     int64  `json:"delta"`
 		Session   string `json:"session"`
+		Meta      string `json:"meta"`
 	}
 	type actorSession struct {
 		Session     string `json:"session"`
@@ -697,6 +700,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		metaObj := parseJSONMap(meta)
+		row.Meta = meta
 		row.Size = int64FromAny(metaObj["size"])
 		row.Delta = int64FromAny(metaObj["delta"])
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
