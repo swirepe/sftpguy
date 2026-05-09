@@ -78,7 +78,7 @@ The SFTP surface is primarily shaped by these flags and env vars:
 - `-dir`: archive root directory
 - `-hostkey`: SSH host key path
 - `-db.path`: SQLite database path
-- `-explorer.events`: optional Unix socket path for standalone explorer upload/download/request events
+- `-explorer.events`: optional Unix RPC socket path for standalone explorer events and IP policy checks
 - `-systemd.socket`: require inherited systemd sockets instead of binding configured ports or Unix socket paths
 - `-banner` and `-banner.stats`: SSH banner source and optional banner stats
 - `-noauth`: enables SSH `none` auth
@@ -94,7 +94,7 @@ The SFTP surface is primarily shaped by these flags and env vars:
 
 Admin web flags exist alongside the SFTP service but are covered separately in [spec/admin.md](admin.md) and [spec/web/admin.md](web/admin.md).
 
-On systemd installs, the built-in installer writes socket units for the SFTP TCP listener and the explorer event Unix socket. It enables and starts those socket units, disables direct service enablement, and leaves `sftpguy.service` to be started by socket activation. The generated service uses `-systemd.socket`, so a direct start without inherited sockets fails instead of trying to bind configured ports or Unix socket paths. When the process starts with inherited systemd descriptors named `sftp` or `explorer-events`, it uses those listeners instead of binding the sockets itself. If the standalone explorer is installed too, the installer writes `-install.explorer.port` into the explorer socket unit, enables and starts that socket, and leaves the explorer service to be started by socket activation. It also passes explorer-specific `-header`, `-footer`, `-maxsize`, and `-systemd.socket` arguments; `-install.explorer.maxsize` is independent from the SFTP `-maxsize`, and provided header/footer fragments are copied into the service install directory.
+On systemd installs, the built-in installer writes socket units for the SFTP TCP listener and the explorer RPC Unix socket. It enables and starts those socket units, disables direct service enablement, and leaves `sftpguy.service` to be started by socket activation. The generated service uses `-systemd.socket`, so a direct start without inherited sockets fails instead of trying to bind configured ports or Unix socket paths. When the process starts with inherited systemd descriptors named `sftp` or `explorer-events`, it uses those listeners instead of binding the sockets itself. If the standalone explorer is installed too, the installer writes `-install.explorer.port` into the explorer socket unit, enables and starts that socket, and leaves the explorer service to be started by socket activation. It also passes explorer-specific `-header`, `-footer`, `-maxsize`, and `-systemd.socket` arguments; `-install.explorer.maxsize` is independent from the SFTP `-maxsize`, and provided header/footer fragments are copied into the service install directory.
 
 ## Authentication And Identity
 

@@ -1003,7 +1003,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
 	EnvFlag(&cfg.Syslog, "syslog", "SYSLOG", false, "Enable logging to local syslog (Linux only)")
-	EnvFlag(&cfg.ExplorerEventsSocket, "explorer.events", "EXPLORER_EVENTS", "", "Unix socket path for standalone explorer upload/download/log events")
+	EnvFlag(&cfg.ExplorerEventsSocket, "explorer.events", "EXPLORER_EVENTS", "", "Unix RPC socket path for standalone explorer events and IP policy checks")
 	EnvFlag(&cfg.RequireSystemdSockets, "systemd.socket", "SYSTEMD_SOCKET", false, "Require inherited systemd sockets instead of binding configured ports/paths")
 	EnvFlag(&cfg.UploadDir, "dir", "UPLOAD_DIR", "./uploads", "Upload directory")
 	EnvFlag(&cfg.BannerFile, "banner", "BANNER_FILE", "BANNER.txt", "Banner file")
@@ -1667,7 +1667,7 @@ func (s *Server) ListenExplorerEvents() error {
 		return nil
 	}
 	s.explorerEventListener = listener
-	s.logger.Info("explorer event recorder online", "addr", listener.Addr().String(), "systemd_socket", inherited)
+	s.logger.Info("explorer RPC server online", "addr", listener.Addr().String(), "systemd_socket", inherited)
 
 	rpcServer := rpc.NewServer()
 	if err := rpcServer.RegisterName(explorerevents.RPCServiceName, &explorerEventRPC{srv: s}); err != nil {
@@ -1689,7 +1689,7 @@ func (s *Server) ListenExplorerEvents() error {
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer c.Close()
-			defer recoverAndLogPanic(s.logger, "explorer event worker")
+			defer recoverAndLogPanic(s.logger, "explorer RPC worker")
 			rpcServer.ServeCodec(jsonrpc.NewServerCodec(c))
 		}(conn)
 	}
@@ -1735,7 +1735,7 @@ func removeStaleUnixSocket(socketPath string) error {
 		return err
 	}
 	if fi.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("refusing to replace non-socket explorer event path %q", socketPath)
+		return fmt.Errorf("refusing to replace non-socket explorer RPC path %q", socketPath)
 	}
 	return os.Remove(socketPath)
 }
@@ -1746,7 +1746,7 @@ type explorerEventRPC struct {
 
 func (r *explorerEventRPC) RecordEvent(evt explorerevents.Event, reply *explorerevents.Ack) error {
 	if r == nil || r.srv == nil {
-		return errors.New("explorer event server unavailable")
+		return errors.New("explorer RPC server unavailable")
 	}
 	if reply != nil {
 		*reply = explorerevents.Ack{}
@@ -1756,7 +1756,7 @@ func (r *explorerEventRPC) RecordEvent(evt explorerevents.Event, reply *explorer
 
 func (r *explorerEventRPC) CheckIP(req explorerevents.IPPolicyRequest, reply *explorerevents.IPPolicyResponse) error {
 	if r == nil || r.srv == nil {
-		return errors.New("explorer event server unavailable")
+		return errors.New("explorer RPC server unavailable")
 	}
 	response, err := r.srv.explorerIPPolicy(req.IP)
 	if reply != nil {
@@ -3974,9 +3974,9 @@ func main() {
 
 	srv.startMaintenanceLoop(time.Hour)
 	go func() {
-		defer recoverAndLogPanic(logger, "explorer event listener")
+		defer recoverAndLogPanic(logger, "explorer RPC listener")
 		if err := srv.ListenExplorerEvents(); err != nil {
-			logger.Error("explorer event listener failed", "err", err)
+			logger.Error("explorer RPC listener failed", "err", err)
 		}
 	}()
 

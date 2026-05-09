@@ -239,7 +239,7 @@ func main() {
 	flag.StringVar(&port, "port", "8080", "Port to listen on")
 	flag.Int64Var(&maxSizeMB, "maxsize", 1000, "Max upload size in MB; 0 means unlimited")
 	flag.StringVar(&logPath, "log", "explorer.log", "Log file path")
-	flag.StringVar(&eventsSocket, "events", "", "Unix socket path for sending upload/download/request events to sftpguy")
+	flag.StringVar(&eventsSocket, "events", "", "Unix RPC socket path for sending events and checking IP policy with sftpguy")
 	flag.BoolVar(&requireSystemdSocket, "systemd.socket", false, "Require inherited systemd socket instead of binding -port")
 	flag.StringVar(&headerPath, "header", "header.html", "Path to an HTML template fragment to inject at the top of directory pages; read per request")
 	flag.StringVar(&footerPath, "footer", "footer.html", "Path to an HTML template fragment to inject at the bottom of directory pages; read per request")
@@ -376,12 +376,14 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Form-Factors, Downlink, ECT, RTT, Sec-CH-Device-Memory, Sec-CH-UA-Arch, Sec-CH-UA-Platform-Version")
 
+	session := SessionCookie(w, r)
+
 	sr := &statusRecorder{
 		ResponseWriter: w,
 		status:         http.StatusOK,
 	}
 
-	reqLog := requestLogger(logger, r)
+	reqLog := requestLogger(logger, r).With("session", session)
 
 	handle(reqLog, sr, r, nonce)
 	duration := time.Since(start)

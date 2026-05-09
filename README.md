@@ -143,7 +143,7 @@ Run `go run . -h` for the full list. The flags most operators care about are:
 | `-dir` | Upload directory on disk. Default: `./uploads`. |
 | `-db.path` | SQLite database path. Default: `sftp.db`. |
 | `-hostkey` | SSH host key path. Default: `id_ed25519`. |
-| `-explorer.events` | Unix socket path where the SFTP server accepts standalone explorer events. Normally set by the systemd installer. |
+| `-explorer.events` | Unix RPC socket path where the SFTP server accepts standalone explorer events and answers IP policy checks. Normally set by the systemd installer. |
 | `-contrib` | Bytes required to unlock all downloads. Default: `1mb`. |
 | `-unrestricted` | Comma-separated list of always-downloadable files/directories. |
 | `-dir.owners_only` | Only allow uploads into directories the current user owns. |
@@ -249,7 +249,7 @@ go run . -test.continue -admin.http 127.0.0.1:8080
 
 ## Installing As systemd Services
 
-The main binary has a built-in installer. For Linux installs it writes systemd socket units for the SFTP listener and the explorer event IPC socket, then starts the service with those inherited sockets:
+The main binary has a built-in installer. For Linux installs it writes systemd socket units for the SFTP listener and the explorer RPC socket, then starts the service with those inherited sockets:
 
 ```bash
 sudo ./sftpguy \
@@ -279,7 +279,7 @@ sudo ./sftpguy \
   -logfile /var/log/sftpguy.log
 ```
 
-The explorer gets its own enabled TCP socket and starts through systemd socket activation when traffic arrives. It sends upload, download, and request events over the systemd-owned Unix socket at `/run/<service>/explorer-events.sock`. The installer passes the explorer-specific `-maxsize` value independently from the SFTP `-maxsize`. Add `-install.explorer.header ./header.html` and/or `-install.explorer.footer ./footer.html` to copy custom fragments into `/var/lib/<service>/` and wire them into the explorer service. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
+The explorer gets its own enabled TCP socket and starts through systemd socket activation when traffic arrives. It uses the systemd-owned Unix RPC socket at `/run/<service>/explorer-events.sock` to send upload, download, and request events and to ask sftpguy for IP whitelist/blacklist policy. The installer passes the explorer-specific `-maxsize` value independently from the SFTP `-maxsize`. Add `-install.explorer.header ./header.html` and/or `-install.explorer.footer ./footer.html` to copy custom fragments into `/var/lib/<service>/` and wire them into the explorer service. The SFTP server records explorer transfers in the same SQLite user/file/audit tables, using the visitor IP as the same `anon-auth:<hash>` identity format used by `-noauth`.
 
 ### Testing the systemd Installer With Lima
 

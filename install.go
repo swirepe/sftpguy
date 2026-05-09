@@ -259,7 +259,7 @@ func runInstall(opts installOptions) error {
 		return fmt.Errorf("render sftp socket unit: %w", err)
 	}
 	eventSocketContent, err := renderUnit(unixSocketTemplate, unixSocketParams{
-		Description: opts.Name + " Explorer Event Socket",
+		Description: opts.Name + " Explorer RPC Socket",
 		ServiceName: serviceName,
 		FDName:      "explorer-events",
 		Path:        opts.ExplorerEventsSocket,
@@ -267,7 +267,7 @@ func runInstall(opts installOptions) error {
 		Group:       opts.Group,
 	})
 	if err != nil {
-		return fmt.Errorf("render explorer event socket unit: %w", err)
+		return fmt.Errorf("render explorer RPC socket unit: %w", err)
 	}
 
 	run := func(name string, args ...string) error {
@@ -296,7 +296,7 @@ func runInstall(opts installOptions) error {
 		return fmt.Errorf("write sftp socket file: %w", err)
 	}
 	if err := os.WriteFile(explorerEventsSocketDst, []byte(eventSocketContent), 0644); err != nil {
-		return fmt.Errorf("write explorer event socket file: %w", err)
+		return fmt.Errorf("write explorer RPC socket file: %w", err)
 	}
 
 	// Ensure the service user/group exist before we try to chown anything.
