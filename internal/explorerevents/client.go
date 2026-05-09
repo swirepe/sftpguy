@@ -2,9 +2,10 @@ package explorerevents
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"strings"
 	"sync"
 	"time"
@@ -102,18 +103,23 @@ func (c *Client) run() {
 }
 
 func (c *Client) send(evt Event) error {
-	conn, err := net.DialTimeout("unix", c.path, c.timeout)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(c.timeout))
-	return json.NewEncoder(conn).Encode(evt)
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	var ack Ack
+	return c.call(ctx, "RecordEvent", evt, &ack)
 }
 
 func (c *Client) CheckIP(ctx context.Context, ip string) (*IPPolicyResponse, error) {
 	if c == nil {
 		return nil, net.ErrClosed
+	}
+	ip = strings.TrimSpace(ip)
+	if parsed := net.ParseIP(ip); parsed != nil {
+		ip = parsed.String()
+	}
+	if ip == "" {
+		return nil, net.InvalidAddrError("empty IP")
 	}
 
 	c.policyCacheMu.RLock()
@@ -125,31 +131,8 @@ func (c *Client) CheckIP(ctx context.Context, ip string) (*IPPolicyResponse, err
 		return &resp, nil
 	}
 
-	evt := Event{
-		Version:  Version,
-		Kind:     KindIPPolicy,
-		ClientIP: ip,
-	}
-
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", c.path)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(c.timeout))
-	}
-
-	if err := json.NewEncoder(conn).Encode(evt); err != nil {
-		return nil, err
-	}
-
 	response := &IPPolicyResponse{}
-	if err := json.NewDecoder(conn).Decode(response); err != nil {
+	if err := c.call(ctx, "CheckIP", IPPolicyRequest{IP: ip}, response); err != nil {
 		return nil, err
 	}
 
@@ -168,4 +151,33 @@ func (c *Client) CheckIP(ctx context.Context, ip string) (*IPPolicyResponse, err
 	}
 
 	return response, nil
+}
+
+func (c *Client) call(ctx context.Context, method string, args any, reply any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", c.path)
+	if err != nil {
+		return err
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(c.timeout))
+	}
+
+	client := jsonrpc.NewClient(conn)
+	defer client.Close()
+
+	if err := client.Call(RPCServiceName+"."+method, args, reply); err != nil {
+		if err == rpc.ErrShutdown {
+			return net.ErrClosed
+		}
+		return err
+	}
+	return nil
 }

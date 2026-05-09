@@ -38,9 +38,15 @@ import (
 var appSrc string
 
 const (
-	cookieUnlock = "explorer_unlocked"
-	cookieCSRF   = "explorer_csrf"
-	headerCSRF   = "X-CSRF-Token"
+	cookieUnlock                = "explorer_unlocked"
+	cookieCSRF                  = "explorer_csrf"
+	cookieSession               = "explorer-_session"
+	headerCSRF                  = "X-CSRF-Token"
+	defaultShadowBanBytesPerSec = 2 * 1024
+	explorerShadowMutateMin     = 2 * time.Second
+	explorerShadowMutateMax     = 8 * time.Second
+	explorerShadowListMin       = 500 * time.Millisecond
+	explorerShadowListMax       = 2 * time.Second
 )
 
 // ── globals ───────────────────────────────────────────────────────────────────
@@ -385,6 +391,22 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	emitRequestEvent(r, sr.status, duration)
 }
 
+func SessionCookie(w http.ResponseWriter, r *http.Request) string {
+	sessionCookie, err := r.Cookie(cookieSession)
+	if err != nil {
+		sessionCookie = &http.Cookie{
+			Name:     cookieSession,
+			Value:    generateSessionID(),
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+		}
+		http.SetCookie(w, sessionCookie)
+	}
+	return sessionCookie.Value
+}
+
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
 	ip := clientIP(r)
 	l := base.With(
@@ -416,6 +438,10 @@ func generateNonce() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func generateSessionID() string {
+	return fmt.Sprintf("explorer-%s", generateNonce())
 }
 
 // ── IP helpers ────────────────────────────────────────────────────────────────
@@ -503,6 +529,46 @@ func getIPPolicy(ctx context.Context, ip string) *explorerevents.IPPolicyRespons
 	return policy
 }
 
+func isBannedByPolicy(policy *explorerevents.IPPolicyResponse) bool {
+	return policy != nil && policy.EffectiveBanned
+}
+
+func randomExplorerShadowDelay(minDelay, maxDelay time.Duration) time.Duration {
+	if maxDelay <= minDelay {
+		return minDelay
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return minDelay
+	}
+	span := maxDelay - minDelay
+	return minDelay + time.Duration((uint64(span)*uint64(b[0]))/255)
+}
+
+func delayBannedDirectoryListing(reqLog *slog.Logger, r *http.Request) {
+	ip := clientIdentityIP(r)
+	policy := getIPPolicy(r.Context(), ip)
+	if !isBannedByPolicy(policy) {
+		return
+	}
+	delay := randomExplorerShadowDelay(explorerShadowListMin, explorerShadowListMax)
+	reqLog.Info("directory listing delayed", "ip", ip, "delay", delay)
+	time.Sleep(delay)
+}
+
+func rejectBannedUpload(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request) bool {
+	ip := clientIdentityIP(r)
+	policy := getIPPolicy(r.Context(), ip)
+	if policy == nil || policy.UploadAllowed {
+		return false
+	}
+	delay := randomExplorerShadowDelay(explorerShadowMutateMin, explorerShadowMutateMax)
+	reqLog.Warn("upload rejected", "reason", "ip policy", "ip", ip, "delay", delay)
+	time.Sleep(delay)
+	http.Error(w, "Upload failed", http.StatusInternalServerError)
+	return true
+}
+
 // ── routing ───────────────────────────────────────────────────────────────────
 
 func handle(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, nonce string) {
@@ -571,6 +637,7 @@ func handleGET(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		return
 	}
 	if info.IsDir() {
+		delayBannedDirectoryListing(reqLog, r)
 		serveDir(reqLog, w, r, fullPath, relPath, nonce)
 	} else {
 		serveFile(reqLog, w, r, fullPath, info, relPath)
@@ -600,10 +667,9 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 	if policy != nil && policy.EffectiveBanned {
 		rateLimit := policy.ThrottleBytesPerSec
 		if rateLimit <= 0 {
-			rateLimit = 1024 * 50 // 50 KB/s
+			rateLimit = defaultShadowBanBytesPerSec
 		}
-		// Allow bursts of up to 16KB
-		limiter = rate.NewLimiter(rate.Limit(rateLimit), 16*1024)
+		limiter = rate.NewLimiter(rate.Limit(rateLimit), rateLimit)
 		reqLog.Info("download throttled", "ip", ip, "rateLimit", rateLimit)
 	}
 
@@ -1094,6 +1160,9 @@ func handlePOST(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, ful
 		http.Error(w, "Upload target must be a directory", http.StatusBadRequest)
 		return
 	}
+	if rejectBannedUpload(reqLog, w, r) {
+		return
+	}
 	if maxFileSize > 0 && r.ContentLength > maxFileSize && r.ContentLength != -1 {
 		reqLog.Warn("upload rejected", "reason", "content length exceeds max",
 			"contentLength", r.ContentLength, "maxBytes", maxFileSize)
@@ -1490,9 +1559,12 @@ func (w *transferLogWriter) Write(p []byte) (int, error) {
 }
 
 func (w *transferLogWriter) ReadFrom(r io.Reader) (int64, error) {
-	n, err := io.Copy(w.ResponseWriter, r)
-	w.bytes += n
-	return n, err
+	if w.limiter == nil {
+		n, err := io.Copy(w.ResponseWriter, r)
+		w.bytes += n
+		return n, err
+	}
+	return io.Copy(struct{ io.Writer }{w}, r)
 }
 
 func (w *transferLogWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

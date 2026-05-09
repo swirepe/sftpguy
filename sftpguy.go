@@ -46,6 +46,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"os"
 	"os/signal"
 	"path"
@@ -1667,6 +1669,11 @@ func (s *Server) ListenExplorerEvents() error {
 	s.explorerEventListener = listener
 	s.logger.Info("explorer event recorder online", "addr", listener.Addr().String(), "systemd_socket", inherited)
 
+	rpcServer := rpc.NewServer()
+	if err := rpcServer.RegisterName(explorerevents.RPCServiceName, &explorerEventRPC{srv: s}); err != nil {
+		return err
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -1683,7 +1690,7 @@ func (s *Server) ListenExplorerEvents() error {
 			defer s.wg.Done()
 			defer c.Close()
 			defer recoverAndLogPanic(s.logger, "explorer event worker")
-			s.handleExplorerEventConn(c)
+			rpcServer.ServeCodec(jsonrpc.NewServerCodec(c))
 		}(conn)
 	}
 }
@@ -1733,29 +1740,67 @@ func removeStaleUnixSocket(socketPath string) error {
 	return os.Remove(socketPath)
 }
 
-func (s *Server) handleExplorerEventConn(conn net.Conn) {
-	dec := json.NewDecoder(io.LimitReader(conn, 1<<20))
-	for {
-		var evt explorerevents.Event
-		if err := dec.Decode(&evt); err != nil {
-			if errors.Is(err, io.EOF) {
-				return
-			}
-			s.logger.Warn("failed to decode explorer event", "remote_addr", conn.RemoteAddr(), "err", err)
-			return
-		}
-
-		if err := s.recordExplorerEvent(evt, conn); err != nil {
-			s.logger.Warn("failed to record explorer event",
-				"kind", evt.Kind,
-				"path", evt.Path,
-				"client_ip", evt.ClientIP,
-				"err", err)
-		}
-	}
+type explorerEventRPC struct {
+	srv *Server
 }
 
-func (s *Server) recordExplorerEvent(evt explorerevents.Event, conn net.Conn) error {
+func (r *explorerEventRPC) RecordEvent(evt explorerevents.Event, reply *explorerevents.Ack) error {
+	if r == nil || r.srv == nil {
+		return errors.New("explorer event server unavailable")
+	}
+	if reply != nil {
+		*reply = explorerevents.Ack{}
+	}
+	return r.srv.recordExplorerEvent(evt)
+}
+
+func (r *explorerEventRPC) CheckIP(req explorerevents.IPPolicyRequest, reply *explorerevents.IPPolicyResponse) error {
+	if r == nil || r.srv == nil {
+		return errors.New("explorer event server unavailable")
+	}
+	response, err := r.srv.explorerIPPolicy(req.IP)
+	if reply != nil {
+		*reply = response
+	}
+	return err
+}
+
+func (s *Server) explorerIPPolicy(rawIP string) (explorerevents.IPPolicyResponse, error) {
+	ip := normalizeExplorerIP(rawIP)
+	if ip == "" {
+		return explorerevents.IPPolicyResponse{Version: explorerevents.Version}, fmt.Errorf("invalid ip address %q", rawIP)
+	}
+	if s == nil || s.store == nil {
+		return explorerevents.IPPolicyResponse{Version: explorerevents.Version, IP: ip, UploadAllowed: true}, nil
+	}
+
+	whitelistMatch := false
+	blacklistMatch := false
+	if s.store.whitelist != nil {
+		whitelistMatch = s.store.whitelist.Matches(ip)
+	}
+	if s.store.blacklist != nil {
+		blacklistMatch = s.store.blacklist.Matches(ip)
+	}
+
+	isBanned := s.store.IsIPBanned(ip)
+	throttle := 0
+	if isBanned {
+		throttle = shadowBanBytesPerSec
+	}
+
+	return explorerevents.IPPolicyResponse{
+		Version:             explorerevents.Version,
+		IP:                  ip,
+		Whitelisted:         whitelistMatch,
+		Blacklisted:         blacklistMatch,
+		EffectiveBanned:     isBanned,
+		UploadAllowed:       !isBanned,
+		ThrottleBytesPerSec: throttle,
+	}, nil
+}
+
+func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	ip := explorerEventIP(evt)
 	remoteAddr := explorerEventRemoteAddr(evt, ip)
 	pubHash := ""
@@ -1764,22 +1809,6 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event, conn net.Conn) er
 	}
 
 	switch evt.Kind {
-	case explorerevents.KindIPPolicy:
-		isBanned := s.store.IsIPBanned(ip)
-		throttle := 0
-		if isBanned {
-			throttle = shadowBanBytesPerSec
-		}
-		response := explorerevents.IPPolicyResponse{
-			Version:             explorerevents.Version,
-			IP:                  ip,
-			Whitelisted:         s.store.whitelist.Matches(ip),
-			Blacklisted:         s.store.blacklist.Matches(ip),
-			EffectiveBanned:     isBanned,
-			UploadAllowed:       !isBanned,
-			ThrottleBytesPerSec: throttle,
-		}
-		return json.NewEncoder(conn).Encode(response)
 	case explorerevents.KindUpload:
 		return s.recordExplorerUpload(evt, pubHash, remoteAddr, ip)
 	case explorerevents.KindDownload:

@@ -7,7 +7,8 @@ const (
 	KindDownload = "download"
 	KindLog      = "log"
 	KindRequest  = "request"
-	KindIPPolicy = "ip-policy"
+
+	RPCServiceName = "ExplorerEvents"
 )
 
 type Event struct {
@@ -29,6 +30,12 @@ type Event struct {
 	Level          string         `json:"level,omitempty"`
 	Message        string         `json:"message,omitempty"`
 	Meta           map[string]any `json:"meta,omitempty"`
+}
+
+type Ack struct{}
+
+type IPPolicyRequest struct {
+	IP string `json:"ip"`
 }
 
 type IPPolicyResponse struct {

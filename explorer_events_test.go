@@ -1,8 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net"
+	"net/rpc"
+	"net/rpc/jsonrpc"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"sftpguy/internal/explorerevents"
 )
@@ -94,6 +101,107 @@ func TestRecordExplorerUploadUsesAnonAuthFromClientIP(t *testing.T) {
 	if got := stringSliceFromAny(headers["X-Custom-Audit"]); len(got) != 2 || got[0] != "one" || got[1] != "two" {
 		t.Fatalf("X-Custom-Audit headers = %#v", got)
 	}
+}
+
+func TestExplorerEventRPCCheckIPUsesWhitelistPrecedence(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	if err := srv.store.blacklist.AddRange("198.51.100.0", 24, "test blacklist"); err != nil {
+		t.Fatalf("add blacklist range: %v", err)
+	}
+	if _, _, err := srv.store.blacklist.Reload(); err != nil {
+		t.Fatalf("reload blacklist: %v", err)
+	}
+	if _, err := srv.store.whitelist.AddExactIPWithComment("198.51.100.50", "test whitelist"); err != nil {
+		t.Fatalf("add whitelist ip: %v", err)
+	}
+
+	socketPath := startExplorerEventRPCTestServer(t, srv)
+	client := explorerevents.NewClient(socketPath, nil)
+	defer client.Close(time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	banned, err := client.CheckIP(ctx, "198.51.100.51")
+	if err != nil {
+		t.Fatalf("check banned ip: %v", err)
+	}
+	if banned == nil || !banned.Blacklisted || banned.Whitelisted || !banned.EffectiveBanned || banned.UploadAllowed || banned.ThrottleBytesPerSec != shadowBanBytesPerSec {
+		t.Fatalf("unexpected banned policy: %#v", banned)
+	}
+
+	allowed, err := client.CheckIP(ctx, "198.51.100.50")
+	if err != nil {
+		t.Fatalf("check whitelisted ip: %v", err)
+	}
+	if allowed == nil || !allowed.Blacklisted || !allowed.Whitelisted || allowed.EffectiveBanned || !allowed.UploadAllowed || allowed.ThrottleBytesPerSec != 0 {
+		t.Fatalf("unexpected whitelist policy: %#v", allowed)
+	}
+}
+
+func TestExplorerEventRPCRecordEvent(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	socketPath := startExplorerEventRPCTestServer(t, srv)
+	client := explorerevents.NewClient(socketPath, nil)
+
+	client.Emit(explorerevents.Event{
+		Kind:       explorerevents.KindUpload,
+		ClientIP:   "198.51.100.60",
+		RemoteAddr: "198.51.100.60:49152",
+		Path:       "rpc/upload.txt",
+		Bytes:      9,
+		Size:       9,
+		Delta:      9,
+		Method:     "POST",
+		URLPath:    "/rpc",
+		Meta: map[string]any{
+			"headers": map[string][]string{"User-Agent": {"rpc-test"}},
+		},
+	})
+	client.Close(time.Second)
+
+	hash := anonAuthHashForIP("198.51.100.60")
+	stats, err := srv.store.GetUserStats(hash)
+	if err != nil {
+		t.Fatalf("get rpc upload stats: %v", err)
+	}
+	if stats.UploadCount != 1 || stats.UploadBytes != 9 {
+		t.Fatalf("unexpected rpc upload stats: count=%d bytes=%d", stats.UploadCount, stats.UploadBytes)
+	}
+}
+
+func startExplorerEventRPCTestServer(t *testing.T, srv *Server) string {
+	t.Helper()
+
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("sftpguy-events-%d.sock", time.Now().UnixNano()))
+	_ = os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ln.Close()
+		_ = os.Remove(socketPath)
+	})
+
+	rpcServer := rpc.NewServer()
+	if err := rpcServer.RegisterName(explorerevents.RPCServiceName, &explorerEventRPC{srv: srv}); err != nil {
+		t.Fatalf("register rpc server: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go rpcServer.ServeCodec(jsonrpc.NewServerCodec(conn))
+		}
+	}()
+	return socketPath
 }
 
 func TestRecordExplorerUploadStoresClientIPWhenRemoteAddrIsProxy(t *testing.T) {
