@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/rpc"
 	"net/rpc/jsonrpc"
 	"os"
@@ -22,6 +25,7 @@ func TestRecordExplorerUploadUsesAnonAuthFromClientIP(t *testing.T) {
 		Kind:           explorerevents.KindUpload,
 		ClientIP:       "198.51.100.23",
 		RemoteAddr:     "198.51.100.23:49152",
+		Session:        "explorer-browser-session",
 		Path:           "web/report.txt",
 		Bytes:          7,
 		Size:           7,
@@ -68,7 +72,7 @@ func TestRecordExplorerUploadUsesAnonAuthFromClientIP(t *testing.T) {
 		LIMIT 1`, string(EventUpload)).Scan(&userID, &ip, &path, &session, &meta); err != nil {
 		t.Fatalf("query upload log: %v", err)
 	}
-	if userID != hash || ip != "198.51.100.23" || path != "web/report.txt" || session != "explorer" {
+	if userID != hash || ip != "198.51.100.23" || path != "web/report.txt" || session != "explorer-browser-session" {
 		t.Fatalf("unexpected log row: user=%q ip=%q path=%q session=%q", userID, ip, path, session)
 	}
 	metaObj := parseJSONMap(meta)
@@ -171,6 +175,103 @@ func TestExplorerEventRPCRecordEvent(t *testing.T) {
 	}
 	if stats.UploadCount != 1 || stats.UploadBytes != 9 {
 		t.Fatalf("unexpected rpc upload stats: count=%d bytes=%d", stats.UploadCount, stats.UploadBytes)
+	}
+}
+
+func TestRecordExplorerEventDefaultsLegacySession(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	if err := srv.recordExplorerEvent(explorerevents.Event{
+		Kind:       explorerevents.KindRequest,
+		ClientIP:   "198.51.100.61",
+		RemoteAddr: "198.51.100.61:49152",
+		Method:     "GET",
+		URLPath:    "/legacy",
+		Status:     http.StatusOK,
+	}); err != nil {
+		t.Fatalf("record explorer request: %v", err)
+	}
+
+	var session string
+	if err := srv.store.db.QueryRow(`
+		SELECT IFNULL(user_session, '')
+		FROM log
+		WHERE event = ?
+		ORDER BY id DESC
+		LIMIT 1`, string(EventExplorerRequest)).Scan(&session); err != nil {
+		t.Fatalf("query explorer request log: %v", err)
+	}
+	if session != "explorer" {
+		t.Fatalf("session = %q, want explorer", session)
+	}
+}
+
+func TestExplorerSessionReachesAdminSessionsAPI(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	const sessionID = "explorer-browser-session"
+	evt := explorerevents.Event{
+		Kind:       explorerevents.KindRequest,
+		ClientIP:   "198.51.100.42",
+		RemoteAddr: "198.51.100.42:49152",
+		Session:    sessionID,
+		URLPath:    "/public/readme.txt",
+		Method:     http.MethodGet,
+		Status:     http.StatusOK,
+	}
+	if err := srv.recordExplorerEvent(evt); err != nil {
+		t.Fatalf("record explorer request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/sessions?range=24h&q=explorer-browser", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/sessions status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var sessionsPayload struct {
+		Sessions []struct {
+			Session    string `json:"session"`
+			UserID     string `json:"user_id"`
+			IP         string `json:"ip"`
+			EventCount int64  `json:"event_count"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &sessionsPayload); err != nil {
+		t.Fatalf("decode sessions payload: %v", err)
+	}
+	if len(sessionsPayload.Sessions) != 1 {
+		t.Fatalf("unexpected sessions length: got=%d want=1 payload=%s", len(sessionsPayload.Sessions), w.Body.String())
+	}
+	row := sessionsPayload.Sessions[0]
+	if row.Session != sessionID || row.UserID != anonAuthHashForIP("198.51.100.42") || row.IP != "198.51.100.42" || row.EventCount != 1 {
+		t.Fatalf("unexpected session row: %#v", row)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/sessions/explorer-browser?limit=20", nil)
+	w = httptest.NewRecorder()
+	srv.handleAdminSessionTimeline(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/sessions/{id} status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var timelinePayload struct {
+		Session string `json:"session"`
+		Events  []struct {
+			Event string `json:"event"`
+			Path  string `json:"path"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &timelinePayload); err != nil {
+		t.Fatalf("decode timeline payload: %v", err)
+	}
+	if timelinePayload.Session != sessionID || len(timelinePayload.Events) != 1 || timelinePayload.Events[0].Event != string(EventExplorerRequest) || timelinePayload.Events[0].Path != "public/readme.txt" {
+		t.Fatalf("unexpected timeline payload: %#v", timelinePayload)
 	}
 }
 

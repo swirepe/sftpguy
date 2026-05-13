@@ -1803,6 +1803,7 @@ func (s *Server) explorerIPPolicy(rawIP string) (explorerevents.IPPolicyResponse
 func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	ip := explorerEventIP(evt)
 	remoteAddr := explorerEventRemoteAddr(evt, ip)
+	sessionID := explorerEventSession(evt)
 	pubHash := ""
 	if ip != "" {
 		pubHash = anonAuthHashForIP(ip)
@@ -1810,17 +1811,17 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 
 	switch evt.Kind {
 	case explorerevents.KindUpload:
-		return s.recordExplorerUpload(evt, pubHash, remoteAddr, ip)
+		return s.recordExplorerUpload(evt, pubHash, sessionID, remoteAddr, ip)
 	case explorerevents.KindDownload:
-		return s.recordExplorerDownload(evt, pubHash, remoteAddr, ip)
+		return s.recordExplorerDownload(evt, pubHash, sessionID, remoteAddr, ip)
 	case explorerevents.KindRequest:
 		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
-		s.store.LogEvent(EventExplorerRequest, pubHash, "explorer", remoteAddr,
+		s.store.LogEvent(EventExplorerRequest, pubHash, sessionID, remoteAddr,
 			explorerEventLogArgs(evt, rel, ip)...)
 		return nil
 	case explorerevents.KindLog:
 		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
-		s.store.LogEvent(EventExplorerLog, pubHash, "explorer", remoteAddr,
+		s.store.LogEvent(EventExplorerLog, pubHash, sessionID, remoteAddr,
 			explorerEventLogArgs(evt, rel, ip)...)
 		return nil
 	default:
@@ -1828,7 +1829,7 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	}
 }
 
-func (s *Server) recordExplorerUpload(evt explorerevents.Event, pubHash string, remoteAddr net.Addr, ip string) error {
+func (s *Server) recordExplorerUpload(evt explorerevents.Event, pubHash, sessionID string, remoteAddr net.Addr, ip string) error {
 	if pubHash == "" {
 		return errors.New("explorer upload missing client ip")
 	}
@@ -1863,13 +1864,13 @@ func (s *Server) recordExplorerUpload(evt explorerevents.Event, pubHash string, 
 	if err := s.store.UpdateFileWrite(pubHash, pubHash, rel, size, delta); err != nil {
 		return err
 	}
-	s.store.LogEvent(EventUpload, pubHash, "explorer", remoteAddr,
+	s.store.LogEvent(EventUpload, pubHash, sessionID, remoteAddr,
 		explorerEventLogArgs(evt, rel, ip)...)
 	s.enqueueBadUploadCheck(rel, pubHash, ip)
 	return nil
 }
 
-func (s *Server) recordExplorerDownload(evt explorerevents.Event, pubHash string, remoteAddr net.Addr, ip string) error {
+func (s *Server) recordExplorerDownload(evt explorerevents.Event, pubHash, sessionID string, remoteAddr net.Addr, ip string) error {
 	if pubHash == "" {
 		return errors.New("explorer download missing client ip")
 	}
@@ -1890,7 +1891,7 @@ func (s *Server) recordExplorerDownload(evt explorerevents.Event, pubHash string
 	if err := s.store.RecordDownload(pubHash, rel, evt.Bytes); err != nil {
 		return err
 	}
-	s.store.LogEvent(EventDownload, pubHash, "explorer", remoteAddr,
+	s.store.LogEvent(EventDownload, pubHash, sessionID, remoteAddr,
 		explorerEventLogArgs(evt, rel, ip)...)
 	return nil
 }
@@ -1931,6 +1932,17 @@ func explorerEventIP(evt explorerevents.Event) string {
 		return normalizeExplorerIP(host)
 	}
 	return normalizeExplorerIP(evt.RemoteAddr)
+}
+
+func explorerEventSession(evt explorerevents.Event) string {
+	session := strings.TrimSpace(evt.Session)
+	if session == "" {
+		return "explorer"
+	}
+	if len(session) > 256 {
+		return session[:256]
+	}
+	return session
 }
 
 func normalizeExplorerIP(raw string) string {

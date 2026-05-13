@@ -405,8 +405,20 @@ func SessionCookie(w http.ResponseWriter, r *http.Request) string {
 			SameSite: http.SameSiteLaxMode,
 		}
 		http.SetCookie(w, sessionCookie)
+		r.AddCookie(sessionCookie)
 	}
 	return sessionCookie.Value
+}
+
+func requestSession(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	sessionCookie, err := r.Cookie(cookieSession)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(sessionCookie.Value)
 }
 
 func requestLogger(base *slog.Logger, r *http.Request) *slog.Logger {
@@ -729,6 +741,7 @@ func transferEvent(kind string, r *http.Request, relPath string, bytes, size, de
 		Kind:           kind,
 		ClientIP:       clientIdentityIP(r),
 		RemoteAddr:     r.RemoteAddr,
+		Session:        requestSession(r),
 		Path:           filepath.ToSlash(relPath),
 		Bytes:          bytes,
 		Size:           size,
@@ -759,6 +772,7 @@ func requestEvent(r *http.Request, status int, duration time.Duration) explorere
 		Kind:       explorerevents.KindRequest,
 		ClientIP:   clientIdentityIP(r),
 		RemoteAddr: r.RemoteAddr,
+		Session:    requestSession(r),
 		Status:     status,
 		Method:     r.Method,
 		URLPath:    r.URL.Path,

@@ -427,6 +427,7 @@ func TestTransferEventIncludesStatsAndAllRequestHeaders(t *testing.T) {
 	req.Header.Add("X-Custom-Audit", "one")
 	req.Header.Add("X-Custom-Audit", "two")
 	req.Header.Set("Downlink", "10")
+	req.AddCookie(&http.Cookie{Name: cookieSession, Value: "explorer-transfer-session"})
 
 	evt := transferEvent(explorerevents.KindUpload, req, "album/report.txt", 12, 20, 8, 25*time.Millisecond)
 
@@ -438,6 +439,9 @@ func TestTransferEventIncludesStatsAndAllRequestHeaders(t *testing.T) {
 	}
 	if evt.Path != "album/report.txt" || evt.Bytes != 12 || evt.Size != 20 || evt.Delta != 8 {
 		t.Fatalf("unexpected transfer stats: path=%q bytes=%d size=%d delta=%d", evt.Path, evt.Bytes, evt.Size, evt.Delta)
+	}
+	if evt.Session != "explorer-transfer-session" {
+		t.Fatalf("session = %q, want explorer-transfer-session", evt.Session)
 	}
 	if evt.DurationMS != 25 || evt.AvgBytesPerSec != 480 {
 		t.Fatalf("unexpected timing stats: duration_ms=%v avg=%d", evt.DurationMS, evt.AvgBytesPerSec)
@@ -476,6 +480,7 @@ func TestRequestEventIncludesDurationAndAllRequestHeaders(t *testing.T) {
 	req.Header.Set("Referer", "https://example.test/from")
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
 	req.AddCookie(&http.Cookie{Name: cookieUnlock, Value: "true"})
+	req.AddCookie(&http.Cookie{Name: cookieSession, Value: "explorer-session-test"})
 
 	evt := requestEvent(req, http.StatusSeeOther, 42*time.Millisecond)
 
@@ -487,6 +492,9 @@ func TestRequestEventIncludesDurationAndAllRequestHeaders(t *testing.T) {
 	}
 	if evt.Status != http.StatusSeeOther || evt.DurationMS != 42 {
 		t.Fatalf("unexpected request stats: status=%d duration_ms=%v", evt.Status, evt.DurationMS)
+	}
+	if evt.Session != "explorer-session-test" {
+		t.Fatalf("session = %q, want explorer-session-test", evt.Session)
 	}
 	headers, ok := evt.Meta["headers"].(map[string][]string)
 	if !ok {
@@ -500,6 +508,23 @@ func TestRequestEventIncludesDurationAndAllRequestHeaders(t *testing.T) {
 	}
 	if unlocked, ok := evt.Meta["unlocked"].(bool); !ok || !unlocked {
 		t.Fatalf("unlocked meta = %#v, want true", evt.Meta["unlocked"])
+	}
+}
+
+func TestSessionCookieBackfillsCurrentRequest(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+
+	session := SessionCookie(w, req)
+
+	if !strings.HasPrefix(session, "explorer-") {
+		t.Fatalf("session = %q, want explorer-*", session)
+	}
+	if got := requestSession(req); got != session {
+		t.Fatalf("request session = %q, want %q", got, session)
+	}
+	if got := w.Result().Cookies(); len(got) != 1 || got[0].Name != cookieSession || got[0].Value != session {
+		t.Fatalf("unexpected response cookies: %#v", got)
 	}
 }
 

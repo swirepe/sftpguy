@@ -17,6 +17,7 @@ type Event struct {
 	Timestamp      int64          `json:"timestamp,omitempty"`
 	ClientIP       string         `json:"client_ip,omitempty"`
 	RemoteAddr     string         `json:"remote_addr,omitempty"`
+	Session        string         `json:"session,omitempty"`
 	Path           string         `json:"path,omitempty"`
 	Bytes          int64          `json:"bytes,omitempty"`
 	Size           int64          `json:"size,omitempty"`
