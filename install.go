@@ -69,6 +69,8 @@ Group={{.Group}}
 WorkingDirectory={{.InstallDir}}
 Sockets={{.SFTPSocketName}} {{.ExplorerEventsSocketName}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 
 # If server handles syslog internally, discard stdout to avoid duplicate logs in journal
 StandardOutput={{if .UseSyslog}}null{{else}}journal{{end}}
@@ -116,6 +118,8 @@ Group={{.Group}}
 WorkingDirectory={{.InstallDir}}
 Sockets={{.SocketName}}
 ExecStart={{.BinaryPath}}{{range .Args}} {{.}}{{end}}
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier={{.Name}}
@@ -276,13 +280,6 @@ func runInstall(opts installOptions) error {
 		return cmd.Run()
 	}
 
-	// Stop existing service (ignore error: may not exist yet).
-	_ = run("systemctl", "stop", serviceName)
-	_ = run("systemctl", "stop", socketName)
-	_ = run("systemctl", "stop", explorerServiceName)
-	_ = run("systemctl", "stop", explorerSocketName)
-	_ = run("systemctl", "stop", explorerEventsSocketName)
-
 	if err := os.MkdirAll(installDir, permDir); err != nil {
 		return fmt.Errorf("mkdir %s: %w", installDir, err)
 	}
@@ -360,7 +357,6 @@ func runInstall(opts installOptions) error {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
 
-	_ = run("systemctl", "stop", serviceName)
 	_ = run("systemctl", "disable", serviceName)
 	_ = os.Remove(filepath.Join("/etc/systemd/system/multi-user.target.wants", serviceName))
 	_ = run("systemctl", "reset-failed", serviceName)
@@ -368,7 +364,6 @@ func runInstall(opts installOptions) error {
 	units := []string{socketName, explorerEventsSocketName}
 	startUnits := []string{socketName, explorerEventsSocketName}
 	if explorerInstalled {
-		_ = run("systemctl", "stop", explorerServiceName)
 		_ = run("systemctl", "disable", explorerServiceName)
 		_ = os.Remove(filepath.Join("/etc/systemd/system/multi-user.target.wants", explorerServiceName))
 		_ = run("systemctl", "reset-failed", explorerServiceName)
@@ -387,6 +382,18 @@ func runInstall(opts installOptions) error {
 	for _, unit := range startUnits {
 		if err := run("systemctl", "start", unit); err != nil {
 			return fmt.Errorf("systemctl start %s: %w", unit, err)
+		}
+	}
+
+	// On upgrades, keep socket units listening and let active services drain.
+	// Inactive socket-activated services are left idle for the next connection.
+	restartUnits := []string{serviceName}
+	if explorerInstalled {
+		restartUnits = append(restartUnits, explorerServiceName)
+	}
+	for _, unit := range restartUnits {
+		if err := run("systemctl", "--no-block", "try-restart", unit); err != nil {
+			return fmt.Errorf("systemctl try-restart %s: %w", unit, err)
 		}
 	}
 

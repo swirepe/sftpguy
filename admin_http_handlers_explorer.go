@@ -17,6 +17,11 @@ type adminExplorerActionRequest struct {
 	Path string `json:"path"`
 }
 
+type adminExplorerRenameRequest struct {
+	Path    string `json:"path"`
+	NewName string `json:"new_name"`
+}
+
 func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 	s.adminExplorerMu.Lock()
 	defer s.adminExplorerMu.Unlock()
@@ -77,7 +82,40 @@ func (s *Server) handleAdminExplorer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("explorer init failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	h.ServeHTTP(w, r)
+
+	connID := s.startLiveConnectionFor("explorer-admin", "http", liveHTTPRemoteAddr(r), liveHTTPLocalAddr(r), false)
+	sessionID := "admin-explorer:" + connID
+	pathLabel := r.URL.Path
+	if r.URL.RawQuery != "" {
+		pathLabel += "?" + r.URL.RawQuery
+	}
+	s.startLiveSession(liveSessionStart{
+		ConnectionID: connID,
+		Source:       "explorer-admin",
+		Protocol:     "http",
+		SessionID:    sessionID,
+		UserID:       systemOwner,
+		AuthUser:     "admin-http",
+		RemoteAddr:   liveHTTPRemoteAddr(r),
+		LocalAddr:    liveHTTPLocalAddr(r),
+		LoginType:    "http",
+		UserAgent:    r.UserAgent(),
+		Admin:        true,
+	})
+	finishRequest := s.startLiveSFTPRequest(sessionID, r.Method, pathLabel)
+	liveWriter := &liveHTTPResponseWriter{
+		ResponseWriter: w,
+		srv:            s,
+		sessionID:      sessionID,
+		path:           pathLabel,
+	}
+	defer func() {
+		liveWriter.finish()
+		finishRequest(nil)
+		s.finishLiveSession(sessionID)
+		s.finishLiveConnection(connID)
+	}()
+	h.ServeHTTP(liveWriter, r)
 }
 
 func (s *Server) decodeAdminExplorerPath(r *http.Request) (string, error) {
@@ -100,6 +138,74 @@ func (s *Server) decodeAdminExplorerPath(r *http.Request) (string, error) {
 	return relPath, nil
 }
 
+func cleanAdminExplorerNewName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("new name is required")
+	}
+	if name == "." || name == ".." {
+		return "", fmt.Errorf("invalid new name")
+	}
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return "", fmt.Errorf("new name cannot contain path separators")
+	}
+	if filepath.Base(name) != name {
+		return "", fmt.Errorf("invalid new name")
+	}
+	return name, nil
+}
+
+func (s *Server) adminExplorerFullPath(relPath string) (string, error) {
+	fullPath := filepath.Join(s.absUploadDir, filepath.FromSlash(relPath))
+	fullPath = filepath.Clean(fullPath)
+	rootWithSep := s.absUploadDir + string(filepath.Separator)
+	if fullPath != s.absUploadDir && strings.HasPrefix(fullPath+string(filepath.Separator), rootWithSep) {
+		return fullPath, nil
+	}
+	return "", fmt.Errorf("invalid path")
+}
+
+func (s *Server) decodeAdminExplorerRename(r *http.Request) (oldRel, newRel, newName string, err error) {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+
+	var payload adminExplorerRenameRequest
+	if err := dec.Decode(&payload); err != nil {
+		return "", "", "", fmt.Errorf("decode request body: %w", err)
+	}
+
+	oldRel, err = cleanRelativePath(payload.Path)
+	if err != nil {
+		return "", "", "", err
+	}
+	if oldRel == "." {
+		return "", "", "", fmt.Errorf("path is required")
+	}
+
+	newName, err = cleanAdminExplorerNewName(payload.NewName)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	parent := filepath.ToSlash(filepath.Dir(oldRel))
+	if parent == "." {
+		newRel = newName
+	} else {
+		newRel = filepath.ToSlash(filepath.Join(parent, newName))
+	}
+	if newRel == oldRel {
+		return "", "", "", fmt.Errorf("new name matches current name")
+	}
+	if clean, err := cleanRelativePath(newRel); err != nil {
+		return "", "", "", err
+	} else if clean != newRel {
+		return "", "", "", fmt.Errorf("invalid new path")
+	}
+
+	return oldRel, newRel, newName, nil
+}
+
 func (s *Server) handleAdminExplorerDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -112,10 +218,8 @@ func (s *Server) handleAdminExplorerDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	fullPath := filepath.Join(s.absUploadDir, filepath.FromSlash(relPath))
-	fullPath = filepath.Clean(fullPath)
-	rootWithSep := s.absUploadDir + string(filepath.Separator)
-	if !strings.HasPrefix(fullPath+string(filepath.Separator), rootWithSep) {
+	fullPath, err := s.adminExplorerFullPath(relPath)
+	if err != nil {
 		http.Error(w, "invalid path", http.StatusForbidden)
 		return
 	}
@@ -154,6 +258,84 @@ func (s *Server) handleAdminExplorerDelete(w http.ResponseWriter, r *http.Reques
 		"path":   relPath,
 		"is_dir": info.IsDir(),
 		"owner":  owner,
+	})
+}
+
+func (s *Server) handleAdminExplorerRename(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	oldRel, newRel, newName, err := s.decodeAdminExplorerRename(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	oldFullPath, err := s.adminExplorerFullPath(oldRel)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusForbidden)
+		return
+	}
+	newFullPath, err := s.adminExplorerFullPath(newRel)
+	if err != nil {
+		http.Error(w, "invalid target path", http.StatusForbidden)
+		return
+	}
+
+	info, err := os.Stat(oldFullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "path not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := os.Stat(newFullPath); err == nil {
+		http.Error(w, "target already exists", http.StatusConflict)
+		return
+	} else if !os.IsNotExist(err) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if exists, err := s.store.PathMetadataExists(newRel); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if exists {
+		http.Error(w, "target metadata already exists", http.StatusConflict)
+		return
+	}
+
+	owner, _ := s.store.GetFileOwner(oldRel)
+	if err := os.Rename(oldFullPath, newFullPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.RenamePath(oldRel, newRel); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.store.LogEvent(EventRename, systemOwner, "admin-http", nil,
+		"path", oldRel,
+		"target", newRel,
+		"scope", "explorer",
+		"owner", owner)
+	s.logger.Info("admin explorer renamed path",
+		"path", oldRel,
+		"target", newRel,
+		"is_dir", info.IsDir(),
+		"owner", shortID(owner))
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"path":     oldRel,
+		"target":   newRel,
+		"new_name": newName,
+		"is_dir":   info.IsDir(),
+		"owner":    owner,
 	})
 }
 

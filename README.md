@@ -262,7 +262,7 @@ sudo ./sftpguy \
   -logfile /var/log/sftpguy.log
 ```
 
-This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, `<service>.socket`, and `<service>-explorer-events.socket`, optionally creates the service user and group, reloads systemd, enables and starts the socket units, and leaves the service to be started by systemd socket activation. Installed services use `-systemd.socket`, so they require inherited sockets instead of binding the configured ports themselves.
+This copies the current binary into `/var/lib/<service>/<service>`, writes `/etc/systemd/system/<service>.service`, `<service>.socket`, and `<service>-explorer-events.socket`, optionally creates the service user and group, reloads systemd, enables and starts the socket units, and leaves the service to be started by systemd socket activation. Re-running `-install` keeps socket units up and asks systemd to restart already-running services in the background; old processes drain active sessions while new socket-activated processes use the updated binaries. Installed services use `-systemd.socket`, so they require inherited sockets instead of binding the configured ports themselves.
 
 To install the standalone HTTP explorer too, build it beside the main binary and point the installer at it:
 

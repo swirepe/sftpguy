@@ -357,6 +357,8 @@ type statusRecorder struct {
 	status      int
 }
 
+type explorerRequestIDKey struct{}
+
 func (sr *statusRecorder) WriteHeader(code int) {
 	if sr.wroteHeader {
 		return
@@ -377,6 +379,10 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Form-Factors, Downlink, ECT, RTT, Sec-CH-Device-Memory, Sec-CH-UA-Arch, Sec-CH-UA-Platform-Version")
 
 	session := SessionCookie(w, r)
+	requestID := emitRequestStartEvent(r)
+	if requestID != "" {
+		r = r.WithContext(context.WithValue(r.Context(), explorerRequestIDKey{}, requestID))
+	}
 
 	sr := &statusRecorder{
 		ResponseWriter: w,
@@ -390,7 +396,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	reqLog.Info("request",
 		"status", sr.status,
 		"duration", duration)
-	emitRequestEvent(r, sr.status, duration)
+	emitRequestFinishEvent(requestID, r, sr.status, duration)
 }
 
 func SessionCookie(w http.ResponseWriter, r *http.Request) string {
@@ -687,10 +693,18 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		reqLog.Info("download throttled", "ip", ip, "rateLimit", rateLimit)
 	}
 
+	var reporter *explorerTransferReporter
+	if r.Method == http.MethodGet {
+		reporter = newExplorerTransferReporter(explorerevents.KindDownload, r, relPath, info.Size(), 0)
+		reporter.Start()
+	}
 	tw := &transferLogWriter{
 		ResponseWriter: w,
 		limiter:        limiter,
 		ctx:            r.Context(),
+	}
+	if reporter != nil {
+		tw.progress = reporter.Progress
 	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
@@ -708,7 +722,7 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		clientLogGroup(r),
 	)
 	if r.Method == http.MethodGet {
-		emitTransferEvent(explorerevents.KindDownload, r, relPath, tw.bytes, info.Size(), 0, dur)
+		reporter.Finish(tw.bytes, dur)
 	}
 
 }
@@ -729,6 +743,14 @@ func clientLogGroup(r *http.Request) slog.Attr {
 	)
 }
 
+func newExplorerEventID(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "evt"
+	}
+	return prefix + "-" + generateNonce()
+}
+
 func emitTransferEvent(kind string, r *http.Request, relPath string, bytes, size, delta int64, duration time.Duration) {
 	if eventClient == nil || r == nil {
 		return
@@ -737,8 +759,14 @@ func emitTransferEvent(kind string, r *http.Request, relPath string, bytes, size
 }
 
 func transferEvent(kind string, r *http.Request, relPath string, bytes, size, delta int64, duration time.Duration) explorerevents.Event {
+	return transferEventWithPhase("", "", kind, r, relPath, bytes, size, delta, duration)
+}
+
+func transferEventWithPhase(id, phase, kind string, r *http.Request, relPath string, bytes, size, delta int64, duration time.Duration) explorerevents.Event {
 	return explorerevents.Event{
+		ID:             id,
 		Kind:           kind,
+		Phase:          phase,
 		ClientIP:       clientIdentityIP(r),
 		RemoteAddr:     r.RemoteAddr,
 		Session:        requestSession(r),
@@ -760,6 +788,91 @@ func transferEvent(kind string, r *http.Request, relPath string, bytes, size, de
 	}
 }
 
+type explorerTransferReporter struct {
+	id       string
+	kind     string
+	r        *http.Request
+	relPath  string
+	size     int64
+	delta    int64
+	started  time.Time
+	lastEmit time.Time
+}
+
+func newExplorerTransferReporter(kind string, r *http.Request, relPath string, size, delta int64) *explorerTransferReporter {
+	if eventClient == nil || r == nil {
+		return nil
+	}
+	now := time.Now()
+	id := explorerRequestID(r)
+	if id == "" {
+		id = newExplorerEventID("xfer")
+	}
+	return &explorerTransferReporter{
+		id:       id,
+		kind:     kind,
+		r:        r,
+		relPath:  relPath,
+		size:     size,
+		delta:    delta,
+		started:  now,
+		lastEmit: now,
+	}
+}
+
+func explorerRequestID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	id, _ := r.Context().Value(explorerRequestIDKey{}).(string)
+	return strings.TrimSpace(id)
+}
+
+func (r *explorerTransferReporter) Start() {
+	if r == nil || eventClient == nil {
+		return
+	}
+	eventClient.Emit(transferEventWithPhase(r.id, explorerevents.PhaseStart, r.kind, r.r, r.relPath, 0, r.size, r.delta, 0))
+}
+
+func (r *explorerTransferReporter) Progress(bytes int64) {
+	if r == nil || eventClient == nil || bytes <= 0 {
+		return
+	}
+	now := time.Now()
+	if now.Sub(r.lastEmit) < time.Second {
+		return
+	}
+	r.lastEmit = now
+	eventClient.Emit(transferEventWithPhase(r.id, explorerevents.PhaseProgress, r.kind, r.r, r.relPath, bytes, r.size, r.delta, now.Sub(r.started)))
+}
+
+func (r *explorerTransferReporter) Finish(bytes int64, duration time.Duration) {
+	if r == nil || eventClient == nil {
+		return
+	}
+	eventClient.Emit(transferEventWithPhase(r.id, explorerevents.PhaseFinish, r.kind, r.r, r.relPath, bytes, r.size, r.delta, duration))
+}
+
+func emitRequestStartEvent(r *http.Request) string {
+	if eventClient == nil || r == nil {
+		return ""
+	}
+	id := newExplorerEventID("req")
+	eventClient.Emit(requestEventWithPhase(id, explorerevents.PhaseStart, r, 0, 0))
+	return id
+}
+
+func emitRequestFinishEvent(id string, r *http.Request, status int, duration time.Duration) {
+	if eventClient == nil || r == nil {
+		return
+	}
+	if id == "" {
+		id = newExplorerEventID("req")
+	}
+	eventClient.Emit(requestEventWithPhase(id, explorerevents.PhaseFinish, r, status, duration))
+}
+
 func emitRequestEvent(r *http.Request, status int, duration time.Duration) {
 	if eventClient == nil || r == nil {
 		return
@@ -768,8 +881,14 @@ func emitRequestEvent(r *http.Request, status int, duration time.Duration) {
 }
 
 func requestEvent(r *http.Request, status int, duration time.Duration) explorerevents.Event {
+	return requestEventWithPhase("", "", r, status, duration)
+}
+
+func requestEventWithPhase(id, phase string, r *http.Request, status int, duration time.Duration) explorerevents.Event {
 	return explorerevents.Event{
+		ID:         id,
 		Kind:       explorerevents.KindRequest,
+		Phase:      phase,
 		ClientIP:   clientIdentityIP(r),
 		RemoteAddr: r.RemoteAddr,
 		Session:    requestSession(r),
@@ -1534,15 +1653,17 @@ func fmtBytesFloat(b float64) string {
 
 type transferLogWriter struct {
 	http.ResponseWriter
-	bytes   int64
-	limiter *rate.Limiter
-	ctx     context.Context // Needed for limiter.WaitN
+	bytes    int64
+	limiter  *rate.Limiter
+	ctx      context.Context // Needed for limiter.WaitN
+	progress func(int64)
 }
 
 func (w *transferLogWriter) Write(p []byte) (int, error) {
 	if w.limiter == nil {
 		n, err := w.ResponseWriter.Write(p)
 		w.bytes += int64(n)
+		w.reportProgress()
 		return n, err
 	}
 
@@ -1564,6 +1685,7 @@ func (w *transferLogWriter) Write(p []byte) (int, error) {
 		n, err := w.ResponseWriter.Write(p[:writeSize])
 		total += n
 		w.bytes += int64(n)
+		w.reportProgress()
 		if err != nil {
 			return total, err
 		}
@@ -1574,11 +1696,15 @@ func (w *transferLogWriter) Write(p []byte) (int, error) {
 	return total, nil
 }
 
+func (w *transferLogWriter) reportProgress() {
+	if w != nil && w.progress != nil {
+		w.progress(w.bytes)
+	}
+}
+
 func (w *transferLogWriter) ReadFrom(r io.Reader) (int64, error) {
 	if w.limiter == nil {
-		n, err := io.Copy(w.ResponseWriter, r)
-		w.bytes += n
-		return n, err
+		return io.Copy(struct{ io.Writer }{w}, r)
 	}
 	return io.Copy(struct{ io.Writer }{w}, r)
 }

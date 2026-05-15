@@ -776,9 +776,21 @@ func (s *Store) RenamePath(oldRel, newRel string) error {
 		UPDATE files 
 		SET path = ? || substr(path, ?)
 		WHERE path = ? OR substr(path, 1, ?) = ?`,
-		newRel, prefixLen+1,
+		newRel, prefixLen,
 		oldRel, prefixLen, oldRel+"/")
 	return err
+}
+
+func (s *Store) PathMetadataExists(relPath string) (bool, error) {
+	prefixLen := len(relPath) + 1 // "relPath" + "/"
+	var exists bool
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM files
+			WHERE path = ? OR substr(path, 1, ?) = ?
+		)`,
+		relPath, prefixLen, relPath+"/").Scan(&exists)
+	return exists, err
 }
 
 func (s *Store) DeletePath(relPath string) error {
@@ -1217,6 +1229,7 @@ type Server struct {
 	store                 *Store
 	logger                *slog.Logger
 	metrics               *serverMetrics
+	live                  *liveTracker
 	mkdirLimiter          *rate.Limiter
 	fortuneGenerator      *FortuneGenerator
 	cfg                   Config
@@ -1279,6 +1292,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 		store:            store,
 		logger:           logger,
 		mkdirLimiter:     rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1000),
+		live:             newLiveTracker(),
 		fortuneGenerator: &FortuneGenerator{},
 		cfg:              cfg,
 		absUploadDir:     absDir,
@@ -1642,6 +1656,7 @@ func (s *Server) Listen() error {
 		}
 		throttled := s.store.IsBannedByIp(addr)
 		s.observeAcceptedConnection(throttled)
+		connID := s.startLiveConnection(addr, conn.LocalAddr(), throttled)
 		if throttled {
 			s.logger.Info("Throttling new connection", "remote_addr", addr)
 			conn = newThrottledConn(conn, shadowBanBytesPerSec)
@@ -1651,9 +1666,10 @@ func (s *Server) Listen() error {
 		go func(c net.Conn, workerLogger *slog.Logger) {
 			defer s.wg.Done()
 			defer s.releaseIPConnection(ip)
+			defer s.finishLiveConnection(connID)
 			defer s.closeObservedConnection()
 			defer recoverAndLogPanic(workerLogger, "ssh connection worker")
-			s.handleSSH(c, sshConfig)
+			s.handleSSH(c, sshConfig, connID)
 		}(conn, connLogger)
 	}
 }
@@ -1687,9 +1703,12 @@ func (s *Server) ListenExplorerEvents() error {
 
 		s.wg.Add(1)
 		go func(c net.Conn) {
+			connID := s.startLiveConnectionFor("explorer-rpc", "jsonrpc", c.RemoteAddr(), c.LocalAddr(), false)
 			defer s.wg.Done()
+			defer s.finishLiveConnection(connID)
 			defer c.Close()
 			defer recoverAndLogPanic(s.logger, "explorer RPC worker")
+			s.markLiveConnectionState(connID, "rpc")
 			rpcServer.ServeCodec(jsonrpc.NewServerCodec(c))
 		}(conn)
 	}
@@ -1808,6 +1827,19 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	if ip != "" {
 		pubHash = anonAuthHashForIP(ip)
 	}
+	rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
+	phase := explorerEventPhase(evt)
+	if phase == explorerevents.PhaseStart {
+		s.startLiveExplorerEvent(evt, pubHash, sessionID, remoteAddr, rel, ip)
+		return nil
+	}
+	if phase == explorerevents.PhaseProgress {
+		s.progressLiveExplorerEvent(evt, sessionID)
+		return nil
+	}
+	if phase == explorerevents.PhaseFinish {
+		defer s.finishLiveExplorerEvent(evt, sessionID, rel)
+	}
 
 	switch evt.Kind {
 	case explorerevents.KindUpload:
@@ -1815,18 +1847,111 @@ func (s *Server) recordExplorerEvent(evt explorerevents.Event) error {
 	case explorerevents.KindDownload:
 		return s.recordExplorerDownload(evt, pubHash, sessionID, remoteAddr, ip)
 	case explorerevents.KindRequest:
-		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
 		s.store.LogEvent(EventExplorerRequest, pubHash, sessionID, remoteAddr,
 			explorerEventLogArgs(evt, rel, ip)...)
 		return nil
 	case explorerevents.KindLog:
-		rel := cleanExplorerEventPath(firstExplorerEventNonEmpty(evt.Path, evt.URLPath))
 		s.store.LogEvent(EventExplorerLog, pubHash, sessionID, remoteAddr,
 			explorerEventLogArgs(evt, rel, ip)...)
 		return nil
 	default:
 		return fmt.Errorf("unknown explorer event kind %q", evt.Kind)
 	}
+}
+
+func (s *Server) startLiveExplorerEvent(evt explorerevents.Event, pubHash, sessionID string, remoteAddr net.Addr, rel, ip string) {
+	eventID := explorerEventLiveID(evt)
+	if eventID == "" {
+		return
+	}
+	connID := liveExplorerConnectionID(eventID)
+	userAgent := explorerEventUserAgent(evt)
+	banned := false
+	if s != nil && s.store != nil && ip != "" {
+		banned = s.store.IsIPBanned(ip)
+	}
+
+	created := s.ensureLiveConnectionWithID(connID, "explorer", "http", remoteAddr, nil, banned)
+	if created {
+		s.markLiveConnectionState(connID, "request")
+	}
+	if evt.Kind == explorerevents.KindRequest {
+		if !created {
+			return
+		}
+		s.startLiveSession(liveSessionStart{
+			ConnectionID: connID,
+			Source:       "explorer",
+			Protocol:     "http",
+			SessionID:    sessionID,
+			UserID:       pubHash,
+			AuthUser:     "explorer",
+			RemoteAddr:   remoteAddr,
+			LoginType:    "explorer",
+			UserAgent:    userAgent,
+			Banned:       banned,
+		})
+		s.startLiveSFTPRequestForConnection(sessionID, connID, explorerLiveOperation(evt), rel)
+		return
+	}
+
+	if !s.liveSessionHasConnection(sessionID, connID) {
+		s.startLiveSession(liveSessionStart{
+			ConnectionID: connID,
+			Source:       "explorer",
+			Protocol:     "http",
+			SessionID:    sessionID,
+			UserID:       pubHash,
+			AuthUser:     "explorer",
+			RemoteAddr:   remoteAddr,
+			LoginType:    "explorer",
+			UserAgent:    userAgent,
+			Banned:       banned,
+		})
+		s.startLiveSFTPRequestForConnection(sessionID, connID, explorerLiveOperation(evt), rel)
+	}
+	switch evt.Kind {
+	case explorerevents.KindUpload:
+		s.startLiveTransferWithIDForConnection(liveExplorerTransferID(eventID), sessionID, connID, "upload", rel)
+	case explorerevents.KindDownload:
+		s.startLiveTransferWithIDForConnection(liveExplorerTransferID(eventID), sessionID, connID, "download", rel)
+	}
+}
+
+func (s *Server) progressLiveExplorerEvent(evt explorerevents.Event, sessionID string) {
+	eventID := explorerEventLiveID(evt)
+	if eventID == "" {
+		return
+	}
+	switch evt.Kind {
+	case explorerevents.KindUpload:
+		s.recordLiveTransferBytesAbsolute(sessionID, liveExplorerTransferID(eventID), "upload", evt.Bytes)
+	case explorerevents.KindDownload:
+		s.recordLiveTransferBytesAbsolute(sessionID, liveExplorerTransferID(eventID), "download", evt.Bytes)
+	}
+}
+
+func (s *Server) finishLiveExplorerEvent(evt explorerevents.Event, sessionID, rel string) {
+	eventID := explorerEventLiveID(evt)
+	if eventID == "" {
+		return
+	}
+	connID := liveExplorerConnectionID(eventID)
+	switch evt.Kind {
+	case explorerevents.KindUpload:
+		transferID := liveExplorerTransferID(eventID)
+		s.recordLiveTransferBytesAbsolute(sessionID, transferID, "upload", evt.Bytes)
+		s.finishLiveTransfer(transferID)
+		return
+	case explorerevents.KindDownload:
+		transferID := liveExplorerTransferID(eventID)
+		s.recordLiveTransferBytesAbsolute(sessionID, transferID, "download", evt.Bytes)
+		s.finishLiveTransfer(transferID)
+		return
+	}
+	s.finishLiveRequestForConnection(sessionID, connID, explorerLiveOperation(evt), rel, nil)
+	s.finishLiveSessionForConnection(sessionID, connID)
+	s.finishLiveConnection(connID)
 }
 
 func (s *Server) recordExplorerUpload(evt explorerevents.Event, pubHash, sessionID string, remoteAddr net.Addr, ip string) error {
@@ -1899,6 +2024,8 @@ func (s *Server) recordExplorerDownload(evt explorerevents.Event, pubHash, sessi
 func explorerEventLogArgs(evt explorerevents.Event, rel, ip string) []any {
 	args := []any{
 		"source", "explorer",
+		"phase", evt.Phase,
+		"event_id", evt.ID,
 		"client_ip", ip,
 		"remote_addr", evt.RemoteAddr,
 		"bytes", evt.Bytes,
@@ -1921,6 +2048,86 @@ func explorerEventLogArgs(evt explorerevents.Event, rel, ip string) []any {
 		args = append(args, "explorer_meta", evt.Meta)
 	}
 	return args
+}
+
+func explorerEventPhase(evt explorerevents.Event) string {
+	phase := strings.ToLower(strings.TrimSpace(evt.Phase))
+	switch phase {
+	case explorerevents.PhaseStart, explorerevents.PhaseProgress, explorerevents.PhaseFinish:
+		return phase
+	case "":
+		return explorerevents.PhaseFinish
+	default:
+		return explorerevents.PhaseFinish
+	}
+}
+
+func explorerEventLiveID(evt explorerevents.Event) string {
+	id := strings.TrimSpace(evt.ID)
+	if id == "" {
+		return ""
+	}
+	if len(id) > 128 {
+		id = id[:128]
+	}
+	return id
+}
+
+func liveExplorerConnectionID(eventID string) string {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return ""
+	}
+	return "explorer:" + eventID
+}
+
+func liveExplorerTransferID(eventID string) string {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return ""
+	}
+	return "explorer-xfer:" + eventID
+}
+
+func explorerLiveOperation(evt explorerevents.Event) string {
+	method := strings.ToUpper(strings.TrimSpace(evt.Method))
+	kind := strings.TrimSpace(evt.Kind)
+	if method != "" && kind != "" {
+		return method + " " + kind
+	}
+	if method != "" {
+		return method
+	}
+	if kind != "" {
+		return kind
+	}
+	return "explorer"
+}
+
+func explorerEventUserAgent(evt explorerevents.Event) string {
+	if len(evt.Meta) == 0 {
+		return ""
+	}
+	for _, key := range []string{"user_agent", "User-Agent"} {
+		if value := stringFromAny(evt.Meta[key]); strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	if headers, ok := evt.Meta["headers"].(map[string]any); ok {
+		for _, key := range []string{"User-Agent", "user-agent"} {
+			if value := stringFromAny(headers[key]); strings.TrimSpace(value) != "" {
+				return value
+			}
+		}
+	}
+	if headers, ok := evt.Meta["headers"].(map[string][]string); ok {
+		for _, key := range []string{"User-Agent", "user-agent"} {
+			if values := headers[key]; len(values) > 0 && strings.TrimSpace(values[0]) != "" {
+				return values[0]
+			}
+		}
+	}
+	return ""
 }
 
 func explorerEventIP(evt explorerevents.Event) string {
@@ -2145,12 +2352,14 @@ func (s *Server) bannerCallback(conn ssh.ConnMetadata) string {
 	return banner
 }
 
-func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
+func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig, connID string) {
 	nConn.SetDeadline(time.Now().Add(30 * time.Second))
+	s.markLiveConnectionState(connID, "handshake")
 
 	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 	if err != nil {
 		s.observeHandshake(false)
+		s.markLiveConnectionState(connID, "handshake_failed")
 		nConn.Close()
 		return
 	}
@@ -2176,6 +2385,19 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 	sessionStarted := time.Now()
 	sessionCounts := &sessionCounters{}
 	observeSession := s.observeSession(loginType, isAdminSFTP, isBanned)
+	s.startLiveSession(liveSessionStart{
+		ConnectionID: connID,
+		SessionID:    sessionID,
+		UserID:       effectivePubHash,
+		AuthUser:     sConn.User(),
+		RemoteAddr:   sConn.RemoteAddr(),
+		LocalAddr:    sConn.LocalAddr(),
+		LoginType:    loginType,
+		UserAgent:    liveSSHVersion(sConn.ClientVersion()),
+		Admin:        isAdminSFTP,
+		Banned:       isBanned,
+		SessionStart: sessionStarted,
+	})
 	if isAdminSFTP {
 		s.logAdminLogin(pubHash, sessionID, sConn.RemoteAddr())
 	}
@@ -2194,6 +2416,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig) {
 			"downloads_bytes", sessionCounts.downloadsBytes.Load(),
 			"denied", sessionCounts.denied.Load(),
 		)
+		s.finishLiveSession(sessionID)
 	}()
 
 	logger := s.logger.With(s.userGroup(effectivePubHash, sessionID, sConn.RemoteAddr()))
@@ -2929,7 +3152,8 @@ func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
 	if err != nil {
 		return nil, err
 	}
-	reader = newMetricsReaderAt(f, h, "download", func(bytesRead int64, duration time.Duration) {
+	transferID := h.srv.startLiveTransfer(h.sessionID, "download", meta.rel)
+	reader = newMetricsReaderAt(f, h, "download", transferID, func(bytesRead int64, duration time.Duration) {
 		h.logDownload(meta.rel, bytesRead, duration)
 	})
 
@@ -3014,6 +3238,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 		File:       f,
 		h:          h,
 		rel:        meta.rel,
+		transferID: h.srv.startLiveTransfer(h.sessionID, "upload", meta.rel),
 		ownerHint:  ownerHint,
 		oldSize:    oldSize,
 		appendMode: appendMode,
@@ -3118,12 +3343,14 @@ func (h *fsHandler) newSftpFile(fi os.FileInfo, relPath string) *sftpFile {
 func (h *fsHandler) Trace(msg, operation string, errp *error, args ...any) func() {
 	start := time.Now()
 	observe := h.observeSFTPRequest(operation)
+	finishLiveRequest := h.srv.startLiveSFTPRequest(h.sessionID, operation, liveTracePath(args))
 	return func() {
 		var err error
 		if errp != nil {
 			err = *errp
 		}
 		observe(err)
+		finishLiveRequest(err)
 
 		durationArgs := make([]any, 0, 2+len(args))
 		durationArgs = append(durationArgs, "duration", time.Since(start))
@@ -3289,6 +3516,7 @@ type statWriter struct {
 	*os.File
 	h          *fsHandler
 	rel        string
+	transferID string
 	ownerHint  string
 	oldSize    int64
 	appendMode bool
@@ -3312,7 +3540,7 @@ func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 		n, err := sw.File.Write(p)
 		if n > 0 {
 			sw.written.Add(int64(n))
-			sw.h.observeTransferBytes("upload", int64(n))
+			sw.h.observeTransferBytesForTransfer("upload", sw.transferID, int64(n))
 		}
 		return n, err
 	}
@@ -3324,7 +3552,7 @@ func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 	n, err := sw.File.WriteAt(p, off)
 	if n > 0 {
 		sw.written.Add(int64(n))
-		sw.h.observeTransferBytes("upload", int64(n))
+		sw.h.observeTransferBytesForTransfer("upload", sw.transferID, int64(n))
 	}
 	return n, err
 }
@@ -3348,6 +3576,9 @@ func (sw *statWriter) enqueueBadUploadCheck() {
 }
 
 func (sw *statWriter) Close() error {
+	if sw.h != nil && sw.h.srv != nil {
+		defer sw.h.srv.finishLiveTransfer(sw.transferID)
+	}
 	size := sw.oldSize
 	if fi, err := sw.File.Stat(); err == nil {
 		size = fi.Size()

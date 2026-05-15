@@ -67,15 +67,16 @@ type archiveStatsCollector struct {
 }
 
 type metricsReaderAt struct {
-	reader    io.ReaderAt
-	closer    io.Closer
-	h         *fsHandler
-	direction string
-	startedAt time.Time
-	onClose   func(int64, time.Duration)
-	bytesRead atomic.Int64
-	closeOnce sync.Once
-	closeErr  error
+	reader     io.ReaderAt
+	closer     io.Closer
+	h          *fsHandler
+	direction  string
+	transferID string
+	startedAt  time.Time
+	onClose    func(int64, time.Duration)
+	bytesRead  atomic.Int64
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func NewMetricsHandler() http.Handler {
@@ -653,6 +654,13 @@ func (h *fsHandler) observeSFTPRequest(operation string) func(error) {
 }
 
 func (h *fsHandler) observeTransferBytes(direction string, n int64) {
+	h.observeTransferBytesForTransfer(direction, "", n)
+}
+
+func (h *fsHandler) observeTransferBytesForTransfer(direction, transferID string, n int64) {
+	if h != nil && h.srv != nil {
+		h.srv.recordLiveTransferBytes(h.sessionID, transferID, direction, n)
+	}
 	if h == nil || h.srv == nil || h.srv.metrics == nil {
 		return
 	}
@@ -673,13 +681,14 @@ func (h *fsHandler) observeDenied(kind EventKind) {
 	h.srv.metrics.observeDenied(kind, h.isAdmin, h.isBanned)
 }
 
-func newMetricsReaderAt(reader io.ReaderAt, h *fsHandler, direction string, onClose func(int64, time.Duration)) *metricsReaderAt {
+func newMetricsReaderAt(reader io.ReaderAt, h *fsHandler, direction, transferID string, onClose func(int64, time.Duration)) *metricsReaderAt {
 	m := &metricsReaderAt{
-		reader:    reader,
-		h:         h,
-		direction: direction,
-		startedAt: time.Now(),
-		onClose:   onClose,
+		reader:     reader,
+		h:          h,
+		direction:  direction,
+		transferID: transferID,
+		startedAt:  time.Now(),
+		onClose:    onClose,
 	}
 	if closer, ok := reader.(io.Closer); ok {
 		m.closer = closer
@@ -691,7 +700,7 @@ func (m *metricsReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	n, err := m.reader.ReadAt(p, off)
 	if n > 0 {
 		m.bytesRead.Add(int64(n))
-		m.h.observeTransferBytes(m.direction, int64(n))
+		m.h.observeTransferBytesForTransfer(m.direction, m.transferID, int64(n))
 	}
 	return n, err
 }
@@ -701,6 +710,9 @@ func (m *metricsReaderAt) Close() error {
 		bytesRead := m.bytesRead.Load()
 		duration := time.Since(m.startedAt)
 		m.h.observeTransferComplete(m.direction, bytesRead)
+		if m.h != nil && m.h.srv != nil {
+			m.h.srv.finishLiveTransfer(m.transferID)
+		}
 		if m.closer != nil {
 			m.closeErr = m.closer.Close()
 		}

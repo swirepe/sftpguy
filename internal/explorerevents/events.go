@@ -9,11 +9,17 @@ const (
 	KindRequest  = "request"
 
 	RPCServiceName = "ExplorerEvents"
+
+	PhaseStart    = "start"
+	PhaseProgress = "progress"
+	PhaseFinish   = "finish"
 )
 
 type Event struct {
 	Version        int            `json:"version"`
+	ID             string         `json:"id,omitempty"`
 	Kind           string         `json:"kind"`
+	Phase          string         `json:"phase,omitempty"`
 	Timestamp      int64          `json:"timestamp,omitempty"`
 	ClientIP       string         `json:"client_ip,omitempty"`
 	RemoteAddr     string         `json:"remote_addr,omitempty"`

@@ -46,6 +46,9 @@ func TestInstalledServicesAreSocketActivatedUnits(t *testing.T) {
 		if !strings.Contains(content, "Sockets=") {
 			t.Fatalf("%s service missing Sockets=:\n%s", name, content)
 		}
+		if !strings.Contains(content, "KillSignal=SIGTERM") || !strings.Contains(content, "TimeoutStopSec=infinity") {
+			t.Fatalf("%s service missing graceful handoff stop settings:\n%s", name, content)
+		}
 	}
 }
 

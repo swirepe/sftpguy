@@ -48,6 +48,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		Explorer:         d.srv.handleAdminExplorer,
 		Health:           adminhttp.HealthHandler(d),
 		Summary:          adminhttp.SummaryHandler(d),
+		Live:             d.srv.handleAdminLive,
 		Users:            d.srv.handleAdminUsers,
 		User:             d.srv.handleAdminUser,
 		Files:            d.srv.handleAdminFiles,
@@ -79,6 +80,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		SelfTest:         d.srv.handleAdminSelfTest,
 		SelfTestRun:      d.srv.handleAdminSelfTestRun,
 		ExplorerDelete:   d.srv.handleAdminExplorerDelete,
+		ExplorerRename:   d.srv.handleAdminExplorerRename,
 		ExplorerBanOwner: d.srv.handleAdminExplorerBanOwner,
 		OneTimeLoginURL:  d.srv.handleAdminOneTimeLoginURL,
 	}

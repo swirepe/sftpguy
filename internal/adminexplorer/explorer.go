@@ -55,6 +55,7 @@ const (
 	defaultMaxUploadBytes  = 1_000 << 20
 	defaultWarmCacheMax    = 0
 	defaultDeleteAPIPath   = "/admin/api/explorer/delete"
+	defaultRenameAPIPath   = "/admin/api/explorer/rename"
 	defaultBanOwnerAPIPath = "/admin/api/explorer/ban-owner"
 	defaultMarkBadAPIPath  = "/admin/api/maintenance/mark-bad"
 
@@ -407,6 +408,7 @@ type PageData struct {
 	ParentURL       template.URL
 	BasePath        template.URL
 	DeleteAPIURL    template.URL
+	RenameAPIURL    template.URL
 	BanOwnerAPIURL  template.URL
 	MarkBadAPIURL   template.URL
 	Breadcrumbs     []Breadcrumb
@@ -1057,6 +1059,7 @@ func handleGet(w http.ResponseWriter, r *http.Request, fullPath, relPath string)
 		ParentURL:       template.URL(explorerURL(parent)),
 		BasePath:        template.URL(basePath),
 		DeleteAPIURL:    template.URL(defaultDeleteAPIPath),
+		RenameAPIURL:    template.URL(defaultRenameAPIPath),
 		BanOwnerAPIURL:  template.URL(defaultBanOwnerAPIPath),
 		MarkBadAPIURL:   template.URL(defaultMarkBadAPIPath),
 		Breadcrumbs:     buildBreadcrumbs(relPath),
@@ -3592,6 +3595,7 @@ var FLV_JS_CDN  = {{.FlvjsCDN        | js}};
 var VJS_FLV_CDN = {{.VideoJsFlvJsCDN | js}};
 var EXPLORER_BASE = {{.BasePath | js}};
 var EXPLORER_DELETE_API = {{.DeleteAPIURL | js}};
+var EXPLORER_RENAME_API = {{.RenameAPIURL | js}};
 var EXPLORER_BAN_API = {{.BanOwnerAPIURL | js}};
 var EXPLORER_MARK_BAD_API = {{.MarkBadAPIURL | js}};
 var _previewData = null;
@@ -4433,7 +4437,7 @@ function explorerApiPost(url, payload) {
             var data = {};
             try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
             if (!r.ok) {
-                throw new Error(data.error || ('HTTP ' + r.status));
+                throw new Error(data.error || raw || ('HTTP ' + r.status));
             }
             return data;
         });
@@ -4447,6 +4451,19 @@ function explorerDeletePath(event) {
     explorerApiPost(EXPLORER_DELETE_API, { path: _previewData.rel_path })
         .then(function() { window.location.reload(); })
         .catch(function(err) { alert('Delete failed: ' + err.message); });
+}
+
+function explorerRenamePath(event) {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    if (!_previewData || !_previewData.rel_path) return;
+    var current = _previewData.name || _previewData.rel_path.split('/').pop() || '';
+    var next = prompt('Rename "' + _previewData.rel_path + '" to:', current);
+    if (next == null) return;
+    next = next.trim();
+    if (!next || next === current) return;
+    explorerApiPost(EXPLORER_RENAME_API, { path: _previewData.rel_path, new_name: next })
+        .then(function() { window.location.reload(); })
+        .catch(function(err) { alert('Rename failed: ' + err.message); });
 }
 
 function explorerBanOwner(event) {
@@ -4745,6 +4762,10 @@ function renderPreview(d) {
                 + 'Download unavailable</button>';
         }
         if (d.rel_path) {
+            html += '<button class="btn btn-ghost" onclick="explorerRenamePath(event)" title="Rename this file">'
+                + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
+                + '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>'
+                + 'Rename</button>';
             html += '<button class="btn btn-ghost" onclick="explorerDeletePath(event)" title="Delete this file">'
                 + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
                 + '<polyline points="3 6 5 6 21 6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'
@@ -4771,6 +4792,10 @@ function renderPreview(d) {
         html += '</div>';
     } else if (d.rel_path) {
         html += '<div class="preview-actions">';
+        html += '<button class="btn btn-ghost" onclick="explorerRenamePath(event)" title="Rename this directory">'
+            + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
+            + '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>'
+            + 'Rename folder</button>';
         html += '<button class="btn btn-ghost" onclick="explorerDeletePath(event)" title="Delete this directory">'
             + '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">'
             + '<polyline points="3 6 5 6 21 6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'

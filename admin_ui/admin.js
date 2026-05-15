@@ -8,6 +8,7 @@
       liveLogTimer: 0,
       actions: [],
       summary: {},
+      live: { connections: [], sessions: [], transfers: [], connection_count: 0, session_count: 0, transfer_count: 0 },
       insights: {},
 	      summaryUploads: [],
 	      users: [],
@@ -86,6 +87,23 @@
       let i = 0;
       while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
       return x.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+    }
+    function formatRate(n) {
+      return formatBytes(n || 0) + "/s";
+    }
+    function formatSeconds(v) {
+      let n = Math.max(0, Math.floor(Number(v || 0)));
+      if (!isFinite(n) || n <= 0) return "0s";
+      const d = Math.floor(n / 86400);
+      n -= d * 86400;
+      const h = Math.floor(n / 3600);
+      n -= h * 3600;
+      const m = Math.floor(n / 60);
+      const s = n - m * 60;
+      if (d > 0) return d + "d " + h + "h";
+      if (h > 0) return h + "h " + m + "m";
+      if (m > 0) return m + "m " + s + "s";
+      return s + "s";
     }
     function toast(msg) {
       const t = document.getElementById("toast");
@@ -174,6 +192,7 @@
       const el = document.querySelector(".tab[data-tab='" + name + "']");
       if (!el) return;
       const base = name === "selftest" ? "Self Test" :
+        name === "live" ? "Live" :
         name === "logins" ? "Login URLs" :
         name === "maintenance" ? "Maintenance" :
         name === "iplists" ? "IP Lists" :
@@ -382,6 +401,15 @@
 	      if (!raw || isDir) return "";
 	      const enc = encodeURIComponent(raw);
 	      return "<button class=\"btn-danger tiny\" onclick=\"markBadFile(decodeURIComponent('" + enc + "'))\">Mark Bad</button>";
+    }
+    function renameButton(path) {
+      const raw = String(path == null ? "" : path);
+      if (!raw) return "";
+      const enc = encodeURIComponent(raw);
+      return "<button class=\"tiny\" onclick=\"renamePath(decodeURIComponent('" + enc + "'))\">Rename</button>";
+    }
+    function actionButtons() {
+      return Array.from(arguments).filter(Boolean).join(" ");
     }
     function downloadHistoryButton(path, active, label) {
       const rel = normalizeExplorerPath(path);
@@ -596,6 +624,225 @@
 	        "<h3>Recent Uploads (Quick View)</h3>" + renderSimpleTable(["Time", "User", "Path", "Delta", "Session"], quickUploadRows);
 	    }
 
+    async function loadLive() {
+      const d = await api("/admin/api/live");
+      state.live = d || { connections: [], sessions: [], transfers: [] };
+      setTabCount("live", Number(state.live.session_count || 0) || Number(state.live.connection_count || 0));
+      renderLive();
+    }
+    function liveStateTag(label, klass) {
+      return "<span class=\"tag " + esc(klass || "ok") + "\">" + esc(label) + "</span>";
+    }
+    function liveMatch(row, q) {
+      if (!q) return true;
+      const haystack = [
+        row.id,
+        row.session,
+        row.connection_id,
+        row.source,
+        row.protocol,
+        row.user_id,
+        row.auth_user,
+        row.ip,
+        row.remote_addr,
+        row.login_type,
+        row.user_agent,
+        row.client_version,
+        row.direction,
+        row.path,
+        row.last_operation,
+        row.last_path,
+        row.state
+      ].map(function(v) { return String(v || "").toLowerCase(); }).join(" ");
+      return haystack.includes(q.toLowerCase());
+    }
+    function renderLive() {
+      const live = state.live || {};
+      const q = (document.getElementById("live-q") || {}).value || "";
+      const connections = (live.connections || []).filter(function(row) { return liveMatch(row, q); });
+      const sessions = (live.sessions || []).filter(function(row) { return liveMatch(row, q); });
+      const transfers = (live.transfers || []).filter(function(row) { return liveMatch(row, q); });
+      const metrics = [
+        ["Connections", live.connection_count || 0],
+        ["Sessions", live.session_count || 0],
+        ["Transfers", live.transfer_count || 0],
+        ["Upload Rate", formatRate(live.upload_rate_bps || 0)],
+        ["Download Rate", formatRate(live.download_rate_bps || 0)],
+        ["Total Rate", formatRate(live.total_rate_bps || 0)],
+        ["Uploaded", formatBytes(live.upload_bytes || 0)],
+        ["Downloaded", formatBytes(live.download_bytes || 0)]
+      ];
+      const transferRows = transfers.map(function(t) {
+        return {
+          sort: {
+            source: t.source || "",
+            direction: t.direction || "",
+            path: t.path || "",
+            user: t.user_id || "",
+            ip: t.ip || "",
+            age: Number(t.age_sec || 0),
+            bytes: Number(t.bytes || 0),
+            rate: Number(t.rate_bps || 0)
+          },
+          cells: [
+            "<code>" + esc(t.source || "-") + "</code>",
+            "<span class=\"tag " + (t.direction === "upload" ? "ok" : "warn") + "\">" + esc(String(t.direction || "").toUpperCase()) + "</span>",
+            pathWithExplorer(t.path || "", false),
+            ownerCell(t.user_id || ""),
+            ipCell(t.ip || ""),
+            sessionCell(t.session || ""),
+            esc(formatSeconds(t.age_sec || 0)),
+            esc(formatBytes(t.bytes || 0)),
+            esc(formatRate(t.rate_bps || 0)),
+            "<code title=\"" + esc(t.user_agent || "") + "\">" + esc(t.user_agent || "-") + "</code>"
+          ]
+        };
+      });
+      const sessionRows = sessions.map(function(s) {
+        const lastPath = s.last_path ? pathWithExplorer(s.last_path, false) : "<span class=\"muted\">-</span>";
+        const flags = [
+          s.admin ? liveStateTag("ADMIN", "warn") : "",
+          s.banned ? liveStateTag("BANNED", "bad") : ""
+        ].filter(Boolean).join(" ");
+        return {
+          sort: {
+            session: s.session || "",
+            source: s.source || "",
+            user: s.user_id || "",
+            ip: s.ip || "",
+            login: s.login_type || "",
+            age: Number(s.age_sec || 0),
+            idle: Number(s.idle_sec || 0),
+            upload: Number(s.upload_bytes || 0),
+            download: Number(s.download_bytes || 0),
+            rate: Number(s.total_rate_bps || 0),
+            transfers: Number(s.active_transfers || 0),
+            requests: Number(s.requests_active || 0)
+          },
+          cells: [
+            sessionCell(s.session || ""),
+            "<code>" + esc(s.source || "-") + "</code>",
+            ownerCell(s.user_id || ""),
+            ipCell(s.ip || ""),
+            "<code>" + esc(s.login_type || "") + "</code>",
+            esc(formatSeconds(s.age_sec || 0)),
+            esc(formatSeconds(s.idle_sec || 0)),
+            esc(formatBytes(s.upload_bytes || 0)),
+            esc(formatBytes(s.download_bytes || 0)),
+            esc(formatRate(s.total_rate_bps || 0)),
+            esc(s.requests_active || 0),
+            esc(s.active_transfers || 0),
+            "<code>" + esc(s.last_operation || "-") + "</code> " + lastPath,
+            flags || "<span class=\"tag ok\">OPEN</span>",
+            "<code title=\"" + esc(s.user_agent || "") + "\">" + esc(s.user_agent || "-") + "</code>"
+          ]
+        };
+      });
+      const connectionRows = connections.map(function(c) {
+        const flags = [
+          c.throttled ? liveStateTag("THROTTLED", "warn") : "",
+          c.admin ? liveStateTag("ADMIN", "warn") : "",
+          c.banned ? liveStateTag("BANNED", "bad") : ""
+        ].filter(Boolean).join(" ");
+        return {
+          sort: {
+            id: c.id || "",
+            source: c.source || "",
+            state: c.state || "",
+            user: c.user_id || "",
+            ip: c.ip || "",
+            age: Number(c.age_sec || 0),
+            idle: Number(c.idle_sec || 0),
+            rate: Number(c.total_rate_bps || 0)
+          },
+          cells: [
+            "<code>" + esc(c.id || "") + "</code>",
+            "<code>" + esc(c.source || "-") + "</code>",
+            "<span class=\"tag " + (c.state === "authenticated" ? "ok" : "warn") + "\">" + esc(String(c.state || "open").toUpperCase()) + "</span>",
+            ipCell(c.ip || ""),
+            "<code>" + esc(c.remote_addr || "") + "</code>",
+            sessionCell(c.session || ""),
+            c.user_id ? ownerCell(c.user_id) : "<span class=\"muted\">-</span>",
+            esc(formatSeconds(c.age_sec || 0)),
+            esc(formatSeconds(c.idle_sec || 0)),
+            esc(formatRate(c.total_rate_bps || 0)),
+            flags || "<span class=\"tag ok\">NORMAL</span>",
+            "<code title=\"" + esc(c.user_agent || "") + "\">" + esc(c.user_agent || "-") + "</code>"
+          ]
+        };
+      });
+
+      document.getElementById("live-out").innerHTML =
+        "<div class=\"row\"><span class=\"pill\">snapshot " + esc(live.now_time || "") + "</span><span class=\"pill\">rate window " + esc(live.rate_window_sec || 0) + "s</span></div>" +
+        "<div class=\"grid\">" + metrics.map(function(kv) {
+          return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
+        }).join("") + "</div>" +
+        "<h3>Active Transfers</h3>" +
+        renderSmartTable(
+          "live-transfers",
+          [
+            {label:"Source", key:"source"},
+            {label:"Direction", key:"direction"},
+            {label:"Path", key:"path"},
+            {label:"User", key:"user"},
+            {label:"IP", key:"ip"},
+            {label:"Session", key:"session"},
+            {label:"Age", key:"age"},
+            {label:"Bytes", key:"bytes"},
+            {label:"Rate", key:"rate"},
+            {label:"User Agent", key:"user"}
+          ],
+          transferRows,
+          "rate",
+          "desc"
+        ) +
+        "<h3>Open Sessions</h3>" +
+        renderSmartTable(
+          "live-sessions",
+          [
+            {label:"Session", key:"session"},
+            {label:"Source", key:"source"},
+            {label:"User", key:"user"},
+            {label:"IP", key:"ip"},
+            {label:"Login", key:"login"},
+            {label:"Age", key:"age"},
+            {label:"Idle", key:"idle"},
+            {label:"Uploaded", key:"upload"},
+            {label:"Downloaded", key:"download"},
+            {label:"Rate", key:"rate"},
+            {label:"Req", key:"requests"},
+            {label:"Xfers", key:"transfers"},
+            {label:"Last", key:"idle"},
+            {label:"Flags", key:"transfers"},
+            {label:"User Agent", key:"user"}
+          ],
+          sessionRows,
+          "rate",
+          "desc"
+        ) +
+        "<h3>Open Connections</h3>" +
+        renderSmartTable(
+          "live-connections",
+          [
+            {label:"ID", key:"id"},
+            {label:"Source", key:"source"},
+            {label:"State", key:"state"},
+            {label:"IP", key:"ip"},
+            {label:"Remote", key:"ip"},
+            {label:"Session", key:"id"},
+            {label:"User", key:"user"},
+            {label:"Age", key:"age"},
+            {label:"Idle", key:"idle"},
+            {label:"Rate", key:"rate"},
+            {label:"Flags", key:"state"},
+            {label:"User Agent", key:"user"}
+          ],
+          connectionRows,
+          "age",
+          "asc"
+        );
+    }
+
     async function loadUsers() {
       const q = document.getElementById("user-q").value.trim();
       const d = await api("/admin/api/users?q=" + encodeURIComponent(q) + "&limit=1200");
@@ -675,7 +922,7 @@
 	              fileDownloadsCell(e.path || "", e.downloads || 0, !!e.is_dir),
 	              esc(e.size_human || formatBytes(e.size || 0)),
 	              e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
-	              markBadButton(e.path || "", !!e.is_dir)
+	              actionButtons(renameButton(e.path || ""), markBadButton(e.path || "", !!e.is_dir))
 	            ]
 	          };
 	        });
@@ -716,7 +963,7 @@
             fileDownloadsCell(e.path || "", e.downloads || 0, !!e.is_dir),
             esc(e.size_human || formatBytes(e.size || 0)),
             e.is_dir ? "<span class=\"tag ok\">DIR</span>" : "<span class=\"tag\">FILE</span>",
-            markBadButton(e.path || "", !!e.is_dir)
+            actionButtons(renameButton(e.path || ""), markBadButton(e.path || "", !!e.is_dir))
           ]
         };
       });
@@ -788,6 +1035,31 @@
 	      clearFileSearch();
 	      loadFiles();
 	    }
+    async function renamePath(path) {
+      const value = String(path || "").trim();
+      if (!value || value === ".") return;
+      const parts = value.split("/").filter(Boolean);
+      const current = parts.length ? parts[parts.length - 1] : value;
+      const next = prompt("Rename \"" + value + "\" to:", current);
+      if (next == null) return;
+      const name = String(next || "").trim();
+      if (!name || name === current) return;
+      try {
+        const d = await api("/admin/api/explorer/rename", {
+          method: "POST",
+          body: JSON.stringify({ path: value, new_name: name })
+        });
+        addHistory("renamed " + value + " to " + ((d && d.target) || name));
+        toast("Renamed");
+        if (state.fileSearch && (state.fileSearch.q || state.fileSearch.owner)) {
+          await runFileSearch(state.fileSearch.q || "", state.fileSearch.owner || "");
+        } else {
+          await loadFiles();
+        }
+      } catch (err) {
+        alert("Rename failed: " + err.message);
+      }
+    }
 
     async function loadAudit() {
       const q = document.getElementById("audit-q").value.trim();
@@ -2237,6 +2509,7 @@
 
     function rerenderCurrent() {
       if (state.activeTab === "summary") renderSummary();
+      if (state.activeTab === "live") renderLive();
       if (state.activeTab === "users") renderUsers();
       if (state.activeTab === "files") renderFiles();
       if (state.activeTab === "audit") renderAudit();
@@ -2256,7 +2529,7 @@
 
     async function refreshAll() {
       try {
-        await Promise.all([loadSummary(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadDownloads(), loadBanned(), loadSelfTest()]);
+        await Promise.all([loadSummary(), loadLive(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadDownloads(), loadBanned(), loadSelfTest()]);
         if (state.activeTab === "logins") {
           await loadOneTimeLogins();
         }
@@ -2289,6 +2562,7 @@
       if (enabled) {
         state.autoTimer = setInterval(function() {
           const fn = state.activeTab === "summary" ? loadSummary :
+            state.activeTab === "live" ? loadLive :
             state.activeTab === "users" ? loadUsers :
             state.activeTab === "files" ? loadFiles :
             state.activeTab === "audit" ? loadAudit :
@@ -2314,13 +2588,14 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
+      ["summary","live","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
         clearSelfTestPoll();
       }
       const fn = name === "summary" ? loadSummary :
+        name === "live" ? loadLive :
         name === "users" ? loadUsers :
         name === "files" ? loadFiles :
         name === "audit" ? loadAudit :
@@ -2371,7 +2646,7 @@
           await searchFilesByOwner(startup.owner);
           return;
         }
-        if (startup.tab && ["summary","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
+        if (startup.tab && ["summary","live","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
           switchTab(startup.tab);
           if (startup.tab === "files" && startup.q) {
             document.getElementById("files-q").value = startup.q;

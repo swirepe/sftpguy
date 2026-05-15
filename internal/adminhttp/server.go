@@ -36,6 +36,7 @@ type RouteHandlers struct {
 	Explorer         http.HandlerFunc
 	Health           http.HandlerFunc
 	Summary          http.HandlerFunc
+	Live             http.HandlerFunc
 	Users            http.HandlerFunc
 	User             http.HandlerFunc
 	Files            http.HandlerFunc
@@ -67,6 +68,7 @@ type RouteHandlers struct {
 	SelfTest         http.HandlerFunc
 	SelfTestRun      http.HandlerFunc
 	ExplorerDelete   http.HandlerFunc
+	ExplorerRename   http.HandlerFunc
 	ExplorerBanOwner http.HandlerFunc
 	OneTimeLoginURL  http.HandlerFunc
 }
@@ -127,6 +129,7 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/static/admin.js", cfg, handlers.JS)
 	register(mux, "/admin/api/health", cfg, handlers.Health)
 	register(mux, "/admin/api/summary", cfg, handlers.Summary)
+	register(mux, "/admin/api/live", cfg, handlers.Live)
 	register(mux, "/admin/api/users", cfg, handlers.Users)
 	register(mux, "/admin/api/users/", cfg, handlers.User)
 	register(mux, "/admin/api/files", cfg, handlers.Files)
@@ -158,6 +161,7 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/api/self-test", cfg, handlers.SelfTest)
 	register(mux, "/admin/api/self-test/run", cfg, handlers.SelfTestRun)
 	register(mux, "/admin/api/explorer/delete", cfg, handlers.ExplorerDelete)
+	register(mux, "/admin/api/explorer/rename", cfg, handlers.ExplorerRename)
 	register(mux, "/admin/api/explorer/ban-owner", cfg, handlers.ExplorerBanOwner)
 	register(mux, "/admin/api/one-time-login", cfg, handlers.OneTimeLoginURL)
 
