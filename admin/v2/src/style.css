@@ -153,15 +153,15 @@ select {
 
 .toolbar {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: end;
+  grid-template-columns: 1fr;
+  align-items: start;
   gap: 14px;
   margin-bottom: 18px;
 }
 
 .segmented {
   display: inline-grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
@@ -187,6 +187,7 @@ select {
   grid-template-columns: 96px minmax(190px, 1fr) 120px 72px auto;
   gap: 10px;
   align-items: end;
+  max-width: 900px;
 }
 
 .control {
@@ -628,6 +629,11 @@ select {
   min-width: 250px;
 }
 
+.control-pair.single {
+  grid-template-columns: minmax(160px, 1fr);
+  min-width: 180px;
+}
+
 .thumbnail-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
@@ -896,6 +902,72 @@ button.dense-row {
   grid-template-columns: minmax(0, 1fr) auto auto;
 }
 
+.user-meter-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.user-meter-row > span {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.user-table {
+  display: grid;
+  gap: 6px;
+  font-family: var(--mono);
+}
+
+.user-head,
+.user-list-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.3fr) 78px 78px 112px 96px 118px 92px;
+  gap: 9px;
+  align-items: center;
+}
+
+.user-head {
+  padding: 0 9px 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.user-list-row {
+  min-height: 48px;
+  padding: 8px 9px;
+  border-radius: 7px;
+  text-align: left;
+  background: #0d141a;
+}
+
+.user-list-row.banned {
+  border-color: rgba(251, 113, 133, 0.42);
+}
+
+.user-list-row > span,
+.user-primary {
+  min-width: 0;
+}
+
+.user-primary {
+  display: grid;
+  gap: 3px;
+}
+
+.user-primary strong,
+.user-primary small,
+.user-list-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-primary small,
+.user-list-row > span {
+  color: var(--muted);
+}
+
 .panic-row {
   padding: 9px;
   margin-top: 6px;
@@ -1148,8 +1220,13 @@ button.dense-row {
   }
 
   .bar-row,
-  .timeline-row {
+  .timeline-row,
+  .user-list-row {
     grid-template-columns: 1fr;
+  }
+
+  .user-head {
+    display: none;
   }
 
   .gallery-controls,

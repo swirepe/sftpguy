@@ -14,7 +14,7 @@ import {
   type UploadRow
 } from "./api";
 
-type View = "overview" | "activity" | "thumbnails" | "security";
+type View = "overview" | "activity" | "thumbnails" | "users" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
 type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow } | { type: "user"; user: UserRow };
@@ -22,6 +22,8 @@ type ThumbnailKind = "image" | "video" | "pdf" | "archive" | "text" | "model" | 
 type ThumbnailFilter = "all" | "visual" | ThumbnailKind;
 type ThumbnailSort = "recent" | "kind" | "source" | "name";
 type ThumbnailSize = "compact" | "normal" | "large";
+type UserFilter = "all" | "active" | "uploaders" | "downloaders" | "banned" | "quiet";
+type UserSort = "activity" | "uploads" | "downloads" | "sessions" | "last_login";
 
 type EventsPayload = {
   events?: EventRow[];
@@ -255,7 +257,7 @@ export function App() {
   });
   const users = useQuery({
     queryKey: ["users", query],
-    queryFn: () => api<UsersPayload>(adminPath("/admin/api/users", { limit: 10, q: query })),
+    queryFn: () => api<UsersPayload>(adminPath("/admin/api/users", { limit: 120, q: query })),
     refetchInterval: 45_000
   });
   const sessions = useQuery({
@@ -380,6 +382,13 @@ export function App() {
               onRunMaintenance={() => runMaintenance.mutate()}
               onBanIP={(ip) => banIP.mutate(ip)}
             />
+          ) : view === "activity" ? (
+            <Activity
+              rows={filteredEventRows}
+              loading={events.isLoading}
+              sourceFilter={sourceFilter}
+              onInspectEvent={inspectEvent}
+            />
           ) : view === "thumbnails" ? (
             <ThumbnailView
               eventRows={filteredEventRows}
@@ -388,25 +397,22 @@ export function App() {
               loading={events.isLoading || uploads.isLoading || downloads.isLoading}
               onOpenPath={openInspector}
             />
+          ) : view === "users" ? (
+            <UsersView
+              users={users.data?.users ?? []}
+              loading={users.isLoading}
+              onInspectUser={inspectUser}
+            />
           ) : (
-            view === "activity" ? (
-            <Activity
-              rows={filteredEventRows}
-              loading={events.isLoading}
-              sourceFilter={sourceFilter}
+            <Security
+              insights={insights.data}
+              banned={banned.data}
+              auth={authAttempts.data}
+              loading={authAttempts.isLoading || insights.isLoading}
+              banIPPending={banIP.isPending}
+              onBanIP={(ip) => banIP.mutate(ip)}
               onInspectEvent={inspectEvent}
             />
-            ) : (
-              <Security
-                insights={insights.data}
-                banned={banned.data}
-                auth={authAttempts.data}
-                loading={authAttempts.isLoading || insights.isLoading}
-                banIPPending={banIP.isPending}
-                onBanIP={(ip) => banIP.mutate(ip)}
-                onInspectEvent={inspectEvent}
-              />
-            )
           )}
         </section>
 
@@ -447,6 +453,9 @@ function Toolbar(props: {
         </button>
         <button class={props.view === "thumbnails" ? "active" : ""} type="button" onClick={() => props.onView("thumbnails")}>
           Thumbnails
+        </button>
+        <button class={props.view === "users" ? "active" : ""} type="button" onClick={() => props.onView("users")}>
+          Users
         </button>
         <button class={props.view === "security" ? "active" : ""} type="button" onClick={() => props.onView("security")}>
           Security
@@ -598,7 +607,7 @@ function Overview(props: {
       </section>
 
       <section class="split">
-        <UsersPanel users={props.users} onInspectUser={props.onInspectUser} />
+        <UsersPanel users={props.users.slice(0, 10)} onInspectUser={props.onInspectUser} />
         <SessionsPanel sessions={props.sessions} onInspectSession={props.onInspectSession} />
       </section>
 
@@ -810,6 +819,203 @@ function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidat
         </em>
       </span>
     </button>
+  );
+}
+
+function UsersView(props: { users: UserRow[]; loading: boolean; onInspectUser: (user: UserRow) => void }) {
+  const [filter, setFilter] = useState<UserFilter>("all");
+  const [sort, setSort] = useState<UserSort>("activity");
+  const profile = useMemo(() => userProfile(props.users), [props.users]);
+  const filteredUsers = useMemo(() => filterUsers(props.users, filter), [filter, props.users]);
+  const visibleUsers = useMemo(() => sortUsers(filteredUsers, sort).slice(0, 100), [filteredUsers, sort]);
+  const uploadLeaders = useMemo(() => sortUsers(props.users, "uploads"), [props.users]);
+  const downloadLeaders = useMemo(() => sortUsers(props.users, "downloads"), [props.users]);
+  const sessionLeaders = useMemo(() => sortUsers(props.users, "sessions"), [props.users]);
+
+  return (
+    <div class="activity-grid users-view">
+      <section class="metric-strip activity-metrics" aria-label="User summary">
+        <Metric label="Users" value={formatNumber(profile.total)} />
+        <Metric label="Active" value={formatNumber(profile.active)} />
+        <Metric label="Quiet" value={formatNumber(profile.quiet)} />
+        <Metric label="Banned" value={formatNumber(profile.banned)} tone={profile.banned > 0 ? "warn" : "normal"} />
+        <Metric label="Sessions" value={formatNumber(profile.sessions)} />
+        <Metric label="Uploads" value={formatNumber(profile.uploadCount)} />
+        <Metric label="Uploaded" value={formatBytes(profile.uploadBytes)} />
+        <Metric label="Downloaded" value={formatBytes(profile.downloadBytes)} />
+      </section>
+
+      <section class="insights-band">
+        <div>
+          <h2>User Workbench</h2>
+          <p>{props.loading ? "Loading user ledger..." : userWorkbenchCopy(profile, visibleUsers.length, props.users.length)}</p>
+        </div>
+        <div class="release">
+          <span>Sort</span>
+          <strong>{sortLabel(sort)}</strong>
+        </div>
+      </section>
+
+      <section class="split">
+        <UserMeterPanel
+          title="Upload Weight"
+          empty="No upload volume yet"
+          users={uploadLeaders}
+          value={(user) => user.upload_bytes ?? 0}
+          detail={(user) => `${formatNumber(user.upload_count)} uploads`}
+          valueLabel={formatBytes}
+          onInspectUser={props.onInspectUser}
+        />
+        <UserMeterPanel
+          title="Download Weight"
+          empty="No download volume yet"
+          users={downloadLeaders}
+          value={(user) => user.download_bytes ?? 0}
+          detail={(user) => `${formatNumber(user.download_count)} downloads`}
+          valueLabel={formatBytes}
+          onInspectUser={props.onInspectUser}
+        />
+      </section>
+
+      <section class="split">
+        <UserMeterPanel
+          title="Session Footprint"
+          empty="No sessions tracked"
+          users={sessionLeaders}
+          value={(user) => user.seen ?? 0}
+          detail={(user) => user.last_login || "no login time"}
+          valueLabel={formatNumber}
+          onInspectUser={props.onInspectUser}
+        />
+        <UserStatusPanel profile={profile} />
+      </section>
+
+      <section class="wide-panel">
+        <div class="panel-heading">
+          <h2>Users</h2>
+          <span>{props.loading ? "Refreshing" : `${visibleUsers.length} of ${props.users.length} users`}</span>
+        </div>
+        <UserControls filter={filter} sort={sort} onFilter={setFilter} onSort={setSort} />
+        <UserTable users={visibleUsers} onInspectUser={props.onInspectUser} />
+      </section>
+    </div>
+  );
+}
+
+function UserControls(props: { filter: UserFilter; sort: UserSort; onFilter: (filter: UserFilter) => void; onSort: (sort: UserSort) => void }) {
+  const filters: Array<{ value: UserFilter; label: string }> = [
+    { value: "all", label: "All" },
+    { value: "active", label: "Active" },
+    { value: "uploaders", label: "Uploaders" },
+    { value: "downloaders", label: "Downloaders" },
+    { value: "banned", label: "Banned" },
+    { value: "quiet", label: "Quiet" }
+  ];
+  return (
+    <div class="gallery-controls">
+      <div class="filter-tabs" aria-label="User filters">
+        {filters.map((option) => (
+          <button class={props.filter === option.value ? "active" : ""} type="button" key={option.value} onClick={() => props.onFilter(option.value)}>
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <div class="control-pair single">
+        <label class="control">
+          <span>Sort</span>
+          <select value={props.sort} onInput={(event) => props.onSort((event.currentTarget as HTMLSelectElement).value as UserSort)}>
+            <option value="activity">Activity</option>
+            <option value="uploads">Uploaded bytes</option>
+            <option value="downloads">Downloaded bytes</option>
+            <option value="sessions">Sessions</option>
+            <option value="last_login">Last login</option>
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function UserTable({ users, onInspectUser }: { users: UserRow[]; onInspectUser: (user: UserRow) => void }) {
+  if (users.length === 0) {
+    return <div class="empty">No users match this filter.</div>;
+  }
+  return (
+    <div class="user-table" role="table">
+      <div class="user-head" role="row">
+        <span>User</span>
+        <span>Sessions</span>
+        <span>Uploads</span>
+        <span>Uploaded</span>
+        <span>Downloads</span>
+        <span>Downloaded</span>
+        <span>Status</span>
+      </div>
+      {users.map((user) => (
+        <button class={`user-list-row ${user.is_banned ? "banned" : ""}`} type="button" role="row" key={user.hash} onClick={() => onInspectUser(user)}>
+          <span class="user-primary">
+            <strong>{shortValue(user.hash, 24)}</strong>
+            <small>{user.last_login || "no login time"}</small>
+          </span>
+          <span>{formatNumber(user.seen)}</span>
+          <span>{formatNumber(user.upload_count)}</span>
+          <span>{formatBytes(user.upload_bytes)}</span>
+          <span>{formatNumber(user.download_count)}</span>
+          <span>{formatBytes(user.download_bytes)}</span>
+          <span>
+            <span class={user.is_banned ? "status-chip hot" : "status-chip"}>{user.is_banned ? "banned" : userActivityScore(user) > 0 ? "active" : "quiet"}</span>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function UserMeterPanel(props: {
+  title: string;
+  empty: string;
+  users: UserRow[];
+  value: (user: UserRow) => number;
+  valueLabel: (value: number) => string;
+  detail: (user: UserRow) => string;
+  onInspectUser: (user: UserRow) => void;
+}) {
+  const rows = props.users.filter((user) => props.value(user) > 0).slice(0, 10);
+  const max = Math.max(...rows.map((user) => props.value(user)), 1);
+  return (
+    <DataPanel title={props.title} empty={props.empty}>
+      {rows.map((user) => {
+        const value = props.value(user);
+        return (
+          <button class="dense-row user-meter-row" type="button" key={user.hash} onClick={() => props.onInspectUser(user)}>
+            <div>
+              <strong>{shortValue(user.hash, 22)}</strong>
+              <small>{props.detail(user)}</small>
+              <div class="mini-track">
+                <i style={{ width: `${Math.max(3, Math.round((value / max) * 100))}%` }} />
+              </div>
+            </div>
+            <span>{props.valueLabel(value)}</span>
+          </button>
+        );
+      })}
+    </DataPanel>
+  );
+}
+
+function UserStatusPanel({ profile }: { profile: ReturnType<typeof userProfile> }) {
+  return (
+    <DataPanel title="Account Status" empty="No status data">
+      <BarList
+        rows={[
+          { name: "Active", count: profile.active },
+          { name: "Quiet", count: profile.quiet },
+          { name: "Uploaders", count: profile.uploaders },
+          { name: "Downloaders", count: profile.downloaders },
+          { name: "Banned", count: profile.banned }
+        ]}
+      />
+    </DataPanel>
   );
 }
 
@@ -2188,6 +2394,104 @@ function topCountsFromStrings(values: string[], limit: number): NamedCount[] {
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
     .slice(0, limit);
+}
+
+function userProfile(users: UserRow[]) {
+  const uploadBytes = users.reduce((sum, user) => sum + (user.upload_bytes ?? 0), 0);
+  const downloadBytes = users.reduce((sum, user) => sum + (user.download_bytes ?? 0), 0);
+  const uploadCount = users.reduce((sum, user) => sum + (user.upload_count ?? 0), 0);
+  const downloadCount = users.reduce((sum, user) => sum + (user.download_count ?? 0), 0);
+  const sessions = users.reduce((sum, user) => sum + (user.seen ?? 0), 0);
+  const active = users.filter(isActiveUser).length;
+  return {
+    total: users.length,
+    active,
+    quiet: Math.max(0, users.length - active),
+    banned: users.filter((user) => user.is_banned).length,
+    uploaders: users.filter((user) => (user.upload_count ?? 0) > 0 || (user.upload_bytes ?? 0) > 0).length,
+    downloaders: users.filter((user) => (user.download_count ?? 0) > 0 || (user.download_bytes ?? 0) > 0).length,
+    sessions,
+    uploadCount,
+    uploadBytes,
+    downloadCount,
+    downloadBytes
+  };
+}
+
+function filterUsers(users: UserRow[], filter: UserFilter): UserRow[] {
+  switch (filter) {
+    case "active":
+      return users.filter(isActiveUser);
+    case "uploaders":
+      return users.filter((user) => (user.upload_count ?? 0) > 0 || (user.upload_bytes ?? 0) > 0);
+    case "downloaders":
+      return users.filter((user) => (user.download_count ?? 0) > 0 || (user.download_bytes ?? 0) > 0);
+    case "banned":
+      return users.filter((user) => user.is_banned);
+    case "quiet":
+      return users.filter((user) => !isActiveUser(user));
+    case "all":
+    default:
+      return users;
+  }
+}
+
+function sortUsers(users: UserRow[], sort: UserSort): UserRow[] {
+  const next = [...users];
+  return next.sort((a, b) => {
+    let delta = 0;
+    if (sort === "uploads") {
+      delta = (b.upload_bytes ?? 0) - (a.upload_bytes ?? 0) || (b.upload_count ?? 0) - (a.upload_count ?? 0);
+    } else if (sort === "downloads") {
+      delta = (b.download_bytes ?? 0) - (a.download_bytes ?? 0) || (b.download_count ?? 0) - (a.download_count ?? 0);
+    } else if (sort === "sessions") {
+      delta = (b.seen ?? 0) - (a.seen ?? 0);
+    } else if (sort === "last_login") {
+      delta = userLoginTime(b) - userLoginTime(a);
+    } else {
+      delta = userActivityScore(b) - userActivityScore(a);
+    }
+    return delta || a.hash.localeCompare(b.hash);
+  });
+}
+
+function userActivityScore(user: UserRow): number {
+  return (user.seen ?? 0) + (user.upload_count ?? 0) + (user.download_count ?? 0);
+}
+
+function userLoginTime(user: UserRow): number {
+  const parsed = Date.parse(user.last_login || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isActiveUser(user: UserRow): boolean {
+  return userActivityScore(user) > 0 || userLoginTime(user) > 0;
+}
+
+function userWorkbenchCopy(profile: ReturnType<typeof userProfile>, visible: number, total: number): string {
+  if (total === 0) {
+    return "No users match the current search.";
+  }
+  if (profile.banned > 0) {
+    return `${visible} visible users, ${profile.banned} banned, ${formatBytes(profile.uploadBytes)} uploaded, ${formatBytes(profile.downloadBytes)} downloaded.`;
+  }
+  return `${visible} visible users, ${profile.active} active, ${formatNumber(profile.sessions)} tracked sessions, ${formatBytes(profile.uploadBytes)} uploaded.`;
+}
+
+function sortLabel(sort: UserSort): string {
+  switch (sort) {
+    case "uploads":
+      return "uploads";
+    case "downloads":
+      return "downloads";
+    case "sessions":
+      return "sessions";
+    case "last_login":
+      return "last login";
+    case "activity":
+    default:
+      return "activity";
+  }
 }
 
 function collectThumbnailCandidates(events: EventRow[], uploads: UploadRow[], downloads?: DownloadsPayload): ThumbnailCandidate[] {
