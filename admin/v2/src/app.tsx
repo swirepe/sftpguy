@@ -18,6 +18,10 @@ type View = "overview" | "activity" | "thumbnails" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
 type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow } | { type: "user"; user: UserRow };
+type ThumbnailKind = "image" | "video" | "pdf" | "archive" | "text" | "model" | "directory" | "other";
+type ThumbnailFilter = "all" | "visual" | ThumbnailKind;
+type ThumbnailSort = "recent" | "kind" | "source" | "name";
+type ThumbnailSize = "compact" | "normal" | "large";
 
 type EventsPayload = {
   events?: EventRow[];
@@ -48,6 +52,7 @@ type ThumbnailCandidate = {
   source: string;
   detail: string;
   meta?: string;
+  kind: ThumbnailKind;
 };
 
 type InsightsPayload = {
@@ -668,33 +673,35 @@ function ThumbnailView(props: {
   loading: boolean;
   onOpenPath: (path?: string) => void;
 }) {
-  const candidates = useMemo(
-    () => collectThumbnailCandidates(props.eventRows, props.uploads, props.downloads).slice(0, 54),
+  const [kindFilter, setKindFilter] = useState<ThumbnailFilter>("visual");
+  const [sort, setSort] = useState<ThumbnailSort>("recent");
+  const [size, setSize] = useState<ThumbnailSize>("normal");
+  const rawCandidates = useMemo(
+    () => collectThumbnailCandidates(props.eventRows, props.uploads, props.downloads),
     [props.downloads, props.eventRows, props.uploads]
   );
-  const counts = topCountsFromStrings(candidates.map((candidate) => candidate.source), 6);
+  const candidates = useMemo(() => sortThumbnailCandidates(filterThumbnailCandidates(rawCandidates, kindFilter), sort).slice(0, 72), [kindFilter, rawCandidates, sort]);
+  const sourceCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.source), 6);
+  const kindCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.kind), 8);
   return (
     <div class="activity-grid">
       <section class="insights-band">
         <div>
           <h2>Thumbnail Wall</h2>
-          <p>{props.loading ? "Loading candidate paths..." : `${candidates.length} recent paths from uploads, downloads, and events.`}</p>
+          <p>{props.loading ? "Loading candidate paths..." : `${candidates.length} visible of ${rawCandidates.length} recent paths from uploads, downloads, and events.`}</p>
         </div>
         <div class="release">
-          <span>Preview API</span>
-          <strong>shared</strong>
+          <span>Tile Size</span>
+          <strong>{size}</strong>
         </div>
       </section>
 
       <section class="split">
         <DataPanel title="Sources" empty="No thumbnail sources">
-          <BarList rows={counts} />
+          <BarList rows={sourceCounts} />
         </DataPanel>
-        <DataPanel title="Scan Pattern" empty="No paths">
-          <div class="gallery-note">
-            <strong>{formatNumber(candidates.length)} paths queued</strong>
-            <span>Tiles use `/admin/api/preview` and cached `/admin/api/thumbnail` images, then open the inspector on click.</span>
-          </div>
+        <DataPanel title="Media Types" empty="No media types">
+          <BarList rows={kindCounts} />
         </DataPanel>
       </section>
 
@@ -703,8 +710,9 @@ function ThumbnailView(props: {
           <h2>Thumbnails</h2>
           <span>{props.loading ? "Refreshing" : `${candidates.length} tiles`}</span>
         </div>
+        <ThumbnailControls filter={kindFilter} sort={sort} size={size} onFilter={setKindFilter} onSort={setSort} onSize={setSize} />
         {candidates.length > 0 ? (
-          <div class="thumbnail-grid">
+          <div class={`thumbnail-grid ${size}`}>
             {candidates.map((candidate) => (
               <ThumbnailCard key={candidate.path} candidate={candidate} onOpenPath={props.onOpenPath} />
             ))}
@@ -713,6 +721,57 @@ function ThumbnailView(props: {
           <div class="empty">No paths with preview candidates in the current window.</div>
         )}
       </section>
+    </div>
+  );
+}
+
+function ThumbnailControls(props: {
+  filter: ThumbnailFilter;
+  sort: ThumbnailSort;
+  size: ThumbnailSize;
+  onFilter: (filter: ThumbnailFilter) => void;
+  onSort: (sort: ThumbnailSort) => void;
+  onSize: (size: ThumbnailSize) => void;
+}) {
+  const filters: Array<{ value: ThumbnailFilter; label: string }> = [
+    { value: "visual", label: "Visual" },
+    { value: "all", label: "All" },
+    { value: "image", label: "Images" },
+    { value: "video", label: "Videos" },
+    { value: "pdf", label: "PDFs" },
+    { value: "archive", label: "Archives" },
+    { value: "text", label: "Text" },
+    { value: "model", label: "Models" },
+    { value: "other", label: "Other" }
+  ];
+  return (
+    <div class="gallery-controls">
+      <div class="filter-tabs" aria-label="Thumbnail filters">
+        {filters.map((option) => (
+          <button class={props.filter === option.value ? "active" : ""} type="button" key={option.value} onClick={() => props.onFilter(option.value)}>
+            {option.label}
+          </button>
+        ))}
+      </div>
+      <div class="control-pair">
+        <label class="control">
+          <span>Sort</span>
+          <select value={props.sort} onInput={(event) => props.onSort((event.currentTarget as HTMLSelectElement).value as ThumbnailSort)}>
+            <option value="recent">Recent</option>
+            <option value="kind">Kind</option>
+            <option value="source">Source</option>
+            <option value="name">Name</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Size</span>
+          <select value={props.size} onInput={(event) => props.onSize((event.currentTarget as HTMLSelectElement).value as ThumbnailSize)}>
+            <option value="compact">Compact</option>
+            <option value="normal">Normal</option>
+            <option value="large">Large</option>
+          </select>
+        </label>
+      </div>
     </div>
   );
 }
@@ -747,7 +806,7 @@ function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidat
         <small>{candidate.detail}</small>
         <em>
           <SourcePill source={candidate.source} />
-          {candidate.meta ? <span>{candidate.meta}</span> : null}
+          <span>{candidate.kind}{candidate.meta ? ` / ${candidate.meta}` : ""}</span>
         </em>
       </span>
     </button>
@@ -2146,7 +2205,8 @@ function collectThumbnailCandidates(events: EventRow[], uploads: UploadRow[], do
       path: upload.path || "",
       source: "upload",
       detail: `${upload.time || "recent"} ${shortValue(upload.user_id, 10)}`,
-      meta: formatBytes(upload.size)
+      meta: formatBytes(upload.size),
+      kind: thumbnailKindForPath(upload.path || "")
     });
   }
   for (const file of downloads?.files ?? []) {
@@ -2154,7 +2214,8 @@ function collectThumbnailCandidates(events: EventRow[], uploads: UploadRow[], do
       path: file.path,
       source: "download",
       detail: `${file.downloads_in_range ?? 0} in range, ${file.downloads_total ?? 0} total`,
-      meta: file.size_human || ""
+      meta: file.size_human || "",
+      kind: thumbnailKindForPath(file.path)
     });
   }
   for (const row of events) {
@@ -2166,10 +2227,67 @@ function collectThumbnailCandidates(events: EventRow[], uploads: UploadRow[], do
       path,
       source: sourceFor(row),
       detail: `${row.time || ""} ${row.event || ""}`.trim(),
-      meta: shortValue(row.user_id || row.ip, 12)
+      meta: shortValue(row.user_id || row.ip, 12),
+      kind: thumbnailKindForPath(path)
     });
   }
   return Array.from(byPath.values());
+}
+
+function filterThumbnailCandidates(candidates: ThumbnailCandidate[], filter: ThumbnailFilter): ThumbnailCandidate[] {
+  if (filter === "all") {
+    return candidates;
+  }
+  if (filter === "visual") {
+    return candidates.filter((candidate) => candidate.kind === "image" || candidate.kind === "video" || candidate.kind === "pdf" || candidate.kind === "model");
+  }
+  return candidates.filter((candidate) => candidate.kind === filter);
+}
+
+function sortThumbnailCandidates(candidates: ThumbnailCandidate[], sort: ThumbnailSort): ThumbnailCandidate[] {
+  const next = [...candidates];
+  if (sort === "recent") {
+    return next;
+  }
+  return next.sort((a, b) => {
+    if (sort === "kind") {
+      return a.kind.localeCompare(b.kind) || basename(a.path).localeCompare(basename(b.path));
+    }
+    if (sort === "source") {
+      return a.source.localeCompare(b.source) || basename(a.path).localeCompare(basename(b.path));
+    }
+    return basename(a.path).localeCompare(basename(b.path));
+  });
+}
+
+function thumbnailKindForPath(path: string): ThumbnailKind {
+  const clean = cleanPath(path).toLowerCase();
+  if (!clean) {
+    return "other";
+  }
+  if (clean.endsWith("/")) {
+    return "directory";
+  }
+  const ext = clean.includes(".") ? clean.slice(clean.lastIndexOf(".") + 1) : "";
+  if (["apng", "avif", "gif", "heic", "heif", "jpeg", "jpg", "png", "svg", "webp"].includes(ext)) {
+    return "image";
+  }
+  if (["avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm"].includes(ext)) {
+    return "video";
+  }
+  if (ext === "pdf") {
+    return "pdf";
+  }
+  if (["7z", "gz", "rar", "tar", "tgz", "zip"].includes(ext)) {
+    return "archive";
+  }
+  if (["css", "csv", "go", "html", "js", "json", "log", "md", "py", "rs", "sh", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml"].includes(ext)) {
+    return "text";
+  }
+  if (["3mf", "obj", "stl"].includes(ext)) {
+    return "model";
+  }
+  return "other";
 }
 
 function previewKind(preview?: PreviewPayload): string {
