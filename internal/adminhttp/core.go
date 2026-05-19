@@ -16,6 +16,25 @@ type CoreDeps interface {
 	BannerStats(threshold int64) (users, contributors, files, bytes uint64)
 	DirectoryCount() (int, error)
 	FormatBytes(int64) string
+	StorageVolumes() []StorageVolume
+}
+
+type StorageVolume struct {
+	ID          string  `json:"id"`
+	Kind        string  `json:"kind"`
+	Label       string  `json:"label"`
+	Path        string  `json:"path"`
+	StatPath    string  `json:"stat_path,omitempty"`
+	DeviceID    string  `json:"device_id,omitempty"`
+	TotalBytes  int64   `json:"total_bytes"`
+	FreeBytes   int64   `json:"free_bytes"`
+	UsedBytes   int64   `json:"used_bytes"`
+	Total       string  `json:"total,omitempty"`
+	Free        string  `json:"free,omitempty"`
+	Used        string  `json:"used,omitempty"`
+	UsedPercent float64 `json:"used_percent"`
+	FreePercent float64 `json:"free_percent"`
+	Error       string  `json:"error,omitempty"`
 }
 
 func HealthHandler(deps CoreDeps) http.HandlerFunc {
@@ -53,6 +72,7 @@ func SummaryHandler(deps CoreDeps) http.HandlerFunc {
 			"bytes":                 b,
 			"formatted_bytes":       deps.FormatBytes(int64(b)),
 			"contributor_threshold": deps.ContributorThreshold(),
+			"storage":               deps.StorageVolumes(),
 		})
 	}
 }

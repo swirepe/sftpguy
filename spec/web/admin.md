@@ -189,6 +189,7 @@ It shows:
 
 - archive identity and uptime
 - total users, contributors, files, directories, stored bytes
+- free, used, and total filesystem space for the upload directory, configured log file, main SQLite database, and optional CAID database
 - contributor threshold
 - recent activity KPIs
 - top events
@@ -611,7 +612,7 @@ When Prometheus is enabled, the configured metrics route is mounted on the same 
 | `/admin/stats/` | `GET` | statsviz dashboard HTML. |
 | `/admin/stats/ws` | `GET` | statsviz WebSocket feed. |
 | `/admin/api/health` | `GET` | Lightweight health/version payload. |
-| `/admin/api/summary` | `GET` | Archive summary payload. |
+| `/admin/api/summary` | `GET` | Archive summary payload, including filesystem usage for key configured storage paths. |
 | `/admin/api/users` | `GET` | User list filtered by `q`. |
 | `/admin/api/users/{hashOrPrefix}` | `GET` | User detail payload. |
 | `/admin/api/users/{hashOrPrefix}/{ban|unban|purge}` | `POST` | User admin actions. |
@@ -689,4 +690,3 @@ HTTP save endpoints overwrite the whole file and immediately reload the correspo
 - One-time login URLs are not queryable after generation; only the token consumer route exists server-side.
 - Support-file editors save content even when some lines are invalid; invalid lines are reported back instead of blocking the write.
 - The explorer "unlock downloads" concept is currently dead code from a behavior standpoint because the admin explorer is always effectively unlocked.
-

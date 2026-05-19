@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"sftpguy/internal/adminhttp"
@@ -139,6 +140,51 @@ func (d *adminHTTPDeps) DirectoryCount() (int, error) {
 
 func (d *adminHTTPDeps) FormatBytes(n int64) string {
 	return formatBytes(n)
+}
+
+func (d *adminHTTPDeps) StorageVolumes() []adminhttp.StorageVolume {
+	if d == nil || d.srv == nil {
+		return nil
+	}
+
+	targets := []storageTarget{
+		{
+			ID:    "uploads",
+			Kind:  "upload",
+			Label: "Upload directory",
+			Path:  d.srv.absUploadDir,
+		},
+		{
+			ID:        "log",
+			Kind:      "log",
+			Label:     "Log file",
+			Path:      d.srv.cfg.LogFile,
+			UseParent: true,
+		},
+		{
+			ID:        "database",
+			Kind:      "database",
+			Label:     "Main database",
+			Path:      d.srv.cfg.DBPath,
+			UseParent: true,
+		},
+	}
+
+	if caidPath := strings.TrimSpace(d.srv.cfg.CAIDDBPath); caidPath != "" {
+		targets = append(targets, storageTarget{
+			ID:        "caid_database",
+			Kind:      "database",
+			Label:     "CAID database",
+			Path:      caidPath,
+			UseParent: true,
+		})
+	}
+
+	out := make([]adminhttp.StorageVolume, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, storageVolumeForTarget(target, d.FormatBytes))
+	}
+	return out
 }
 
 func (d *adminHTTPDeps) StatsSnapshot() adminhttp.StatsSnapshot {

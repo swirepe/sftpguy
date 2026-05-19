@@ -91,6 +91,11 @@
     function formatRate(n) {
       return formatBytes(n || 0) + "/s";
     }
+    function formatPercent(n) {
+      const x = Number(n || 0);
+      if (!isFinite(x) || x <= 0) return "0%";
+      return x.toFixed(1).replace(/\.0$/, "") + "%";
+    }
     function formatSeconds(v) {
       let n = Math.max(0, Math.floor(Number(v || 0)));
       if (!isFinite(n) || n <= 0) return "0s";
@@ -553,9 +558,26 @@
         ["Contributors", d.contributors || 0],
         ["Files", d.files || 0],
         ["Directories", d.directories || 0],
-        ["Total Disk", d.formatted_bytes || "0 B"],
+        ["Stored Bytes", d.formatted_bytes || "0 B"],
         ["Contrib Threshold", formatBytes(d.contributor_threshold || 0)]
       ];
+      const storageRows = (d.storage || []).map(function(x) {
+        const free = x.free || formatBytes(x.free_bytes || 0);
+        const total = x.total || formatBytes(x.total_bytes || 0);
+        const used = x.used || formatBytes(x.used_bytes || 0);
+        const freePct = formatPercent(x.free_percent || 0) + " free";
+        const status = x.error
+          ? "<span class=\"tag bad\">" + esc(x.error) + "</span>"
+          : "<span class=\"tag ok\">" + esc(freePct) + "</span>";
+        return [
+          esc(x.label || x.kind || x.id || ""),
+          esc(free),
+          esc(total),
+          esc(used),
+          status,
+          "<code>" + esc(x.path || "") + "</code>"
+        ];
+      });
       const activity = [
         ["Events", kpi.events || 0],
         ["Users Active", kpi.users || 0],
@@ -612,6 +634,7 @@
 	        "<div class=\"grid\">" + entries.map(function(kv) {
           return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
 	        }).join("") + "</div>" +
+	        "<h3>Partition Free Space</h3>" + renderSimpleTable(["Target", "Free", "Total", "Used", "Status", "Path"], storageRows) +
 	        "<h3>Activity</h3><div class=\"grid\">" + activity.map(function(kv) {
 	          return "<div class=\"metric\"><div class=\"k\">" + esc(kv[0]) + "</div><div class=\"v\">" + esc(kv[1]) + "</div></div>";
 	        }).join("") + "</div>" +

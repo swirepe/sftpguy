@@ -1,13 +1,36 @@
 export type SummaryPayload = {
   archive?: string;
   version?: string;
+  ssh_port?: number;
+  admin_http?: string;
   uptime?: string;
+  uptime_seconds?: number;
   users?: number;
   contributors?: number;
   files?: number;
   directories?: number;
   bytes?: number;
   formatted_bytes?: string;
+  contributor_threshold?: number;
+  storage?: StorageVolume[];
+};
+
+export type StorageVolume = {
+  id?: string;
+  kind?: string;
+  label?: string;
+  path?: string;
+  stat_path?: string;
+  device_id?: string;
+  total_bytes?: number;
+  free_bytes?: number;
+  used_bytes?: number;
+  total?: string;
+  free?: string;
+  used?: string;
+  used_percent?: number;
+  free_percent?: number;
+  error?: string;
 };
 
 export type EventRow = {

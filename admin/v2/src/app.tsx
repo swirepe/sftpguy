@@ -16,6 +16,7 @@ import {
 
 type View = "overview" | "activity";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
+type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow };
 
 type EventsPayload = {
   events?: EventRow[];
@@ -71,6 +72,8 @@ type SessionRow = {
   session: string;
   user_id?: string;
   ip?: string;
+  started_at?: number;
+  ended_at?: number;
   start_time?: string;
   end_time?: string;
   duration_sec?: number;
@@ -83,6 +86,17 @@ type SessionRow = {
 
 type SessionsPayload = {
   sessions?: SessionRow[];
+};
+
+type SessionTimelinePayload = {
+  session?: string;
+  user_id?: string;
+  ip?: string;
+  started_at?: number;
+  ended_at?: number;
+  start_time?: string;
+  end_time?: string;
+  events?: EventRow[];
 };
 
 type BannedPayload = {
@@ -103,7 +117,7 @@ export function App() {
   const queryClient = useQueryClient();
   const initialHueParam = hasHueParam();
   const [view, setView] = useState<View>("overview");
-  const [selectedPath, setSelectedPath] = useState<string>("");
+  const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget>({ type: "none" });
   const [range, setRange] = useState(readURLParam("range") || "24h");
   const [query, setQuery] = useState(readURLParam("q"));
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
@@ -205,8 +219,16 @@ export function App() {
   function openInspector(path: string | undefined) {
     const clean = cleanPath(path);
     if (clean) {
-      setSelectedPath(clean);
+      setInspectorTarget({ type: "path", path: clean });
     }
+  }
+
+  function inspectEvent(event: EventRow) {
+    setInspectorTarget({ type: "event", event });
+  }
+
+  function inspectSession(session: SessionRow) {
+    setInspectorTarget({ type: "event", event: eventFromSession(session) });
   }
 
   function updateHueFromColor(hex: string) {
@@ -262,6 +284,8 @@ export function App() {
               banIPPending={banIP.isPending}
               loading={summary.isLoading || events.isLoading || insights.isLoading}
               onOpenPath={openInspector}
+              onInspectEvent={inspectEvent}
+              onInspectSession={inspectSession}
               onRunMaintenance={() => runMaintenance.mutate()}
               onBanIP={(ip) => banIP.mutate(ip)}
             />
@@ -270,12 +294,12 @@ export function App() {
               rows={filteredEventRows}
               loading={events.isLoading}
               sourceFilter={sourceFilter}
-              onOpenPath={openInspector}
+              onInspectEvent={inspectEvent}
             />
           )}
         </section>
 
-        <Inspector path={selectedPath} onClose={() => setSelectedPath("")} />
+        <Inspector target={inspectorTarget} onClose={() => setInspectorTarget({ type: "none" })} />
       </main>
     </div>
   );
@@ -365,6 +389,8 @@ function Overview(props: {
   banIPPending: boolean;
   loading: boolean;
   onOpenPath: (path?: string) => void;
+  onInspectEvent: (event: EventRow) => void;
+  onInspectSession: (session: SessionRow) => void;
   onRunMaintenance: () => void;
   onBanIP: (ip: string) => void;
 }) {
@@ -380,7 +406,11 @@ function Overview(props: {
     <div class="overview-grid">
       <section class="metric-strip" aria-label="Summary">
         <Metric label="Files" value={formatNumber(summary?.files)} />
-        <Metric label="Storage" value={summary?.formatted_bytes || formatBytes(summary?.bytes)} />
+        <Metric label="Stored" value={summary?.formatted_bytes || formatBytes(summary?.bytes)} />
+        <Metric label="Uptime" value={summary?.uptime || formatDuration(summary?.uptime_seconds)} />
+        <Metric label="Dirs" value={formatNumber(summary?.directories)} />
+        <Metric label="Users" value={formatNumber(summary?.users)} />
+        <Metric label="Contrib" value={formatNumber(summary?.contributors)} />
         <Metric label="Events" value={formatNumber(kpi.events)} />
         <Metric label="Uploads" value={formatNumber(kpi.uploads)} />
         <Metric label="Downloads" value={formatNumber(kpi.downloads)} />
@@ -398,6 +428,16 @@ function Overview(props: {
           <span>Version</span>
           <strong>{summary?.version || "unknown"}</strong>
         </div>
+      </section>
+
+      <section class="split">
+        <SystemPanel summary={summary} />
+        <KPIBars kpi={kpi} liveCount={props.liveCount} />
+      </section>
+
+      <section class="split">
+        <SourceMixPanel rows={props.eventRows} />
+        <EventTimelinePanel rows={props.eventRows} />
       </section>
 
       <section class="split">
@@ -434,7 +474,7 @@ function Overview(props: {
 
       <section class="split">
         <UsersPanel users={props.users} />
-        <SessionsPanel sessions={props.sessions} />
+        <SessionsPanel sessions={props.sessions} onInspectSession={props.onInspectSession} />
       </section>
 
       <section class="split">
@@ -456,7 +496,7 @@ function Overview(props: {
           <h2>Explorer-Origin Activity</h2>
           <span>{props.explorerEvents.length} events</span>
         </div>
-        <EventTable rows={props.explorerEvents.slice(0, 10)} onOpenPath={props.onOpenPath} />
+        <EventTable rows={props.explorerEvents.slice(0, 10)} onInspectEvent={props.onInspectEvent} />
       </section>
     </div>
   );
@@ -466,7 +506,7 @@ function Activity(props: {
   rows: EventRow[];
   loading: boolean;
   sourceFilter: SourceFilter;
-  onOpenPath: (path?: string) => void;
+  onInspectEvent: (event: EventRow) => void;
 }) {
   return (
     <section class="wide-panel">
@@ -474,12 +514,12 @@ function Activity(props: {
         <h2>Event Stream</h2>
         <span>{props.loading ? "Refreshing" : `${props.rows.length} ${props.sourceFilter} rows`}</span>
       </div>
-      <EventTable rows={props.rows} onOpenPath={props.onOpenPath} />
+      <EventTable rows={props.rows} onInspectEvent={props.onInspectEvent} />
     </section>
   );
 }
 
-function EventTable(props: { rows: EventRow[]; onOpenPath: (path?: string) => void }) {
+function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow) => void }) {
   if (props.rows.length === 0) {
     return <div class="empty">No events to show.</div>;
   }
@@ -503,8 +543,7 @@ function EventTable(props: { rows: EventRow[]; onOpenPath: (path?: string) => vo
             type="button"
             role="row"
             key={row.id}
-            onClick={() => props.onOpenPath(rowPath)}
-            disabled={!cleanPath(rowPath)}
+            onClick={() => props.onInspectEvent(row)}
           >
             <span>{row.time || row.timestamp || ""}</span>
             <span>
@@ -518,6 +557,153 @@ function EventTable(props: { rows: EventRow[]; onOpenPath: (path?: string) => vo
           </button>
         );
       })}
+    </div>
+  );
+}
+
+function SystemPanel({ summary }: { summary?: SummaryPayload }) {
+  const storage = summary?.storage ?? [];
+  return (
+    <DataPanel title="System" empty="Summary unavailable">
+      <dl class="system-grid">
+        <Meta label="Archive" value={summary?.archive} />
+        <Meta label="Version" value={summary?.version} />
+        <Meta label="SSH" value={summary?.ssh_port ? `:${summary.ssh_port}` : ""} />
+        <Meta label="Admin HTTP" value={summary?.admin_http || ""} />
+        <Meta label="Uptime" value={summary?.uptime || formatDuration(summary?.uptime_seconds)} />
+        <Meta label="Contributor Min" value={formatBytes(summary?.contributor_threshold)} />
+      </dl>
+      {storage.length > 0 ? (
+        <div class="storage-list">
+          {storage.map((volume) => (
+            <StorageRow volume={volume} key={volume.id || volume.label || volume.path} />
+          ))}
+        </div>
+      ) : null}
+    </DataPanel>
+  );
+}
+
+function StorageRow({ volume }: { volume: NonNullable<SummaryPayload["storage"]>[number] }) {
+  const free = volume.free || formatBytes(volume.free_bytes);
+  const total = volume.total || formatBytes(volume.total_bytes);
+  const usedPercent = clampPercent(volume.used_percent);
+  return (
+    <div class={`storage-row ${volume.error ? "warning" : ""}`}>
+      <div class="storage-row-head">
+        <strong>{volume.label || volume.kind || "Storage"}</strong>
+        <span>{volume.error ? "Unavailable" : `${formatPercent(volume.free_percent)} free`}</span>
+      </div>
+      {!volume.error ? (
+        <>
+          <div class="storage-meter" aria-label={`${volume.label || "Storage"} usage`}>
+            <i style={{ width: `${usedPercent}%` }} />
+          </div>
+          <small>
+            {free} free of {total}
+          </small>
+        </>
+      ) : (
+        <small>{volume.error}</small>
+      )}
+      <code>{volume.path || ""}</code>
+    </div>
+  );
+}
+
+function KPIBars({ kpi, liveCount }: { kpi: Record<string, number>; liveCount: number }) {
+  const rows: NamedCount[] = [
+    { name: "Events", count: kpi.events ?? 0 },
+    { name: "Uploads", count: kpi.uploads ?? 0 },
+    { name: "Downloads", count: kpi.downloads ?? 0 },
+    { name: "Denied", count: kpi.denied ?? 0 },
+    { name: "Admin", count: kpi.admin_actions ?? 0 },
+    { name: "Sessions", count: kpi.session_starts ?? 0 },
+    { name: "Live", count: liveCount }
+  ];
+  return (
+    <DataPanel title="Window Mix" empty="No activity">
+      <BarList rows={rows} />
+    </DataPanel>
+  );
+}
+
+function SourceMixPanel({ rows }: { rows: EventRow[] }) {
+  const counts = countBySource(rows);
+  const total = rows.length;
+  const mixRows: NamedCount[] = [
+    { name: "SFTP", count: counts.sftp },
+    { name: "Admin", count: counts.admin },
+    { name: "Explorer", count: counts.explorer }
+  ];
+  return (
+    <DataPanel title="Source Mix" empty="No source data">
+      <div class="donut-row">
+        <SourceDonut counts={counts} />
+        <div class="donut-legend">
+          <strong>{formatNumber(total)} events</strong>
+          <span>SFTP, admin, and explorer-origin activity in the current window.</span>
+        </div>
+      </div>
+      <BarList rows={mixRows} />
+    </DataPanel>
+  );
+}
+
+function EventTimelinePanel({ rows }: { rows: EventRow[] }) {
+  const buckets = eventBuckets(rows, 18);
+  const max = Math.max(...buckets, 1);
+  return (
+    <DataPanel title="Event Shape" empty="No events">
+      <div class="spark-bars" aria-label="Event distribution">
+        {buckets.map((count, index) => (
+          <span key={index} style={{ height: `${Math.max(6, (count / max) * 100)}%` }} title={`${count} events`} />
+        ))}
+      </div>
+      <div class="timeline-caption">
+        <span>Older</span>
+        <strong>{formatNumber(rows.length)} events</strong>
+        <span>Newer</span>
+      </div>
+    </DataPanel>
+  );
+}
+
+function BarList({ rows }: { rows: NamedCount[] }) {
+  const max = Math.max(...rows.map((row) => row.count), 1);
+  return (
+    <div class="bar-list">
+      {rows.map((row) => {
+        const width = Math.max(2, Math.round((row.count / max) * 100));
+        return (
+          <div class="bar-row" key={row.name}>
+            <span>{row.name}</span>
+            <div class="bar-track">
+              <i style={{ width: `${width}%` }} />
+            </div>
+            <strong>{formatNumber(row.count)}</strong>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SourceDonut({ counts }: { counts: Record<SourceFilter, number> }) {
+  const total = counts.sftp + counts.admin + counts.explorer;
+  const sftp = percentOf(counts.sftp, total);
+  const admin = percentOf(counts.admin, total);
+  const explorer = percentOf(counts.explorer, total);
+  const gradient =
+    total === 0
+      ? "conic-gradient(var(--line) 0 100%)"
+      : `conic-gradient(var(--accent) 0 ${sftp}%, var(--gold) ${sftp}% ${sftp + admin}%, var(--rose) ${sftp + admin}% ${
+          sftp + admin + explorer
+        }%, var(--line) ${sftp + admin + explorer}% 100%)`;
+  return (
+    <div class="source-donut" style={{ background: gradient }}>
+      <span>{total === 0 ? "0" : `${Math.round(explorer)}%`}</span>
+      <small>explorer</small>
     </div>
   );
 }
@@ -539,18 +725,18 @@ function UsersPanel({ users }: { users: UserRow[] }) {
   );
 }
 
-function SessionsPanel({ sessions }: { sessions: SessionRow[] }) {
+function SessionsPanel({ sessions, onInspectSession }: { sessions: SessionRow[]; onInspectSession: (session: SessionRow) => void }) {
   return (
     <DataPanel title="Sessions" empty="No sessions in this window">
       {sessions.map((session) => (
-        <div class="dense-row session-row" key={session.session}>
+        <button class="dense-row session-row" type="button" key={session.session} onClick={() => onInspectSession(session)}>
           <div>
             <strong>{shortValue(session.session, 18)}</strong>
             <small>{session.user_id || "unknown user"} {session.ip || ""}</small>
           </div>
           <span>{formatDuration(session.duration_sec)}</span>
           <span>{session.event_count ?? 0} events</span>
-        </div>
+        </button>
       ))}
     </DataPanel>
   );
@@ -629,6 +815,7 @@ function RiskPanel(props: {
 }
 
 function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[]; denied?: boolean }) {
+  const max = Math.max(...rows.slice(0, 10).map((row) => row.count), 1);
   return (
     <DataPanel title={title} empty="No rows">
       {rows.slice(0, 10).map((row) => (
@@ -636,6 +823,9 @@ function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[];
           <div>
             <strong>{shortValue(row.name, 28)}</strong>
             {denied ? <small>{row.denied ?? 0} denied</small> : null}
+            <div class="mini-track">
+              <i style={{ width: `${Math.max(3, Math.round((row.count / max) * 100))}%` }} />
+            </div>
           </div>
           <span>{formatNumber(row.count)}</span>
         </div>
@@ -644,20 +834,33 @@ function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[];
   );
 }
 
-function Inspector(props: { path: string; onClose: () => void }) {
+function Inspector(props: { target: InspectorTarget; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState("");
+  const event = props.target.type === "event" ? props.target.event : undefined;
+  const selectedPath = targetPath(props.target);
+  const sessionID = eventSession(event);
+
+  useEffect(() => {
+    setNotice("");
+  }, [props.target]);
 
   const preview = useQuery({
-    queryKey: ["preview", props.path],
-    queryFn: () => api<PreviewPayload>(previewURL(props.path)),
-    enabled: props.path !== ""
+    queryKey: ["preview", selectedPath],
+    queryFn: () => api<PreviewPayload>(previewURL(selectedPath)),
+    enabled: selectedPath !== ""
   });
 
   const ownerDetails = useQuery({
     queryKey: ["owner-details", preview.data?.owner_details_url],
     queryFn: () => api<Record<string, unknown>>(preview.data?.owner_details_url || ""),
     enabled: Boolean(preview.data?.owner_details_url)
+  });
+
+  const sessionTimeline = useQuery({
+    queryKey: ["session-timeline", sessionID],
+    queryFn: () => api<SessionTimelinePayload>(adminPath(`/admin/api/sessions/${encodeURIComponent(sessionID)}`, { limit: 36 })),
+    enabled: sessionID !== ""
   });
 
   const action = useMutation({
@@ -679,6 +882,9 @@ function Inspector(props: { path: string; onClose: () => void }) {
 
   const data = preview.data;
   const ownerStats = ownerDetails.data?.stats as Record<string, unknown> | undefined;
+  const hasSelection = props.target.type !== "none";
+  const previewError = preview.isError ? preview.error : null;
+  const missingPath = Boolean(event && previewError && selectedPath);
 
   async function rename() {
     if (!data?.rel_path) {
@@ -713,26 +919,40 @@ function Inspector(props: { path: string; onClose: () => void }) {
   }
 
   return (
-    <aside class={`inspector ${props.path ? "open" : ""}`} aria-live="polite">
-      {!props.path ? (
+    <aside class={`inspector ${hasSelection ? "open" : ""}`} aria-live="polite">
+      {!hasSelection ? (
         <div class="inspector-empty">
           <h2>Inspector</h2>
-          <p>No path selected.</p>
+          <p>Select a file, session, or event.</p>
         </div>
       ) : (
         <>
           <div class="inspector-head">
             <div>
               <span class="eyebrow">Inspector</span>
-              <h2>{data?.name || props.path}</h2>
+              <h2>{event ? event.event || "Event" : data?.name || selectedPath}</h2>
             </div>
             <button type="button" onClick={props.onClose} aria-label="Close inspector">
               Close
             </button>
           </div>
 
-          {preview.isLoading ? <div class="empty">Loading preview...</div> : null}
-          {preview.isError ? <div class="error">Preview unavailable.</div> : null}
+          {event ? <EventSummary event={event} /> : null}
+
+          {sessionID ? <SessionTimelineBox session={sessionTimeline.data} loading={sessionTimeline.isLoading} /> : null}
+
+          {selectedPath ? (
+            <>
+              {preview.isLoading ? <div class="empty">Loading preview...</div> : null}
+              {preview.isError ? (
+                <div class={missingPath ? "detail-box subtle" : "error"}>
+                  {missingPath ? "Path preview is unavailable; the event metadata is still shown above." : "Preview unavailable."}
+                </div>
+              ) : null}
+            </>
+          ) : event ? (
+            <div class="detail-box subtle">This event has no file path, so the inspector is showing event and session context.</div>
+          ) : null}
 
           {data ? (
             <>
@@ -786,6 +1006,85 @@ function Inspector(props: { path: string; onClose: () => void }) {
         </>
       )}
     </aside>
+  );
+}
+
+function EventSummary({ event }: { event: EventRow }) {
+  const path = targetPath({ type: "event", event });
+  const session = eventSession(event);
+  const command = eventCommand(event);
+  const target = metaString(event, ["target", "new_path", "old_path", "name", "file"]);
+  const error = metaString(event, ["error", "err", "message"]);
+  return (
+    <div class="event-card">
+      <div class="event-card-head">
+        <SourcePill source={sourceFor(event)} />
+        <span class={statusClass(event)}>{statusFor(event)}</span>
+      </div>
+      <dl class="metadata">
+        <Meta label="Time" value={event.time || String(event.timestamp || "")} />
+        <Meta label="Event" value={event.event} />
+        <Meta label="Path" value={path} />
+        <Meta label="Target" value={target} />
+        <Meta label="Command" value={command} />
+        <Meta label="User" value={event.user_id} />
+        <Meta label="IP" value={event.ip} />
+        <Meta label="Session" value={session} />
+        <Meta label="Error" value={error} />
+      </dl>
+      {eventIsDelete(event) ? <div class="detail-box subtle">Delete events often point at a path that no longer exists; keep the metadata as the record of what happened.</div> : null}
+      <EventMetaBlock event={event} />
+    </div>
+  );
+}
+
+function EventMetaBlock({ event }: { event: EventRow }) {
+  const metaObject = event.meta_obj && Object.keys(event.meta_obj).length > 0 ? event.meta_obj : null;
+  const text = metaObject ? JSON.stringify(metaObject, null, 2) : event.meta || "";
+  if (!text) {
+    return null;
+  }
+  return (
+    <div class="json-block">
+      <div class="panel-heading">
+        <h3>Event Metadata</h3>
+      </div>
+      <pre>{text}</pre>
+    </div>
+  );
+}
+
+function SessionTimelineBox({ session, loading }: { session?: SessionTimelinePayload; loading: boolean }) {
+  const rows = session?.events ?? [];
+  if (loading) {
+    return <div class="detail-box subtle">Loading session timeline...</div>;
+  }
+  if (!session?.session) {
+    return null;
+  }
+  return (
+    <div class="session-box">
+      <div class="panel-heading">
+        <h3>Session Timeline</h3>
+        <span>{rows.length} events</span>
+      </div>
+      <dl class="metadata compact-meta">
+        <Meta label="Session" value={session.session} />
+        <Meta label="User" value={session.user_id} />
+        <Meta label="IP" value={session.ip} />
+        <Meta label="Started" value={session.start_time} />
+        <Meta label="Ended" value={session.end_time} />
+      </dl>
+      <div class="timeline-list">
+        {rows.slice(0, 16).map((row) => (
+          <div class="timeline-row" key={row.id}>
+            <span>{row.time || ""}</span>
+            <strong>{row.event || "event"}</strong>
+            <em>{targetPath({ type: "event", event: row }) || statusFor(row)}</em>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -944,6 +1243,136 @@ function actionLabel(action: InspectorAction["type"]): string {
   }
 }
 
+function eventFromSession(session: SessionRow): EventRow {
+  return {
+    id: Number(session.started_at || 0),
+    timestamp: session.started_at,
+    time: session.start_time,
+    event: session.has_end ? "session" : "session/active",
+    user_id: session.user_id,
+    ip: session.ip,
+    session: session.session,
+    meta_obj: {
+      end_time: session.end_time,
+      duration: formatDuration(session.duration_sec),
+      event_count: session.event_count ?? 0,
+      uploads: session.upload_count ?? 0,
+      downloads: session.download_count ?? 0,
+      denied: session.denied_count ?? 0
+    }
+  };
+}
+
+function targetPath(target: InspectorTarget): string {
+  if (target.type === "path") {
+    return cleanPath(target.path);
+  }
+  if (target.type === "event") {
+    return cleanPath(target.event.path || metaString(target.event, ["path", "target_path", "old_path", "new_path", "file"]));
+  }
+  return "";
+}
+
+function eventSession(event?: EventRow): string {
+  if (!event) {
+    return "";
+  }
+  return event.session || metaString(event, ["session", "session_id", "user_session"]);
+}
+
+function eventCommand(event: EventRow): string {
+  return metaString(event, ["command", "cmd", "exec", "argv", "args"]);
+}
+
+function eventIsDelete(event: EventRow): boolean {
+  const name = (event.event || "").toLowerCase();
+  const action = metaString(event, ["action", "operation"]).toLowerCase();
+  return name.includes("delete") || action.includes("delete") || action.includes("unlink");
+}
+
+function statusClass(event: EventRow): string {
+  const status = statusFor(event).toLowerCase();
+  if (status.includes("fail") || status.includes("error") || status.includes("denied") || status.includes("bad")) {
+    return "status-chip hot";
+  }
+  return "status-chip";
+}
+
+function metaString(row: EventRow, keys: string[]): string {
+  const meta = metaRecord(row);
+  for (const key of keys) {
+    const value = meta[key];
+    if (typeof value === "string" && value.trim() !== "") {
+      return value;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    if (Array.isArray(value) && value.length > 0) {
+      return value.map((item) => String(item)).join(" ");
+    }
+    if (value && typeof value === "object") {
+      return JSON.stringify(value);
+    }
+  }
+  return "";
+}
+
+function metaRecord(row: EventRow): Record<string, unknown> {
+  if (row.meta_obj && typeof row.meta_obj === "object" && !Array.isArray(row.meta_obj)) {
+    return row.meta_obj;
+  }
+  if (!row.meta) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(row.meta);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return {};
+  }
+  return {};
+}
+
+function countBySource(rows: EventRow[]): Record<SourceFilter, number> {
+  const counts: Record<SourceFilter, number> = { all: rows.length, sftp: 0, admin: 0, explorer: 0 };
+  for (const row of rows) {
+    counts[sourceFor(row)]++;
+  }
+  return counts;
+}
+
+function percentOf(value: number, total: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  return (value / total) * 100;
+}
+
+function eventBuckets(rows: EventRow[], size: number): number[] {
+  const buckets = Array.from({ length: size }, () => 0);
+  if (rows.length === 0) {
+    return buckets;
+  }
+  const times = rows.map((row) => Number(row.timestamp || 0)).filter((value) => value > 0);
+  if (times.length === 0) {
+    rows.forEach((_row, index) => {
+      buckets[Math.min(size - 1, Math.floor((index / Math.max(rows.length, 1)) * size))]++;
+    });
+    return buckets;
+  }
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+  const span = Math.max(1, max - min + 1);
+  for (const timestamp of times) {
+    const bucket = Math.min(size - 1, Math.floor(((timestamp - min) / span) * size));
+    buckets[bucket]++;
+  }
+  return buckets;
+}
+
 function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: InsightsPayload): string {
   if (events.length === 0) {
     return "No events recorded in the current window.";
@@ -1014,6 +1443,20 @@ function formatBytes(value: number | undefined): string {
     unit++;
   }
   return `${next.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatPercent(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "0%";
+  }
+  return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function clampPercent(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, value));
 }
 
 function formatDuration(seconds: number | undefined): string {
