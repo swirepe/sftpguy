@@ -1,12 +1,11 @@
 import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/preact-query";
 import {
   api,
   fetchBlobURL,
   postJSON,
   previewURL,
-  rangeURL,
   type DownloadFileRow,
   type EventRow,
   type LivePayload,
@@ -16,6 +15,7 @@ import {
 } from "./api";
 
 type View = "overview" | "activity";
+type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 
 type EventsPayload = {
   events?: EventRow[];
@@ -32,17 +32,92 @@ type DownloadsPayload = {
   summary?: Record<string, number>;
 };
 
+type NamedCount = {
+  name: string;
+  count: number;
+};
+
+type NamedPair = NamedCount & {
+  denied?: number;
+};
+
+type InsightsPayload = {
+  kpi?: Record<string, number>;
+  top_events?: NamedCount[];
+  top_users?: NamedPair[];
+  top_ips?: NamedPair[];
+  suspicious_ips?: NamedPair[];
+  parsed_levels?: NamedCount[];
+  parsed_panics?: number;
+  recent_panics?: unknown[];
+};
+
+type UserRow = {
+  hash: string;
+  last_login?: string;
+  seen?: number;
+  upload_count?: number;
+  upload_bytes?: number;
+  download_count?: number;
+  download_bytes?: number;
+  is_banned?: boolean;
+};
+
+type UsersPayload = {
+  users?: UserRow[];
+};
+
+type SessionRow = {
+  session: string;
+  user_id?: string;
+  ip?: string;
+  start_time?: string;
+  end_time?: string;
+  duration_sec?: number;
+  event_count?: number;
+  upload_count?: number;
+  download_count?: number;
+  denied_count?: number;
+  has_end?: boolean;
+};
+
+type SessionsPayload = {
+  sessions?: SessionRow[];
+};
+
+type BannedPayload = {
+  hashes?: Array<{ hash: string; banned_at?: string }>;
+  ips?: Array<{ ip: string; banned_at?: string; comment?: string }>;
+};
+
 type InspectorAction =
   | { type: "delete"; path: string }
   | { type: "rename"; path: string; newName: string }
   | { type: "mark-bad"; path: string }
   | { type: "ban-owner"; path: string };
 
-const range = "24h";
+const defaultHue = 174;
+const rangeOptions = ["15m", "1h", "6h", "24h", "48h", "7d", "30d", "all"];
 
 export function App() {
+  const queryClient = useQueryClient();
+  const initialHueParam = hasHueParam();
   const [view, setView] = useState<View>("overview");
   const [selectedPath, setSelectedPath] = useState<string>("");
+  const [range, setRange] = useState(readURLParam("range") || "24h");
+  const [query, setQuery] = useState(readURLParam("q"));
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+  const [hue, setHue] = useState(parseHueParam());
+  const [hueInURL, setHueInURL] = useState(initialHueParam);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--hue", String(hue));
+    if (hueInURL) {
+      replaceURLParams({ hue: String(hue), range: range === "24h" ? "" : range, q: query });
+    } else {
+      replaceURLParams({ range: range === "24h" ? "" : range, q: query });
+    }
+  }, [hue, hueInURL, query, range]);
 
   const summary = useQuery({
     queryKey: ["summary"],
@@ -54,26 +129,76 @@ export function App() {
     queryFn: () => api<LivePayload>("/admin/api/live"),
     refetchInterval: 10_000
   });
+  const insights = useQuery({
+    queryKey: ["insights", range],
+    queryFn: () => api<InsightsPayload>(adminPath("/admin/api/insights", { range })),
+    refetchInterval: 30_000
+  });
   const events = useQuery({
-    queryKey: ["events", range],
-    queryFn: () => api<EventsPayload>(rangeURL("/admin/api/events?limit=90", range)),
+    queryKey: ["events", range, query],
+    queryFn: () => api<EventsPayload>(adminPath("/admin/api/events", { limit: 160, range, q: query })),
     refetchInterval: 20_000
   });
   const uploads = useQuery({
-    queryKey: ["uploads", range],
-    queryFn: () => api<UploadsPayload>(rangeURL("/admin/api/uploads/recent?limit=8", range)),
+    queryKey: ["uploads", range, query],
+    queryFn: () => api<UploadsPayload>(adminPath("/admin/api/uploads/recent", { limit: 10, range, q: query })),
     refetchInterval: 20_000
   });
   const downloads = useQuery({
-    queryKey: ["downloads", range],
+    queryKey: ["downloads", range, query],
     queryFn: () =>
       api<DownloadsPayload>(
-        rangeURL("/admin/api/downloads?file_limit=8&recent_limit=8&downloader_limit=10", range)
+        adminPath("/admin/api/downloads", {
+          file_limit: 10,
+          recent_limit: 12,
+          downloader_limit: 10,
+          range,
+          q: query
+        })
       ),
     refetchInterval: 30_000
   });
+  const users = useQuery({
+    queryKey: ["users", query],
+    queryFn: () => api<UsersPayload>(adminPath("/admin/api/users", { limit: 10, q: query })),
+    refetchInterval: 45_000
+  });
+  const sessions = useQuery({
+    queryKey: ["sessions", range, query],
+    queryFn: () => api<SessionsPayload>(adminPath("/admin/api/sessions", { limit: 12, range, q: query })),
+    refetchInterval: 30_000
+  });
+  const banned = useQuery({
+    queryKey: ["banned"],
+    queryFn: () => api<BannedPayload>("/admin/api/banned"),
+    refetchInterval: 60_000
+  });
+  const maintenance = useQuery({
+    queryKey: ["maintenance"],
+    queryFn: () => api<Record<string, unknown>>("/admin/api/maintenance"),
+    refetchInterval: 30_000
+  });
+
+  const runMaintenance = useMutation({
+    mutationFn: () => postJSON("/admin/api/maintenance/run", {}),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["maintenance"] });
+      await queryClient.invalidateQueries({ queryKey: ["events"] });
+    }
+  });
+  const banIP = useMutation({
+    mutationFn: (ip: string) => postJSON("/admin/api/banned/ip", { ip }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["banned"] });
+      await queryClient.invalidateQueries({ queryKey: ["events"] });
+    }
+  });
 
   const eventRows = events.data?.events ?? [];
+  const filteredEventRows = useMemo(
+    () => eventRows.filter((row) => sourceFilter === "all" || sourceFor(row) === sourceFilter),
+    [eventRows, sourceFilter]
+  );
   const explorerEvents = eventRows.filter((row) => sourceFor(row) === "explorer");
   const liveCount = countLive(live.data);
 
@@ -82,6 +207,11 @@ export function App() {
     if (clean) {
       setSelectedPath(clean);
     }
+  }
+
+  function updateHueFromColor(hex: string) {
+    setHue(hexToHue(hex));
+    setHueInURL(true);
   }
 
   return (
@@ -100,39 +230,48 @@ export function App() {
 
       <main class="workspace">
         <section class="primary">
-          <div class="modebar">
-            <div class="segmented" role="tablist" aria-label="Admin v2 views">
-              <button
-                class={view === "overview" ? "active" : ""}
-                type="button"
-                onClick={() => setView("overview")}
-              >
-                Overview
-              </button>
-              <button
-                class={view === "activity" ? "active" : ""}
-                type="button"
-                onClick={() => setView("activity")}
-              >
-                Activity
-              </button>
-            </div>
-            <span class="range-pill">Last 24h</span>
-          </div>
+          <Toolbar
+            view={view}
+            range={range}
+            query={query}
+            sourceFilter={sourceFilter}
+            hue={hue}
+            onView={setView}
+            onRange={setRange}
+            onQuery={setQuery}
+            onSourceFilter={setSourceFilter}
+            onHue={updateHueFromColor}
+            onRefresh={() => queryClient.invalidateQueries()}
+          />
 
           {view === "overview" ? (
             <Overview
               summary={summary.data}
+              insights={insights.data}
+              live={live.data}
               liveCount={liveCount}
               eventRows={eventRows}
               explorerEvents={explorerEvents}
               uploads={uploads.data?.uploads ?? []}
               downloads={downloads.data}
-              loading={summary.isLoading || events.isLoading}
+              users={users.data?.users ?? []}
+              sessions={sessions.data?.sessions ?? []}
+              banned={banned.data}
+              maintenance={maintenance.data}
+              maintenancePending={runMaintenance.isPending}
+              banIPPending={banIP.isPending}
+              loading={summary.isLoading || events.isLoading || insights.isLoading}
               onOpenPath={openInspector}
+              onRunMaintenance={() => runMaintenance.mutate()}
+              onBanIP={(ip) => banIP.mutate(ip)}
             />
           ) : (
-            <Activity rows={eventRows} loading={events.isLoading} onOpenPath={openInspector} />
+            <Activity
+              rows={filteredEventRows}
+              loading={events.isLoading}
+              sourceFilter={sourceFilter}
+              onOpenPath={openInspector}
+            />
           )}
         </section>
 
@@ -142,27 +281,110 @@ export function App() {
   );
 }
 
+function Toolbar(props: {
+  view: View;
+  range: string;
+  query: string;
+  sourceFilter: SourceFilter;
+  hue: number;
+  onView: (view: View) => void;
+  onRange: (range: string) => void;
+  onQuery: (query: string) => void;
+  onSourceFilter: (source: SourceFilter) => void;
+  onHue: (hex: string) => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <div class="toolbar">
+      <div class="segmented" role="tablist" aria-label="Admin v2 views">
+        <button class={props.view === "overview" ? "active" : ""} type="button" onClick={() => props.onView("overview")}>
+          Overview
+        </button>
+        <button class={props.view === "activity" ? "active" : ""} type="button" onClick={() => props.onView("activity")}>
+          Activity
+        </button>
+      </div>
+
+      <div class="control-cluster">
+        <label class="control">
+          <span>Range</span>
+          <select value={props.range} onInput={(event) => props.onRange((event.currentTarget as HTMLSelectElement).value)}>
+            {rangeOptions.map((option) => (
+              <option key={option} value={option}>
+                {rangeLabel(option)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label class="control search-control">
+          <span>Search</span>
+          <input
+            value={props.query}
+            placeholder="path, user, IP, session"
+            onInput={(event) => props.onQuery((event.currentTarget as HTMLInputElement).value)}
+          />
+        </label>
+        <label class="control">
+          <span>Source</span>
+          <select
+            value={props.sourceFilter}
+            onInput={(event) => props.onSourceFilter((event.currentTarget as HTMLSelectElement).value as SourceFilter)}
+          >
+            <option value="all">All</option>
+            <option value="sftp">SFTP</option>
+            <option value="admin">Admin</option>
+            <option value="explorer">Explorer</option>
+          </select>
+        </label>
+        <label class="control hue-control">
+          <span>Hue</span>
+          <input type="color" value={hslToHex(props.hue, 72, 54)} onInput={(event) => props.onHue((event.currentTarget as HTMLInputElement).value)} />
+        </label>
+        <button type="button" class="refresh-button" onClick={props.onRefresh}>
+          Refresh
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Overview(props: {
   summary?: SummaryPayload;
+  insights?: InsightsPayload;
+  live?: LivePayload;
   liveCount: number;
   eventRows: EventRow[];
   explorerEvents: EventRow[];
   uploads: UploadRow[];
   downloads?: DownloadsPayload;
+  users: UserRow[];
+  sessions: SessionRow[];
+  banned?: BannedPayload;
+  maintenance?: Record<string, unknown>;
+  maintenancePending: boolean;
+  banIPPending: boolean;
   loading: boolean;
   onOpenPath: (path?: string) => void;
+  onRunMaintenance: () => void;
+  onBanIP: (ip: string) => void;
 }) {
   const downloads = props.downloads?.files ?? [];
   const summary = props.summary;
+  const kpi = props.insights?.kpi ?? {};
   const totalEvents = props.eventRows.length;
   const explorerShare = totalEvents > 0 ? Math.round((props.explorerEvents.length / totalEvents) * 100) : 0;
+  const bannedHashes = props.banned?.hashes?.length ?? 0;
+  const bannedIPs = props.banned?.ips?.length ?? 0;
 
   return (
     <div class="overview-grid">
       <section class="metric-strip" aria-label="Summary">
         <Metric label="Files" value={formatNumber(summary?.files)} />
         <Metric label="Storage" value={summary?.formatted_bytes || formatBytes(summary?.bytes)} />
-        <Metric label="Users" value={formatNumber(summary?.users)} />
+        <Metric label="Events" value={formatNumber(kpi.events)} />
+        <Metric label="Uploads" value={formatNumber(kpi.uploads)} />
+        <Metric label="Downloads" value={formatNumber(kpi.downloads)} />
+        <Metric label="Denied" value={formatNumber(kpi.denied)} tone={Number(kpi.denied || 0) > 0 ? "warn" : "normal"} />
         <Metric label="Live" value={formatNumber(props.liveCount)} />
         <Metric label="Explorer" value={`${explorerShare}%`} />
       </section>
@@ -170,7 +392,7 @@ function Overview(props: {
       <section class="insights-band">
         <div>
           <h2>Operational Pulse</h2>
-          <p>{props.loading ? "Loading current activity..." : pulseCopy(props.eventRows, props.explorerEvents)}</p>
+          <p>{props.loading ? "Loading current activity..." : pulseCopy(props.eventRows, props.explorerEvents, props.insights)}</p>
         </div>
         <div class="release">
           <span>Version</span>
@@ -204,6 +426,31 @@ function Overview(props: {
         </DataPanel>
       </section>
 
+      <section class="triple">
+        <CountPanel title="Top Events" rows={props.insights?.top_events ?? []} />
+        <CountPanel title="Top Users" rows={props.insights?.top_users ?? []} denied />
+        <CountPanel title="Top IPs" rows={props.insights?.top_ips ?? []} denied />
+      </section>
+
+      <section class="split">
+        <UsersPanel users={props.users} />
+        <SessionsPanel sessions={props.sessions} />
+      </section>
+
+      <section class="split">
+        <LivePanel live={props.live} />
+        <RiskPanel
+          insights={props.insights}
+          bannedHashes={bannedHashes}
+          bannedIPs={bannedIPs}
+          maintenance={props.maintenance}
+          maintenancePending={props.maintenancePending}
+          banIPPending={props.banIPPending}
+          onRunMaintenance={props.onRunMaintenance}
+          onBanIP={props.onBanIP}
+        />
+      </section>
+
       <section class="wide-panel">
         <div class="panel-heading">
           <h2>Explorer-Origin Activity</h2>
@@ -215,12 +462,17 @@ function Overview(props: {
   );
 }
 
-function Activity(props: { rows: EventRow[]; loading: boolean; onOpenPath: (path?: string) => void }) {
+function Activity(props: {
+  rows: EventRow[];
+  loading: boolean;
+  sourceFilter: SourceFilter;
+  onOpenPath: (path?: string) => void;
+}) {
   return (
     <section class="wide-panel">
       <div class="panel-heading">
         <h2>Event Stream</h2>
-        <span>{props.loading ? "Refreshing" : `${props.rows.length} rows`}</span>
+        <span>{props.loading ? "Refreshing" : `${props.rows.length} ${props.sourceFilter} rows`}</span>
       </div>
       <EventTable rows={props.rows} onOpenPath={props.onOpenPath} />
     </section>
@@ -255,16 +507,140 @@ function EventTable(props: { rows: EventRow[]; onOpenPath: (path?: string) => vo
             disabled={!cleanPath(rowPath)}
           >
             <span>{row.time || row.timestamp || ""}</span>
-            <span>{sourceFor(row)}</span>
+            <span>
+              <SourcePill source={sourceFor(row)} />
+            </span>
             <span>{statusFor(row)}</span>
             <span class="path-cell">{rowPath}</span>
-            <span>{row.user_id || ""}</span>
+            <span>{shortValue(row.user_id)}</span>
             <span>{row.ip || ""}</span>
             <span class="truncate">{row.session || ""}</span>
           </button>
         );
       })}
     </div>
+  );
+}
+
+function UsersPanel({ users }: { users: UserRow[] }) {
+  return (
+    <DataPanel title="Users" empty="No users match the current filter">
+      {users.map((user) => (
+        <div class="dense-row" key={user.hash}>
+          <div>
+            <strong>{shortValue(user.hash)}</strong>
+            <small>{user.last_login || "no login time"}</small>
+          </div>
+          <span>{formatBytes(user.upload_bytes)} up</span>
+          <span>{formatBytes(user.download_bytes)} down</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function SessionsPanel({ sessions }: { sessions: SessionRow[] }) {
+  return (
+    <DataPanel title="Sessions" empty="No sessions in this window">
+      {sessions.map((session) => (
+        <div class="dense-row session-row" key={session.session}>
+          <div>
+            <strong>{shortValue(session.session, 18)}</strong>
+            <small>{session.user_id || "unknown user"} {session.ip || ""}</small>
+          </div>
+          <span>{formatDuration(session.duration_sec)}</span>
+          <span>{session.event_count ?? 0} events</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function LivePanel({ live }: { live?: LivePayload }) {
+  const connections = recordArray(live?.connections).slice(0, 6);
+  const sessions = recordArray(live?.sessions).slice(0, 6);
+  const requests = recordArray(live?.requests).slice(0, 6);
+  return (
+    <DataPanel title="Live" empty="No live activity">
+      {connections.map((row, index) => (
+        <LiveRow key={`conn-${index}`} label="Connection" row={row} />
+      ))}
+      {sessions.map((row, index) => (
+        <LiveRow key={`session-${index}`} label="Session" row={row} />
+      ))}
+      {requests.map((row, index) => (
+        <LiveRow key={`request-${index}`} label="Request" row={row} />
+      ))}
+    </DataPanel>
+  );
+}
+
+function LiveRow({ label, row }: { label: string; row: Record<string, unknown> }) {
+  return (
+    <div class="dense-row">
+      <div>
+        <strong>{label}</strong>
+        <small>{stringFromRecord(row, ["path", "operation", "session_id", "id"])}</small>
+      </div>
+      <span>{stringFromRecord(row, ["source", "protocol", "user_id"])}</span>
+      <span>{stringFromRecord(row, ["remote_addr", "ip"])}</span>
+    </div>
+  );
+}
+
+function RiskPanel(props: {
+  insights?: InsightsPayload;
+  bannedHashes: number;
+  bannedIPs: number;
+  maintenance?: Record<string, unknown>;
+  maintenancePending: boolean;
+  banIPPending: boolean;
+  onRunMaintenance: () => void;
+  onBanIP: (ip: string) => void;
+}) {
+  const suspicious = props.insights?.suspicious_ips ?? [];
+  const running = Boolean(props.maintenance?.running);
+  return (
+    <DataPanel title="Risk & Maintenance" empty="No risk data available">
+      <div class="risk-summary">
+        <Metric label="Banned Users" value={formatNumber(props.bannedHashes)} compact />
+        <Metric label="Banned IPs" value={formatNumber(props.bannedIPs)} compact />
+        <Metric label="Panics" value={formatNumber(props.insights?.parsed_panics)} compact tone={Number(props.insights?.parsed_panics || 0) > 0 ? "warn" : "normal"} />
+      </div>
+      <div class="action-line">
+        <span class={running ? "status-chip hot" : "status-chip"}>{running ? "Running" : "Idle"}</span>
+        <button type="button" onClick={props.onRunMaintenance} disabled={running || props.maintenancePending}>
+          Run Maintenance
+        </button>
+      </div>
+      {suspicious.map((ip) => (
+        <div class="dense-row risk-row" key={ip.name}>
+          <div>
+            <strong>{ip.name}</strong>
+            <small>{ip.count} events, {ip.denied ?? 0} denied</small>
+          </div>
+          <button type="button" onClick={() => props.onBanIP(ip.name)} disabled={props.banIPPending}>
+            Ban IP
+          </button>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[]; denied?: boolean }) {
+  return (
+    <DataPanel title={title} empty="No rows">
+      {rows.slice(0, 10).map((row) => (
+        <div class="dense-row" key={row.name}>
+          <div>
+            <strong>{shortValue(row.name, 28)}</strong>
+            {denied ? <small>{row.denied ?? 0} denied</small> : null}
+          </div>
+          <span>{formatNumber(row.count)}</span>
+        </div>
+      ))}
+    </DataPanel>
   );
 }
 
@@ -341,7 +717,7 @@ function Inspector(props: { path: string; onClose: () => void }) {
       {!props.path ? (
         <div class="inspector-empty">
           <h2>Inspector</h2>
-          <p>Select a path from activity, uploads, or downloads.</p>
+          <p>No path selected.</p>
         </div>
       ) : (
         <>
@@ -492,13 +868,17 @@ function PreviewDetails({ preview }: { preview: PreviewPayload }) {
   return null;
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function Metric({ label, value, tone = "normal", compact = false }: { label: string; value: string; tone?: "normal" | "warn"; compact?: boolean }) {
   return (
-    <div class="metric">
+    <div class={`metric ${tone === "warn" ? "warn" : ""} ${compact ? "compact" : ""}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
+}
+
+function SourcePill({ source }: { source: string }) {
+  return <span class={`source-pill ${source}`}>{source}</span>;
 }
 
 function DataPanel(props: { title: string; empty: string; children: ComponentChildren }) {
@@ -564,25 +944,26 @@ function actionLabel(action: InspectorAction["type"]): string {
   }
 }
 
-function pulseCopy(events: EventRow[], explorerEvents: EventRow[]): string {
+function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: InsightsPayload): string {
   if (events.length === 0) {
     return "No events recorded in the current window.";
   }
-  if (explorerEvents.length > 0) {
-    return `${events.length} events, including ${explorerEvents.length} from explorer-origin traffic.`;
+  const denied = insights?.kpi?.denied ?? 0;
+  if (denied > 0) {
+    return `${events.length} events, ${denied} denied, ${explorerEvents.length} explorer-origin.`;
   }
-  return `${events.length} events across SFTP and admin traffic.`;
+  return `${events.length} events, ${explorerEvents.length} explorer-origin, no denied events in view.`;
 }
 
-function sourceFor(row: EventRow): string {
-  const source = valueFromMeta(row, "source");
-  if (source) {
+function sourceFor(row: EventRow): SourceFilter {
+  const source = valueFromMeta(row, "source").toLowerCase();
+  if (source === "explorer" || source === "admin" || source === "sftp") {
     return source;
   }
   if ((row.event || "").startsWith("explorer_")) {
     return "explorer";
   }
-  if ((row.user_id || "") === "system") {
+  if ((row.user_id || "") === "system" || (row.event || "").startsWith("admin/")) {
     return "admin";
   }
   return "sftp";
@@ -615,7 +996,7 @@ function countLive(payload?: LivePayload): number {
 }
 
 function formatNumber(value: number | undefined): string {
-  if (typeof value !== "number") {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     return "0";
   }
   return new Intl.NumberFormat().format(value);
@@ -633,4 +1014,173 @@ function formatBytes(value: number | undefined): string {
     unit++;
   }
   return `${next.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatDuration(seconds: number | undefined): string {
+  if (!seconds || seconds < 0) {
+    return "0s";
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  }
+  if (seconds < 3600) {
+    return `${Math.round(seconds / 60)}m`;
+  }
+  return `${Math.round(seconds / 3600)}h`;
+}
+
+function shortValue(value: string | undefined, length = 12): string {
+  if (!value) {
+    return "";
+  }
+  if (value.length <= length) {
+    return value;
+  }
+  return `${value.slice(0, length)}...`;
+}
+
+function recordArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+}
+
+function stringFromRecord(row: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === "string" && value.trim() !== "") {
+      return value;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+  return "";
+}
+
+function rangeLabel(range: string): string {
+  switch (range) {
+    case "15m":
+      return "15m";
+    case "1h":
+      return "1h";
+    case "6h":
+      return "6h";
+    case "24h":
+      return "24h";
+    case "48h":
+      return "48h";
+    case "7d":
+      return "7d";
+    case "30d":
+      return "30d";
+    case "all":
+      return "All";
+    default:
+      return range;
+  }
+}
+
+function adminPath(path: string, params: Record<string, string | number | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") {
+      continue;
+    }
+    q.set(key, String(value));
+  }
+  const query = q.toString();
+  return query ? `${path}?${query}` : path;
+}
+
+function readURLParam(key: string): string {
+  return new URLSearchParams(window.location.search).get(key)?.trim() || "";
+}
+
+function hasHueParam(): boolean {
+  return new URLSearchParams(window.location.search).has("hue");
+}
+
+function parseHueParam(): number {
+  const raw = Number(readURLParam("hue"));
+  if (!Number.isFinite(raw)) {
+    return defaultHue;
+  }
+  return clampHue(raw);
+}
+
+function replaceURLParams(params: Record<string, string>) {
+  const url = new URL(window.location.href);
+  for (const [key, value] of Object.entries(params)) {
+    if (value === "") {
+      url.searchParams.delete(key);
+    } else {
+      url.searchParams.set(key, value);
+    }
+  }
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function clampHue(value: number): number {
+  const next = Math.round(value) % 360;
+  return next < 0 ? next + 360 : next;
+}
+
+function hexToHue(hex: string): number {
+  const clean = hex.replace("#", "");
+  const value = Number.parseInt(clean.length === 3 ? clean.split("").map((ch) => ch + ch).join("") : clean, 16);
+  const r = ((value >> 16) & 255) / 255;
+  const g = ((value >> 8) & 255) / 255;
+  const b = (value & 255) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  if (delta === 0) {
+    return defaultHue;
+  }
+  let hue = 0;
+  if (max === r) {
+    hue = 60 * (((g - b) / delta) % 6);
+  } else if (max === g) {
+    hue = 60 * ((b - r) / delta + 2);
+  } else {
+    hue = 60 * ((r - g) / delta + 4);
+  }
+  return clampHue(hue);
+}
+
+function hslToHex(hue: number, saturation: number, lightness: number): string {
+  const s = saturation / 100;
+  const l = lightness / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hue < 60) {
+    r = c;
+    g = x;
+  } else if (hue < 120) {
+    r = x;
+    g = c;
+  } else if (hue < 180) {
+    g = c;
+    b = x;
+  } else if (hue < 240) {
+    g = x;
+    b = c;
+  } else if (hue < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  return `#${toHex(r + m)}${toHex(g + m)}${toHex(b + m)}`;
+}
+
+function toHex(value: number): string {
+  return Math.round(value * 255).toString(16).padStart(2, "0");
 }
