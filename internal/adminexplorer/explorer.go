@@ -32,6 +32,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"sftpguy/internal/adminpreview"
 )
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -116,6 +118,7 @@ var (
 	ownerLookup       func(relPath string) (string, error)
 	ownerFilesURLFunc func(owner string) string
 	ownerDetailsURLFn func(owner string) string
+	previewer         *adminpreview.Previewer
 )
 
 //go:embed three.min.js video.js video-js.css flv.js videojs-flvjs.min.js
@@ -233,6 +236,9 @@ func cachedDirSize(absPath string) int64 {
 }
 
 func invalidateDirSizeCache(absPath string) {
+	if previewer != nil {
+		previewer.InvalidateDirSize(absPath)
+	}
 	p := absPath
 	for {
 		dirSizeCache.delete(p)
@@ -482,6 +488,7 @@ type Config struct {
 	LookupOwner       func(relPath string) (string, error)
 	OwnerFilesURL     func(owner string) string
 	OwnerDetailsURL   func(owner string) string
+	Previewer         *adminpreview.Previewer
 }
 
 type FileDetails struct {
@@ -521,8 +528,41 @@ func New(cfg Config) (*Explorer, error) {
 	ownerFilesURLFunc = cfg.OwnerFilesURL
 	ownerDetailsURLFn = cfg.OwnerDetailsURL
 
+	sharedPreviewer := cfg.Previewer
+	if sharedPreviewer == nil {
+		sharedPreviewer, err = adminpreview.New(adminpreview.Config{
+			RootDir: cfg.RootDir,
+			LookupFileDetails: func(relPath string) (adminpreview.FileDetails, error) {
+				if cfg.LookupFileDetails != nil {
+					details, err := cfg.LookupFileDetails(relPath)
+					return adminpreview.FileDetails{
+						Owner:     details.Owner,
+						Downloads: details.Downloads,
+					}, err
+				}
+				if cfg.LookupOwner != nil {
+					owner, err := cfg.LookupOwner(relPath)
+					return adminpreview.FileDetails{Owner: owner}, err
+				}
+				return adminpreview.FileDetails{}, nil
+			},
+			LookupOwner: func(relPath string) (string, error) {
+				if cfg.LookupOwner == nil {
+					return "", nil
+				}
+				return cfg.LookupOwner(relPath)
+			},
+			OwnerFilesURL:   cfg.OwnerFilesURL,
+			OwnerDetailsURL: cfg.OwnerDetailsURL,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	previewer = sharedPreviewer
+
 	if cfg.WarmCacheMax > 0 {
-		go warmCaches(rootDir, cfg.WarmCacheMax)
+		go previewer.WarmCaches(cfg.WarmCacheMax, explorerPreviewURLOptions(true))
 	}
 	return &Explorer{basePath: basePath}, nil
 }
@@ -894,48 +934,15 @@ func setCacheHeaders(w http.ResponseWriter, ttl time.Duration) {
 // ── thumbnail handler ─────────────────────────────────────────────────────────
 
 func serveThumb(w http.ResponseWriter, r *http.Request, fullPath string) {
-	if !isUnlocked(r) {
-		http.Error(w, "Locked", http.StatusForbidden)
+	if previewer == nil {
+		http.Error(w, "previewer not configured", http.StatusInternalServerError)
 		return
 	}
-
-	info, err := os.Stat(fullPath)
-	if err != nil {
-		http.NotFound(w, r)
-		return
+	relPath := strings.TrimPrefix(filepath.ToSlash(fullPath), filepath.ToSlash(rootDir)+"/")
+	if fullPath == rootDir {
+		relPath = ""
 	}
-
-	modTime := info.ModTime()
-
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if t, err := http.ParseTime(ims); err == nil && !modTime.After(t) {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-	}
-
-	// Check in-memory cache first.
-	if cached, ok := getThumb(fullPath, modTime); ok {
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("Last-Modified", modTime.UTC().Format(http.TimeFormat))
-		setCacheHeaders(w, thumbBrowserTTL)
-		w.Write(cached)
-		return
-	}
-
-	// Generate and cache the thumbnail; on decode failure return 404.
-	generateAndStoreThumb(fullPath, modTime)
-	cached, ok := getThumb(fullPath, modTime)
-	if !ok {
-		// Decode failed (unsupported or corrupt image).
-		http.NotFound(w, r)
-		return
-	}
-
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Last-Modified", modTime.UTC().Format(http.TimeFormat))
-	setCacheHeaders(w, thumbBrowserTTL)
-	w.Write(cached)
+	previewer.ServeThumbnail(w, r, relPath, isUnlocked(r))
 }
 
 // byteBuffer is a minimal io.Writer that accumulates bytes.
@@ -1482,65 +1489,24 @@ type previewPayload struct {
 }
 
 func servePreviewJSON(w http.ResponseWriter, r *http.Request, fullPath, relPath string) {
-	info, err := os.Stat(fullPath)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	if previewer == nil {
+		http.Error(w, `{"error":"previewer not configured"}`, http.StatusInternalServerError)
 		return
 	}
+	previewer.ServePreviewJSON(w, r, relPath, explorerPreviewURLOptions(isUnlocked(r)))
+}
 
-	unlocked := isUnlocked(r)
-	details, _, ownerFilesURL, ownerDetailsURL := fileDetailsForPath(relPath)
-
-	cacheKey := fullPath
-	if unlocked {
-		cacheKey += ":unlocked"
+func explorerPreviewURLOptions(unlocked bool) adminpreview.URLOptions {
+	return adminpreview.URLOptions{
+		Variant:  "explorer",
+		Unlocked: unlocked,
+		DownloadURL: func(relPath string) string {
+			return explorerURL(relPath)
+		},
+		ThumbnailURL: func(relPath string) string {
+			return explorerURL(relPath) + "?thumb=1"
+		},
 	}
-	cacheKey += fmt.Sprintf(":owner=%s:downloads=%d", details.Owner, details.Downloads)
-	if cached, ok := getPreview(cacheKey, info.ModTime()); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(cached)
-		return
-	}
-
-	escapedPath := explorerURL(filepath.ToSlash(relPath))
-
-	var p previewPayload
-	if info.IsDir() {
-		p = previewPayload{
-			Name:    info.Name(),
-			IsDir:   true,
-			Size:    formatBytes(info.Size()),
-			ModTime: info.ModTime().Format("2006-01-02 15:04"),
-		}
-		entries, _ := os.ReadDir(fullPath)
-		for _, e := range entries {
-			if e.IsDir() {
-				p.ChildDirs++
-			} else {
-				p.ChildFiles++
-			}
-		}
-		p.TotalSize = formatBytes(cachedDirSize(fullPath))
-	} else {
-		p = buildFilePreviewPayload(fullPath, info, escapedPath, unlocked)
-	}
-	p.RelPath = filepath.ToSlash(relPath)
-	p.Owner = details.Owner
-	p.Downloads = details.Downloads
-	if ownerFilesURL != "" {
-		p.OwnerFilesURL = string(ownerFilesURL)
-	}
-	if ownerDetailsURL != "" {
-		p.OwnerDetailsURL = string(ownerDetailsURL)
-	}
-
-	var jsonBuf byteBuffer
-	json.NewEncoder(&jsonBuf).Encode(p)
-	storePreview(cacheKey, info.ModTime(), jsonBuf.b)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonBuf.b)
 }
 
 // ── text / image helpers ──────────────────────────────────────────────────────

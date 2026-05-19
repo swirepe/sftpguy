@@ -30,12 +30,19 @@ func (s *Server) getAdminExplorerHandler() (http.Handler, error) {
 		return s.adminExplorer, s.adminExplorerErr
 	}
 
+	sharedPreviewer, err := s.getAdminPreviewer()
+	if err != nil {
+		s.adminExplorerErr = err
+		return nil, err
+	}
+
 	h, err := adminexplorer.New(adminexplorer.Config{
 		RootDir:        s.absUploadDir,
 		BasePath:       adminexplorer.DefaultBasePath,
 		EmbedAssets:    false,
 		MaxUploadBytes: s.cfg.MaxFileSize,
 		WarmCacheMax:   s.cfg.AdminExplorerWarmMax,
+		Previewer:      sharedPreviewer,
 		LookupFileDetails: func(relPath string) (adminexplorer.FileDetails, error) {
 			meta, err := s.store.GetFileAdminMeta(relPath)
 			if err != nil {

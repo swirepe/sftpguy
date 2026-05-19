@@ -1,0 +1,20 @@
+{
+  "name": "sftpguy-admin-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "check": "tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "@tanstack/preact-query": "^5.76.1",
+    "preact": "^10.26.9"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.2",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}

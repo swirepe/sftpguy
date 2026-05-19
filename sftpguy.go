@@ -63,6 +63,7 @@ import (
 	"time"
 
 	"sftpguy/caid"
+	"sftpguy/internal/adminpreview"
 	"sftpguy/internal/explorerevents"
 	"sftpguy/internal/logutil"
 	"sftpguy/internal/socketactivation"
@@ -79,6 +80,8 @@ import (
 //go:embed go.mod go.sum
 //go:embed README.md fortunes.txt bad_files.txt
 //go:embed admin_ui internal cmd caid spec
+//go:embed admin/v2/index.html admin/v2/package.json admin/v2/package-lock.json admin/v2/tsconfig.json admin/v2/vite.config.ts admin/v2/src
+//go:embed admin/v2/dist
 //go:embed *.go
 var embeddedSource embed.FS
 
@@ -1258,6 +1261,9 @@ type Server struct {
 	adminExplorerMu  sync.Mutex
 	adminExplorer    http.Handler
 	adminExplorerErr error
+	adminPreviewMu   sync.Mutex
+	adminPreview     *adminpreview.Previewer
+	adminPreviewErr  error
 	adminOneTimeMu   sync.Mutex
 	adminOneTime     map[string]time.Time
 	shadowMutateMin  time.Duration

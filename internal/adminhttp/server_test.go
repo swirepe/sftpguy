@@ -117,3 +117,48 @@ func TestHandlerRegistersMetricsRoute(t *testing.T) {
 		t.Fatalf("unexpected metrics body: %q", authW.Body.String())
 	}
 }
+
+func TestHandlerProtectsAdminV2Routes(t *testing.T) {
+	mux := Handler(Config{
+		Token:           "topsecret",
+		TokenCookieName: "admin_cookie",
+	}, RouteHandlers{
+		AdminV2: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("admin v2"))
+		},
+	})
+
+	unauthReq := httptest.NewRequest(http.MethodGet, "/admin/v2/", nil)
+	unauthW := httptest.NewRecorder()
+	mux.ServeHTTP(unauthW, unauthReq)
+	if unauthW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated admin v2 request, got %d", unauthW.Code)
+	}
+
+	assetReq := httptest.NewRequest(http.MethodGet, "/admin/v2/assets/index.js", nil)
+	assetW := httptest.NewRecorder()
+	mux.ServeHTTP(assetW, assetReq)
+	if assetW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated admin v2 asset request, got %d", assetW.Code)
+	}
+
+	redirectReq := httptest.NewRequest(http.MethodGet, "/admin/v2", nil)
+	redirectReq.Header.Set("Authorization", "Bearer topsecret")
+	redirectW := httptest.NewRecorder()
+	mux.ServeHTTP(redirectW, redirectReq)
+	if redirectW.Code != http.StatusMovedPermanently {
+		t.Fatalf("expected /admin/v2 redirect status 301, got %d", redirectW.Code)
+	}
+	if got := redirectW.Header().Get("Location"); got != "/admin/v2/" {
+		t.Fatalf("expected redirect to /admin/v2/, got %q", got)
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/admin/v2/", nil)
+	authReq.Header.Set("Authorization", "Bearer topsecret")
+	authW := httptest.NewRecorder()
+	mux.ServeHTTP(authW, authReq)
+	if authW.Code != http.StatusOK {
+		t.Fatalf("expected authenticated admin v2 request to pass, got %d", authW.Code)
+	}
+}

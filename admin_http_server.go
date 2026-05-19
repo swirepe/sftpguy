@@ -43,6 +43,7 @@ func (d *adminHTTPDeps) AdminHTTPConfig() adminhttp.Config {
 func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 	return adminhttp.RouteHandlers{
 		Page:             d.srv.handleAdminPage,
+		AdminV2:          d.srv.handleAdminV2,
 		CSS:              d.srv.handleAdminCSS,
 		JS:               d.srv.handleAdminJS,
 		Explorer:         d.srv.handleAdminExplorer,
@@ -63,6 +64,8 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		RecentUploads:    d.srv.handleAdminRecentUploads,
 		Downloads:        d.srv.handleAdminDownloads,
 		Actor:            d.srv.handleAdminActor,
+		Preview:          d.srv.handleAdminPreview,
+		Thumbnail:        d.srv.handleAdminThumbnail,
 		SystemLog:        d.srv.handleAdminSystemLog,
 		ParsedSystemLog:  d.srv.handleAdminParsedSystemLog,
 		Banned:           d.srv.handleAdminBanned,

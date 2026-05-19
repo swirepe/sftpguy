@@ -31,6 +31,7 @@ type Config struct {
 
 type RouteHandlers struct {
 	Page             http.HandlerFunc
+	AdminV2          http.HandlerFunc
 	CSS              http.HandlerFunc
 	JS               http.HandlerFunc
 	Explorer         http.HandlerFunc
@@ -51,6 +52,8 @@ type RouteHandlers struct {
 	RecentUploads    http.HandlerFunc
 	Downloads        http.HandlerFunc
 	Actor            http.HandlerFunc
+	Preview          http.HandlerFunc
+	Thumbnail        http.HandlerFunc
 	SystemLog        http.HandlerFunc
 	ParsedSystemLog  http.HandlerFunc
 	Banned           http.HandlerFunc
@@ -123,6 +126,10 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	mux.HandleFunc(OneTimeLoginPath, oneTimeLogin(cfg))
 
 	register(mux, "/admin", cfg, handlers.Page)
+	register(mux, "/admin/v2", cfg, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/admin/v2/", http.StatusMovedPermanently)
+	})
+	register(mux, "/admin/v2/", cfg, handlers.AdminV2)
 	register(mux, "/admin/explorer", cfg, handlers.Explorer)
 	register(mux, "/admin/explorer/", cfg, handlers.Explorer)
 	register(mux, "/admin/static/admin.css", cfg, handlers.CSS)
@@ -144,6 +151,8 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/api/uploads/recent", cfg, handlers.RecentUploads)
 	register(mux, "/admin/api/downloads", cfg, handlers.Downloads)
 	register(mux, "/admin/api/actor", cfg, handlers.Actor)
+	register(mux, "/admin/api/preview", cfg, handlers.Preview)
+	register(mux, "/admin/api/thumbnail", cfg, handlers.Thumbnail)
 	register(mux, "/admin/api/system-log", cfg, handlers.SystemLog)
 	register(mux, "/admin/api/system-log/parsed", cfg, handlers.ParsedSystemLog)
 	register(mux, "/admin/api/banned", cfg, handlers.Banned)
