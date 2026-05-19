@@ -161,7 +161,7 @@ select {
 
 .segmented {
   display: inline-grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
@@ -598,6 +598,102 @@ select {
   text-transform: uppercase;
 }
 
+.gallery-note {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.gallery-note strong {
+  color: var(--ink);
+  font-family: var(--mono);
+}
+
+.thumbnail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.thumbnail-card {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+  padding: 8px;
+  text-align: left;
+  background: #0d141a;
+}
+
+.thumbnail-frame {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #05080a;
+}
+
+.thumbnail-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.thumbnail-placeholder {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: var(--accent-strong);
+  font-family: var(--mono);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.thumbnail-placeholder.error-state {
+  color: var(--rose);
+}
+
+.thumbnail-body {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.thumbnail-body strong,
+.thumbnail-body small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thumbnail-body strong {
+  font-family: var(--mono);
+}
+
+.thumbnail-body small,
+.thumbnail-body em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.thumbnail-body em {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.thumbnail-body em > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
 .path-row,
 .event-row,
 .dense-row {
@@ -713,6 +809,16 @@ button.dense-row {
   border-color: rgba(148, 165, 174, 0.48);
 }
 
+.source-pill.upload {
+  border-color: rgba(34, 211, 238, 0.46);
+  color: #67e8f9;
+}
+
+.source-pill.download {
+  border-color: rgba(129, 140, 248, 0.48);
+  color: #a5b4fc;
+}
+
 .dense-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -745,6 +851,27 @@ button.dense-row {
 
 .risk-row {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.auth-combo-row,
+.auth-attempt-row,
+.banned-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.panic-row {
+  padding: 9px;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #0d141a;
+}
+
+.panic-row code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: #cbd6d8;
+  font-size: 12px;
 }
 
 .empty,

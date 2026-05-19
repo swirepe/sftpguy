@@ -14,10 +14,10 @@ import {
   type UploadRow
 } from "./api";
 
-type View = "overview" | "activity";
+type View = "overview" | "activity" | "thumbnails" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
-type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow };
+type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow } | { type: "user"; user: UserRow };
 
 type EventsPayload = {
   events?: EventRow[];
@@ -41,6 +41,13 @@ type NamedCount = {
 
 type NamedPair = NamedCount & {
   denied?: number;
+};
+
+type ThumbnailCandidate = {
+  path: string;
+  source: string;
+  detail: string;
+  meta?: string;
 };
 
 type InsightsPayload = {
@@ -67,6 +74,45 @@ type UserRow = {
 
 type UsersPayload = {
   users?: UserRow[];
+};
+
+type UserStatsPayload = {
+  last_login?: string;
+  last_address?: string;
+  seen?: number;
+  upload_count?: number;
+  upload_bytes?: number;
+  download_count?: number;
+  download_bytes?: number;
+  first_timer?: boolean;
+  is_banned?: boolean;
+};
+
+type UserFileRow = {
+  path?: string;
+  name?: string;
+  owner?: string;
+  downloads?: number;
+  size?: number;
+  size_human?: string;
+  is_dir?: boolean;
+};
+
+type UserEventRow = {
+  timestamp?: number;
+  time?: string;
+  event?: string;
+  path?: string;
+  meta?: string;
+  ip?: string;
+};
+
+type UserDetailPayload = {
+  hash?: string;
+  is_banned?: boolean;
+  stats?: UserStatsPayload;
+  files?: UserFileRow[];
+  events?: UserEventRow[];
 };
 
 type SessionRow = {
@@ -105,11 +151,40 @@ type BannedPayload = {
   ips?: Array<{ ip: string; banned_at?: string; comment?: string }>;
 };
 
+type AuthAttemptRow = {
+  id: number;
+  timestamp?: number;
+  time?: string;
+  ip?: string;
+  user_id?: string;
+  session?: string;
+  username?: string;
+  password?: string;
+  generated_hash?: string;
+};
+
+type AuthComboRow = {
+  username?: string;
+  password?: string;
+  count?: number;
+  last_timestamp?: number;
+  last_time?: string;
+  last_ip?: string;
+};
+
+type AuthAttemptsPayload = {
+  attempts?: AuthAttemptRow[];
+  combos?: AuthComboRow[];
+  window?: { label?: string };
+};
+
 type InspectorAction =
   | { type: "delete"; path: string }
   | { type: "rename"; path: string; newName: string }
   | { type: "mark-bad"; path: string }
   | { type: "ban-owner"; path: string };
+
+type UserInspectorAction = { type: "ban" | "unban"; hash: string };
 
 const defaultHue = 174;
 const rangeOptions = ["15m", "1h", "6h", "24h", "48h", "7d", "30d", "all"];
@@ -188,6 +263,11 @@ export function App() {
     queryFn: () => api<BannedPayload>("/admin/api/banned"),
     refetchInterval: 60_000
   });
+  const authAttempts = useQuery({
+    queryKey: ["auth-attempts", range, query],
+    queryFn: () => api<AuthAttemptsPayload>(adminPath("/admin/api/auth-attempts", { limit: 600, combo_limit: 180, range, q: query })),
+    refetchInterval: 30_000
+  });
   const maintenance = useQuery({
     queryKey: ["maintenance"],
     queryFn: () => api<Record<string, unknown>>("/admin/api/maintenance"),
@@ -230,6 +310,10 @@ export function App() {
 
   function inspectSession(session: SessionRow) {
     setInspectorTarget({ type: "event", event: eventFromSession(session) });
+  }
+
+  function inspectUser(user: UserRow) {
+    setInspectorTarget({ type: "user", user });
   }
 
   function updateHueFromColor(hex: string) {
@@ -287,16 +371,37 @@ export function App() {
               onOpenPath={openInspector}
               onInspectEvent={inspectEvent}
               onInspectSession={inspectSession}
+              onInspectUser={inspectUser}
               onRunMaintenance={() => runMaintenance.mutate()}
               onBanIP={(ip) => banIP.mutate(ip)}
             />
+          ) : view === "thumbnails" ? (
+            <ThumbnailView
+              eventRows={filteredEventRows}
+              uploads={uploads.data?.uploads ?? []}
+              downloads={downloads.data}
+              loading={events.isLoading || uploads.isLoading || downloads.isLoading}
+              onOpenPath={openInspector}
+            />
           ) : (
+            view === "activity" ? (
             <Activity
               rows={filteredEventRows}
               loading={events.isLoading}
               sourceFilter={sourceFilter}
               onInspectEvent={inspectEvent}
             />
+            ) : (
+              <Security
+                insights={insights.data}
+                banned={banned.data}
+                auth={authAttempts.data}
+                loading={authAttempts.isLoading || insights.isLoading}
+                banIPPending={banIP.isPending}
+                onBanIP={(ip) => banIP.mutate(ip)}
+                onInspectEvent={inspectEvent}
+              />
+            )
           )}
         </section>
 
@@ -305,6 +410,7 @@ export function App() {
           banIPPending={banIP.isPending}
           onBanIP={(ip) => banIP.mutate(ip)}
           onInspectEvent={inspectEvent}
+          onOpenPath={openInspector}
           onClose={() => setInspectorTarget({ type: "none" })}
         />
       </main>
@@ -333,6 +439,12 @@ function Toolbar(props: {
         </button>
         <button class={props.view === "activity" ? "active" : ""} type="button" onClick={() => props.onView("activity")}>
           Activity
+        </button>
+        <button class={props.view === "thumbnails" ? "active" : ""} type="button" onClick={() => props.onView("thumbnails")}>
+          Thumbnails
+        </button>
+        <button class={props.view === "security" ? "active" : ""} type="button" onClick={() => props.onView("security")}>
+          Security
         </button>
       </div>
 
@@ -398,6 +510,7 @@ function Overview(props: {
   onOpenPath: (path?: string) => void;
   onInspectEvent: (event: EventRow) => void;
   onInspectSession: (session: SessionRow) => void;
+  onInspectUser: (user: UserRow) => void;
   onRunMaintenance: () => void;
   onBanIP: (ip: string) => void;
 }) {
@@ -480,7 +593,7 @@ function Overview(props: {
       </section>
 
       <section class="split">
-        <UsersPanel users={props.users} />
+        <UsersPanel users={props.users} onInspectUser={props.onInspectUser} />
         <SessionsPanel sessions={props.sessions} onInspectSession={props.onInspectSession} />
       </section>
 
@@ -545,6 +658,262 @@ function Activity(props: {
         <EventTable rows={rows} onInspectEvent={props.onInspectEvent} />
       </section>
     </div>
+  );
+}
+
+function ThumbnailView(props: {
+  eventRows: EventRow[];
+  uploads: UploadRow[];
+  downloads?: DownloadsPayload;
+  loading: boolean;
+  onOpenPath: (path?: string) => void;
+}) {
+  const candidates = useMemo(
+    () => collectThumbnailCandidates(props.eventRows, props.uploads, props.downloads).slice(0, 54),
+    [props.downloads, props.eventRows, props.uploads]
+  );
+  const counts = topCountsFromStrings(candidates.map((candidate) => candidate.source), 6);
+  return (
+    <div class="activity-grid">
+      <section class="insights-band">
+        <div>
+          <h2>Thumbnail Wall</h2>
+          <p>{props.loading ? "Loading candidate paths..." : `${candidates.length} recent paths from uploads, downloads, and events.`}</p>
+        </div>
+        <div class="release">
+          <span>Preview API</span>
+          <strong>shared</strong>
+        </div>
+      </section>
+
+      <section class="split">
+        <DataPanel title="Sources" empty="No thumbnail sources">
+          <BarList rows={counts} />
+        </DataPanel>
+        <DataPanel title="Scan Pattern" empty="No paths">
+          <div class="gallery-note">
+            <strong>{formatNumber(candidates.length)} paths queued</strong>
+            <span>Tiles use `/admin/api/preview` and cached `/admin/api/thumbnail` images, then open the inspector on click.</span>
+          </div>
+        </DataPanel>
+      </section>
+
+      <section class="wide-panel">
+        <div class="panel-heading">
+          <h2>Thumbnails</h2>
+          <span>{props.loading ? "Refreshing" : `${candidates.length} tiles`}</span>
+        </div>
+        {candidates.length > 0 ? (
+          <div class="thumbnail-grid">
+            {candidates.map((candidate) => (
+              <ThumbnailCard key={candidate.path} candidate={candidate} onOpenPath={props.onOpenPath} />
+            ))}
+          </div>
+        ) : (
+          <div class="empty">No paths with preview candidates in the current window.</div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidate; onOpenPath: (path?: string) => void }) {
+  const preview = useQuery({
+    queryKey: ["thumbnail-card-preview", candidate.path],
+    queryFn: () => api<PreviewPayload>(previewURL(candidate.path)),
+    staleTime: 60_000
+  });
+  const thumb = useQuery({
+    queryKey: ["thumbnail-card-image", preview.data?.thumb_url],
+    queryFn: () => fetchBlobURL(preview.data?.thumb_url || ""),
+    enabled: Boolean(preview.data?.thumb_url),
+    staleTime: 60_000
+  });
+  const data = preview.data;
+  const label = data?.name || basename(candidate.path);
+  return (
+    <button class="thumbnail-card" type="button" onClick={() => onOpenPath(candidate.path)}>
+      <span class="thumbnail-frame">
+        {thumb.data ? (
+          <img src={thumb.data} alt={label} />
+        ) : (
+          <span class={`thumbnail-placeholder ${preview.isError ? "error-state" : ""}`}>
+            {preview.isLoading ? "loading" : preview.isError ? "unavailable" : previewKind(data)}
+          </span>
+        )}
+      </span>
+      <span class="thumbnail-body">
+        <strong>{label}</strong>
+        <small>{candidate.detail}</small>
+        <em>
+          <SourcePill source={candidate.source} />
+          {candidate.meta ? <span>{candidate.meta}</span> : null}
+        </em>
+      </span>
+    </button>
+  );
+}
+
+function Security(props: {
+  insights?: InsightsPayload;
+  banned?: BannedPayload;
+  auth?: AuthAttemptsPayload;
+  loading: boolean;
+  banIPPending: boolean;
+  onBanIP: (ip: string) => void;
+  onInspectEvent: (event: EventRow) => void;
+}) {
+  const attempts = props.auth?.attempts ?? [];
+  const combos = props.auth?.combos ?? [];
+  const suspicious = props.insights?.suspicious_ips ?? [];
+  const bannedIPs = props.banned?.ips ?? [];
+  const bannedHashes = props.banned?.hashes ?? [];
+  const denied = props.insights?.kpi?.denied ?? 0;
+  const panics = props.insights?.parsed_panics ?? 0;
+  return (
+    <div class="activity-grid">
+      <section class="metric-strip activity-metrics" aria-label="Security summary">
+        <Metric label="Auth" value={formatNumber(attempts.length)} tone={attempts.length > 0 ? "warn" : "normal"} />
+        <Metric label="Combos" value={formatNumber(combos.length)} tone={combos.length > 0 ? "warn" : "normal"} />
+        <Metric label="Suspicious" value={formatNumber(suspicious.length)} tone={suspicious.length > 0 ? "warn" : "normal"} />
+        <Metric label="Denied" value={formatNumber(denied)} tone={denied > 0 ? "warn" : "normal"} />
+        <Metric label="Panics" value={formatNumber(panics)} tone={panics > 0 ? "warn" : "normal"} />
+        <Metric label="Banned IPs" value={formatNumber(bannedIPs.length)} />
+        <Metric label="Banned Users" value={formatNumber(bannedHashes.length)} />
+      </section>
+
+      <section class="insights-band">
+        <div>
+          <h2>Security Posture</h2>
+          <p>{props.loading ? "Loading security signals..." : securityCopy(attempts, suspicious, denied, panics)}</p>
+        </div>
+        <div class="release">
+          <span>Auth Window</span>
+          <strong>{props.auth?.window?.label || "current"}</strong>
+        </div>
+      </section>
+
+      <section class="split">
+        <SuspiciousPanel rows={suspicious} banIPPending={props.banIPPending} onBanIP={props.onBanIP} />
+        <AuthCombosPanel combos={combos} banIPPending={props.banIPPending} onBanIP={props.onBanIP} />
+      </section>
+
+      <section class="split">
+        <AuthAttemptsPanel attempts={attempts} onInspectEvent={props.onInspectEvent} />
+        <BannedPanel banned={props.banned} />
+      </section>
+
+      <section class="split">
+        <LogLevelsPanel rows={props.insights?.parsed_levels ?? []} />
+        <PanicPanel rows={props.insights?.recent_panics ?? []} />
+      </section>
+    </div>
+  );
+}
+
+function SuspiciousPanel(props: { rows: NamedPair[]; banIPPending: boolean; onBanIP: (ip: string) => void }) {
+  return (
+    <DataPanel title="Suspicious IPs" empty="No suspicious IPs in this window">
+      {props.rows.slice(0, 12).map((row) => (
+        <div class="dense-row risk-row" key={row.name}>
+          <div>
+            <strong>{row.name}</strong>
+            <small>{row.count} events, {row.denied ?? 0} denied</small>
+            <div class="mini-track">
+              <i style={{ width: `${Math.max(5, Math.min(100, (row.denied ?? 0) * 12))}%` }} />
+            </div>
+          </div>
+          <button type="button" onClick={() => props.onBanIP(row.name)} disabled={props.banIPPending}>
+            Ban IP
+          </button>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function AuthCombosPanel(props: { combos: AuthComboRow[]; banIPPending: boolean; onBanIP: (ip: string) => void }) {
+  return (
+    <DataPanel title="Credential Combos" empty="No auth attempts in this window">
+      {props.combos.slice(0, 14).map((combo, index) => (
+        <div class="dense-row auth-combo-row" key={`${combo.username || ""}:${combo.password || ""}:${index}`}>
+          <div>
+            <strong>{credentialLabel(combo.username, combo.password)}</strong>
+            <small>{combo.last_time || ""} {combo.last_ip || ""}</small>
+          </div>
+          <span>{formatNumber(combo.count)} tries</span>
+          {combo.last_ip ? (
+            <button type="button" onClick={() => props.onBanIP(combo.last_ip || "")} disabled={props.banIPPending}>
+              Ban
+            </button>
+          ) : null}
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function AuthAttemptsPanel({ attempts, onInspectEvent }: { attempts: AuthAttemptRow[]; onInspectEvent: (event: EventRow) => void }) {
+  return (
+    <DataPanel title="Recent Auth Attempts" empty="No auth attempts">
+      {attempts.slice(0, 18).map((attempt) => (
+        <button class="dense-row auth-attempt-row" type="button" key={attempt.id} onClick={() => onInspectEvent(eventFromAuthAttempt(attempt))}>
+          <div>
+            <strong>{credentialLabel(attempt.username, attempt.password)}</strong>
+            <small>{attempt.time || ""} {attempt.ip || ""}</small>
+          </div>
+          <span>{shortValue(attempt.generated_hash, 14)}</span>
+          <span>{shortValue(attempt.session, 14)}</span>
+        </button>
+      ))}
+    </DataPanel>
+  );
+}
+
+function BannedPanel({ banned }: { banned?: BannedPayload }) {
+  const ips = banned?.ips ?? [];
+  const hashes = banned?.hashes ?? [];
+  return (
+    <DataPanel title="Banned" empty="No banned actors">
+      {ips.slice(0, 8).map((row) => (
+        <div class="dense-row banned-row" key={`ip-${row.ip}`}>
+          <div>
+            <strong>{row.ip}</strong>
+            <small>{row.comment || "IP"} {row.banned_at || ""}</small>
+          </div>
+          <span>ip</span>
+        </div>
+      ))}
+      {hashes.slice(0, 8).map((row) => (
+        <div class="dense-row banned-row" key={`hash-${row.hash}`}>
+          <div>
+            <strong>{shortValue(row.hash, 22)}</strong>
+            <small>{row.banned_at || ""}</small>
+          </div>
+          <span>user</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function LogLevelsPanel({ rows }: { rows: NamedCount[] }) {
+  return (
+    <DataPanel title="Log Levels" empty="No parsed log levels">
+      <BarList rows={rows.slice(0, 8)} />
+    </DataPanel>
+  );
+}
+
+function PanicPanel({ rows }: { rows: unknown[] }) {
+  return (
+    <DataPanel title="Recent Panics" empty="No recent panics">
+      {rows.slice(0, 8).map((row, index) => (
+        <div class="panic-row" key={index}>
+          <code>{shortValue(panicText(row), 96)}</code>
+        </div>
+      ))}
+    </DataPanel>
   );
 }
 
@@ -798,18 +1167,18 @@ function SourceDonut({ counts }: { counts: Record<SourceFilter, number> }) {
   );
 }
 
-function UsersPanel({ users }: { users: UserRow[] }) {
+function UsersPanel({ users, onInspectUser }: { users: UserRow[]; onInspectUser: (user: UserRow) => void }) {
   return (
     <DataPanel title="Users" empty="No users match the current filter">
       {users.map((user) => (
-        <div class="dense-row" key={user.hash}>
+        <button class="dense-row user-row" type="button" key={user.hash} onClick={() => onInspectUser(user)}>
           <div>
             <strong>{shortValue(user.hash)}</strong>
             <small>{user.last_login || "no login time"}</small>
           </div>
           <span>{formatBytes(user.upload_bytes)} up</span>
           <span>{formatBytes(user.download_bytes)} down</span>
-        </div>
+        </button>
       ))}
     </DataPanel>
   );
@@ -929,13 +1298,16 @@ function Inspector(props: {
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
   onInspectEvent: (event: EventRow) => void;
+  onOpenPath: (path?: string) => void;
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState("");
   const event = props.target.type === "event" ? props.target.event : undefined;
+  const user = props.target.type === "user" ? props.target.user : undefined;
   const selectedPath = targetPath(props.target);
   const sessionID = eventSession(event);
+  const selectedUser = user?.hash || "";
 
   useEffect(() => {
     setNotice("");
@@ -959,6 +1331,12 @@ function Inspector(props: {
     enabled: sessionID !== ""
   });
 
+  const userDetails = useQuery({
+    queryKey: ["user-detail", selectedUser],
+    queryFn: () => api<UserDetailPayload>(`/admin/api/users/${encodeURIComponent(selectedUser)}`),
+    enabled: selectedUser !== ""
+  });
+
   const action = useMutation({
     mutationFn: (next: InspectorAction) => runInspectorAction(next),
     onSuccess: async (_data, variables) => {
@@ -970,6 +1348,20 @@ function Inspector(props: {
       if (variables.type === "delete") {
         props.onClose();
       }
+    },
+    onError: (error) => {
+      setNotice(error instanceof Error ? error.message : "Action failed");
+    }
+  });
+
+  const userAction = useMutation({
+    mutationFn: (next: UserInspectorAction) => postJSON(`/admin/api/users/${encodeURIComponent(next.hash)}/${next.type}`, {}),
+    onSuccess: async (_data, variables) => {
+      setNotice(`${variables.type === "ban" ? "Ban" : "Unban"} user complete`);
+      await queryClient.invalidateQueries({ queryKey: ["user-detail", variables.hash] });
+      await queryClient.invalidateQueries({ queryKey: ["users"] });
+      await queryClient.invalidateQueries({ queryKey: ["banned"] });
+      await queryClient.invalidateQueries({ queryKey: ["events"] });
     },
     onError: (error) => {
       setNotice(error instanceof Error ? error.message : "Action failed");
@@ -1026,7 +1418,7 @@ function Inspector(props: {
           <div class="inspector-head">
             <div>
               <span class="eyebrow">Inspector</span>
-              <h2>{event ? event.event || "Event" : data?.name || selectedPath}</h2>
+              <h2>{user ? shortValue(user.hash, 22) : event ? event.event || "Event" : data?.name || selectedPath}</h2>
             </div>
             <button type="button" onClick={props.onClose} aria-label="Close inspector">
               Close
@@ -1035,6 +1427,21 @@ function Inspector(props: {
 
           {event ? <EventSummary event={event} /> : null}
           {event ? <EventActions event={event} path={selectedPath} banIPPending={props.banIPPending} onBanIP={props.onBanIP} /> : null}
+          {user ? (
+            <UserDetailBox
+              user={user}
+              details={userDetails.data}
+              loading={userDetails.isLoading}
+              actionPending={userAction.isPending}
+              onToggleBan={(hash, banned) => {
+                if (window.confirm(`${banned ? "Unban" : "Ban"} ${hash}?`)) {
+                  userAction.mutate({ type: banned ? "unban" : "ban", hash });
+                }
+              }}
+              onInspectEvent={props.onInspectEvent}
+              onOpenPath={props.onOpenPath}
+            />
+          ) : null}
 
           {sessionID ? <SessionTimelineBox session={sessionTimeline.data} loading={sessionTimeline.isLoading} onInspectEvent={props.onInspectEvent} /> : null}
 
@@ -1097,9 +1504,9 @@ function Inspector(props: {
                   </button>
                 ) : null}
               </div>
-              {notice ? <p class="notice">{notice}</p> : null}
             </>
           ) : null}
+          {notice ? <p class="notice">{notice}</p> : null}
         </>
       )}
     </aside>
@@ -1159,6 +1566,88 @@ function EventActions(props: { event: EventRow; path: string; banIPPending: bool
         </button>
       ) : null}
     </div>
+  );
+}
+
+function UserDetailBox(props: {
+  user: UserRow;
+  details?: UserDetailPayload;
+  loading: boolean;
+  actionPending: boolean;
+  onToggleBan: (hash: string, banned: boolean) => void;
+  onInspectEvent: (event: EventRow) => void;
+  onOpenPath: (path?: string) => void;
+}) {
+  const hash = props.details?.hash || props.user.hash;
+  const stats = props.details?.stats;
+  const banned = Boolean(props.details?.is_banned ?? props.user.is_banned);
+  const files = props.details?.files ?? [];
+  const events = props.details?.events ?? [];
+  if (props.loading) {
+    return <div class="detail-box subtle">Loading user details...</div>;
+  }
+  return (
+    <>
+      <div class="event-card">
+        <div class="event-card-head">
+          <SourcePill source="sftp" />
+          <span class={banned ? "status-chip hot" : "status-chip"}>{banned ? "banned" : "active"}</span>
+        </div>
+        <dl class="metadata">
+          <Meta label="User" value={hash} />
+          <Meta label="Last Login" value={stats?.last_login || props.user.last_login} />
+          <Meta label="Last IP" value={stats?.last_address} />
+          <Meta label="Sessions" value={formatNumber(stats?.seen ?? props.user.seen)} />
+          <Meta label="Uploads" value={`${formatNumber(stats?.upload_count ?? props.user.upload_count)} / ${formatBytes(stats?.upload_bytes ?? props.user.upload_bytes)}`} />
+          <Meta
+            label="Downloads"
+            value={`${formatNumber(stats?.download_count ?? props.user.download_count)} / ${formatBytes(stats?.download_bytes ?? props.user.download_bytes)}`}
+          />
+        </dl>
+        <div class="inspector-actions event-actions">
+          <button type="button" onClick={() => props.onToggleBan(hash, banned)} disabled={props.actionPending}>
+            {banned ? "Unban User" : "Ban User"}
+          </button>
+          <a class="button-link" href={adminPath("/admin/v2/", { q: hash })}>
+            Filter User
+          </a>
+        </div>
+      </div>
+
+      <div class="session-box">
+        <div class="panel-heading">
+          <h3>User Files</h3>
+          <span>{files.length} files</span>
+        </div>
+        <div class="timeline-list">
+          {files.slice(0, 12).map((file) => (
+            <button class="timeline-row user-file-row" type="button" key={file.path || file.name} onClick={() => props.onOpenPath(file.path)}>
+              <span>{file.is_dir ? "dir" : file.size_human || formatBytes(file.size)}</span>
+              <strong>{file.name || file.path || "file"}</strong>
+              <em>{file.path || ""}</em>
+            </button>
+          ))}
+          {files.length === 0 ? <div class="empty">No files for this user.</div> : null}
+        </div>
+      </div>
+
+      <div class="session-box">
+        <div class="panel-heading">
+          <h3>User Events</h3>
+          <span>{events.length} events</span>
+        </div>
+        <div class="timeline-list">
+          {events.slice(0, 16).map((event, index) => (
+            <button class="timeline-row" type="button" key={`${event.timestamp || 0}-${index}`} onClick={() => props.onInspectEvent(eventFromUserEvent(event, hash, index))}>
+              <span>{event.time || ""}</span>
+              <strong>{event.event || "event"}</strong>
+              <em>{event.path || event.ip || ""}</em>
+            </button>
+          ))}
+          {events.length === 0 ? <div class="empty">No recent events for this user.</div> : null}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -1305,7 +1794,7 @@ function SourcePill({ source }: { source: string }) {
 }
 
 function DataPanel(props: { title: string; empty: string; children: ComponentChildren }) {
-  const hasChildren = Array.isArray(props.children) ? props.children.length > 0 : Boolean(props.children);
+  const hasChildren = hasRenderableChildren(props.children);
   return (
     <section class="data-panel">
       <div class="panel-heading">
@@ -1314,6 +1803,13 @@ function DataPanel(props: { title: string; empty: string; children: ComponentChi
       {hasChildren ? props.children : <div class="empty">{props.empty}</div>}
     </section>
   );
+}
+
+function hasRenderableChildren(children: ComponentChildren): boolean {
+  if (Array.isArray(children)) {
+    return children.some(hasRenderableChildren);
+  }
+  return children !== null && children !== undefined && children !== false;
 }
 
 function PathRow(props: { title: string; detail: string; meta: string; onClick: () => void }) {
@@ -1385,6 +1881,45 @@ function eventFromSession(session: SessionRow): EventRow {
       denied: session.denied_count ?? 0
     }
   };
+}
+
+function eventFromAuthAttempt(attempt: AuthAttemptRow): EventRow {
+  return {
+    id: attempt.id,
+    timestamp: attempt.timestamp,
+    time: attempt.time,
+    event: "auth/attempt",
+    user_id: attempt.user_id || attempt.generated_hash,
+    ip: attempt.ip,
+    session: attempt.session,
+    meta_obj: {
+      username: attempt.username || "",
+      password: attempt.password || "",
+      generated_hash: attempt.generated_hash || "",
+      source: "sftp",
+      status: "attempt"
+    }
+  };
+}
+
+function eventFromUserEvent(event: UserEventRow, hash: string, index: number): EventRow {
+  return {
+    id: Number(event.timestamp || index),
+    timestamp: event.timestamp,
+    time: event.time,
+    event: event.event,
+    user_id: hash,
+    ip: event.ip,
+    path: event.path,
+    meta: event.meta,
+    meta_obj: metaRecord({ id: 0, meta: event.meta })
+  };
+}
+
+function credentialLabel(username?: string, password?: string): string {
+  const user = username || "(empty)";
+  const pass = password || "(empty)";
+  return `${user} / ${pass}`;
 }
 
 function targetPath(target: InspectorTarget): string {
@@ -1581,6 +2116,90 @@ function topCounts(rows: EventRow[], value: (row: EventRow) => string, limit: nu
     .slice(0, limit);
 }
 
+function topCountsFromStrings(values: string[], limit: number): NamedCount[] {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const key = value.trim();
+    if (!key) {
+      continue;
+    }
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, limit);
+}
+
+function collectThumbnailCandidates(events: EventRow[], uploads: UploadRow[], downloads?: DownloadsPayload): ThumbnailCandidate[] {
+  const byPath = new Map<string, ThumbnailCandidate>();
+  const add = (candidate: ThumbnailCandidate) => {
+    const path = cleanPath(candidate.path);
+    if (!path || byPath.has(path)) {
+      return;
+    }
+    byPath.set(path, { ...candidate, path });
+  };
+
+  for (const upload of uploads) {
+    add({
+      path: upload.path || "",
+      source: "upload",
+      detail: `${upload.time || "recent"} ${shortValue(upload.user_id, 10)}`,
+      meta: formatBytes(upload.size)
+    });
+  }
+  for (const file of downloads?.files ?? []) {
+    add({
+      path: file.path,
+      source: "download",
+      detail: `${file.downloads_in_range ?? 0} in range, ${file.downloads_total ?? 0} total`,
+      meta: file.size_human || ""
+    });
+  }
+  for (const row of events) {
+    const path = targetPath({ type: "event", event: row });
+    if (!path) {
+      continue;
+    }
+    add({
+      path,
+      source: sourceFor(row),
+      detail: `${row.time || ""} ${row.event || ""}`.trim(),
+      meta: shortValue(row.user_id || row.ip, 12)
+    });
+  }
+  return Array.from(byPath.values());
+}
+
+function previewKind(preview?: PreviewPayload): string {
+  if (!preview) {
+    return "file";
+  }
+  if (preview.is_dir) {
+    return "dir";
+  }
+  if (preview.is_image) {
+    return "image";
+  }
+  if (preview.is_video) {
+    return "video";
+  }
+  if (preview.is_pdf) {
+    return "pdf";
+  }
+  if (preview.is_archive) {
+    return "archive";
+  }
+  if (preview.is_text) {
+    return "text";
+  }
+  if (preview.is_stl) {
+    return "stl";
+  }
+  return preview.ext || "file";
+}
+
 function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: InsightsPayload): string {
   if (events.length === 0) {
     return "No events recorded in the current window.";
@@ -1590,6 +2209,30 @@ function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: In
     return `${events.length} events, ${denied} denied, ${explorerEvents.length} explorer-origin.`;
   }
   return `${events.length} events, ${explorerEvents.length} explorer-origin, no denied events in view.`;
+}
+
+function securityCopy(attempts: AuthAttemptRow[], suspicious: NamedPair[], denied: number, panics: number): string {
+  if (panics > 0) {
+    return `${panics} parsed panics, ${denied} denied events, ${attempts.length} auth attempts.`;
+  }
+  if (suspicious.length > 0) {
+    return `${suspicious.length} suspicious IPs, ${denied} denied events, ${attempts.length} auth attempts.`;
+  }
+  if (attempts.length > 0) {
+    return `${attempts.length} auth attempts in view, no suspicious IPs flagged.`;
+  }
+  return "No auth attempts or high-risk signals in this window.";
+}
+
+function panicText(row: unknown): string {
+  if (typeof row === "string") {
+    return row;
+  }
+  if (row && typeof row === "object") {
+    const record = row as Record<string, unknown>;
+    return stringFromRecord(record, ["time", "timestamp", "message", "msg", "line"]) || JSON.stringify(row);
+  }
+  return String(row ?? "");
 }
 
 function sourceFor(row: EventRow): SourceFilter {
@@ -1623,6 +2266,15 @@ function valueFromMeta(row: EventRow, key: string): string {
 
 function cleanPath(path: string | undefined): string {
   return (path || "").trim().replace(/^\/+/, "");
+}
+
+function basename(path: string): string {
+  const clean = cleanPath(path);
+  if (!clean) {
+    return "";
+  }
+  const parts = clean.split("/");
+  return parts[parts.length - 1] || clean;
 }
 
 function countLive(payload?: LivePayload): number {
