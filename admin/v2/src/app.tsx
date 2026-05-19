@@ -16,6 +16,7 @@ import {
 
 type View = "overview" | "activity";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
+type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
 type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow };
 
 type EventsPayload = {
@@ -299,7 +300,13 @@ export function App() {
           )}
         </section>
 
-        <Inspector target={inspectorTarget} onClose={() => setInspectorTarget({ type: "none" })} />
+        <Inspector
+          target={inspectorTarget}
+          banIPPending={banIP.isPending}
+          onBanIP={(ip) => banIP.mutate(ip)}
+          onInspectEvent={inspectEvent}
+          onClose={() => setInspectorTarget({ type: "none" })}
+        />
       </main>
     </div>
   );
@@ -508,14 +515,93 @@ function Activity(props: {
   sourceFilter: SourceFilter;
   onInspectEvent: (event: EventRow) => void;
 }) {
+  const [kind, setKind] = useState<ActivityKind>("all");
+  const rows = useMemo(() => props.rows.filter((row) => matchesActivityKind(row, kind)), [props.rows, kind]);
+  const profile = useMemo(() => activityProfile(props.rows), [props.rows]);
+
   return (
-    <section class="wide-panel">
-      <div class="panel-heading">
-        <h2>Event Stream</h2>
-        <span>{props.loading ? "Refreshing" : `${props.rows.length} ${props.sourceFilter} rows`}</span>
+    <div class="activity-grid">
+      <section class="metric-strip activity-metrics" aria-label="Activity summary">
+        <Metric label="Rows" value={formatNumber(props.rows.length)} />
+        <Metric label="Attention" value={formatNumber(profile.attention)} tone={profile.attention > 0 ? "warn" : "normal"} />
+        <Metric label="Denied" value={formatNumber(profile.denied)} tone={profile.denied > 0 ? "warn" : "normal"} />
+        <Metric label="Transfers" value={formatNumber(profile.transfer)} />
+        <Metric label="Mutations" value={formatNumber(profile.mutating)} />
+        <Metric label="Sessions" value={formatNumber(profile.session)} />
+        <Metric label="Exec" value={formatNumber(profile.exec)} tone={profile.exec > 0 ? "warn" : "normal"} />
+      </section>
+
+      <section class="split">
+        <ActivityBreakdownPanel profile={profile} />
+        <ActorBreakdownPanel rows={props.rows} />
+      </section>
+
+      <section class="wide-panel">
+        <div class="panel-heading">
+          <h2>Event Stream</h2>
+          <span>{props.loading ? "Refreshing" : `${rows.length} of ${props.rows.length} ${props.sourceFilter} rows`}</span>
+        </div>
+        <ActivityKindTabs value={kind} onChange={setKind} />
+        <EventTable rows={rows} onInspectEvent={props.onInspectEvent} />
+      </section>
+    </div>
+  );
+}
+
+function ActivityKindTabs(props: { value: ActivityKind; onChange: (kind: ActivityKind) => void }) {
+  const options: Array<{ value: ActivityKind; label: string }> = [
+    { value: "all", label: "All" },
+    { value: "attention", label: "Attention" },
+    { value: "denied", label: "Denied" },
+    { value: "transfer", label: "Transfers" },
+    { value: "mutating", label: "Mutations" },
+    { value: "session", label: "Sessions" },
+    { value: "exec", label: "Exec" }
+  ];
+  return (
+    <div class="filter-tabs" aria-label="Activity filters">
+      {options.map((option) => (
+        <button class={props.value === option.value ? "active" : ""} type="button" key={option.value} onClick={() => props.onChange(option.value)}>
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ActivityBreakdownPanel({ profile }: { profile: ReturnType<typeof activityProfile> }) {
+  return (
+    <DataPanel title="Activity Types" empty="No activity">
+      <BarList
+        rows={[
+          { name: "Attention", count: profile.attention },
+          { name: "Denied", count: profile.denied },
+          { name: "Transfer", count: profile.transfer },
+          { name: "Mutating", count: profile.mutating },
+          { name: "Session", count: profile.session },
+          { name: "Exec", count: profile.exec }
+        ]}
+      />
+    </DataPanel>
+  );
+}
+
+function ActorBreakdownPanel({ rows }: { rows: EventRow[] }) {
+  const users = topCounts(rows, (row) => row.user_id || "anonymous", 5);
+  const ips = topCounts(rows, (row) => row.ip || "unknown", 5);
+  return (
+    <DataPanel title="Actors" empty="No actor data">
+      <div class="actor-columns">
+        <div>
+          <h3>Users</h3>
+          <BarList rows={users} />
+        </div>
+        <div>
+          <h3>IPs</h3>
+          <BarList rows={ips} />
+        </div>
       </div>
-      <EventTable rows={props.rows} onInspectEvent={props.onInspectEvent} />
-    </section>
+    </DataPanel>
   );
 }
 
@@ -529,6 +615,7 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
       <div class="event-head" role="row">
         <span>Time</span>
         <span>Source</span>
+        <span>Event</span>
         <span>Status</span>
         <span>Path</span>
         <span>User</span>
@@ -536,7 +623,7 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
         <span>Session</span>
       </div>
       {props.rows.map((row) => {
-        const rowPath = row.path || valueFromMeta(row, "path");
+        const rowPath = targetPath({ type: "event", event: row });
         return (
           <button
             class="event-row"
@@ -549,7 +636,10 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
             <span>
               <SourcePill source={sourceFor(row)} />
             </span>
-            <span>{statusFor(row)}</span>
+            <span class="event-name">{row.event || ""}</span>
+            <span>
+              <span class={statusClass(row)}>{statusFor(row)}</span>
+            </span>
             <span class="path-cell">{rowPath}</span>
             <span>{shortValue(row.user_id)}</span>
             <span>{row.ip || ""}</span>
@@ -834,7 +924,13 @@ function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[];
   );
 }
 
-function Inspector(props: { target: InspectorTarget; onClose: () => void }) {
+function Inspector(props: {
+  target: InspectorTarget;
+  banIPPending: boolean;
+  onBanIP: (ip: string) => void;
+  onInspectEvent: (event: EventRow) => void;
+  onClose: () => void;
+}) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState("");
   const event = props.target.type === "event" ? props.target.event : undefined;
@@ -938,8 +1034,9 @@ function Inspector(props: { target: InspectorTarget; onClose: () => void }) {
           </div>
 
           {event ? <EventSummary event={event} /> : null}
+          {event ? <EventActions event={event} path={selectedPath} banIPPending={props.banIPPending} onBanIP={props.onBanIP} /> : null}
 
-          {sessionID ? <SessionTimelineBox session={sessionTimeline.data} loading={sessionTimeline.isLoading} /> : null}
+          {sessionID ? <SessionTimelineBox session={sessionTimeline.data} loading={sessionTimeline.isLoading} onInspectEvent={props.onInspectEvent} /> : null}
 
           {selectedPath ? (
             <>
@@ -1038,6 +1135,33 @@ function EventSummary({ event }: { event: EventRow }) {
   );
 }
 
+function EventActions(props: { event: EventRow; path: string; banIPPending: boolean; onBanIP: (ip: string) => void }) {
+  const session = eventSession(props.event);
+  const ip = props.event.ip || metaString(props.event, ["ip", "ip_address", "remote_addr"]);
+  if (!props.path && !ip && !session) {
+    return null;
+  }
+  return (
+    <div class="inspector-actions event-actions">
+      {props.path ? (
+        <a class="button-link" href={explorerURL(props.path)}>
+          Open Explorer
+        </a>
+      ) : null}
+      {session ? (
+        <a class="button-link" href={adminPath("/admin/v2/", { q: session })}>
+          Filter Session
+        </a>
+      ) : null}
+      {ip ? (
+        <button type="button" onClick={() => props.onBanIP(ip)} disabled={props.banIPPending}>
+          Ban IP
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 function EventMetaBlock({ event }: { event: EventRow }) {
   const metaObject = event.meta_obj && Object.keys(event.meta_obj).length > 0 ? event.meta_obj : null;
   const text = metaObject ? JSON.stringify(metaObject, null, 2) : event.meta || "";
@@ -1054,7 +1178,7 @@ function EventMetaBlock({ event }: { event: EventRow }) {
   );
 }
 
-function SessionTimelineBox({ session, loading }: { session?: SessionTimelinePayload; loading: boolean }) {
+function SessionTimelineBox({ session, loading, onInspectEvent }: { session?: SessionTimelinePayload; loading: boolean; onInspectEvent: (event: EventRow) => void }) {
   const rows = session?.events ?? [];
   if (loading) {
     return <div class="detail-box subtle">Loading session timeline...</div>;
@@ -1077,11 +1201,11 @@ function SessionTimelineBox({ session, loading }: { session?: SessionTimelinePay
       </dl>
       <div class="timeline-list">
         {rows.slice(0, 16).map((row) => (
-          <div class="timeline-row" key={row.id}>
+          <button class="timeline-row" type="button" key={row.id} onClick={() => onInspectEvent({ ...row, session: session.session })}>
             <span>{row.time || ""}</span>
             <strong>{row.event || "event"}</strong>
             <em>{targetPath({ type: "event", event: row }) || statusFor(row)}</em>
-          </div>
+          </button>
         ))}
       </div>
     </div>
@@ -1373,6 +1497,90 @@ function eventBuckets(rows: EventRow[], size: number): number[] {
   return buckets;
 }
 
+function activityProfile(rows: EventRow[]) {
+  return {
+    total: rows.length,
+    attention: rows.filter(isAttentionEvent).length,
+    denied: rows.filter(isDeniedEvent).length,
+    transfer: rows.filter(isTransferEvent).length,
+    mutating: rows.filter(isMutatingEvent).length,
+    session: rows.filter(isSessionEvent).length,
+    exec: rows.filter(isExecEvent).length
+  };
+}
+
+function matchesActivityKind(row: EventRow, kind: ActivityKind): boolean {
+  switch (kind) {
+    case "attention":
+      return isAttentionEvent(row);
+    case "denied":
+      return isDeniedEvent(row);
+    case "transfer":
+      return isTransferEvent(row);
+    case "mutating":
+      return isMutatingEvent(row);
+    case "session":
+      return isSessionEvent(row);
+    case "exec":
+      return isExecEvent(row);
+    case "all":
+    default:
+      return true;
+  }
+}
+
+function rawStatus(row: EventRow): string {
+  return valueFromMeta(row, "status") || valueFromMeta(row, "result");
+}
+
+function eventText(row: EventRow): string {
+  return `${row.event || ""} ${rawStatus(row)} ${metaString(row, ["action", "operation", "error", "err", "message", "command", "cmd", "exec"])}`.toLowerCase();
+}
+
+function isAttentionEvent(row: EventRow): boolean {
+  const text = eventText(row);
+  return text.includes("fail") || text.includes("error") || text.includes("denied") || text.includes("panic") || text.includes("bad");
+}
+
+function isDeniedEvent(row: EventRow): boolean {
+  return eventText(row).includes("denied");
+}
+
+function isTransferEvent(row: EventRow): boolean {
+  const name = (row.event || "").toLowerCase();
+  return name === "upload" || name === "download" || name.includes("upload") || name.includes("download");
+}
+
+function isMutatingEvent(row: EventRow): boolean {
+  const text = eventText(row);
+  return eventIsDelete(row) || text.includes("rename") || text.includes("ban") || text.includes("mark-bad") || text.includes("move") || text.includes("write");
+}
+
+function isSessionEvent(row: EventRow): boolean {
+  const name = (row.event || "").toLowerCase();
+  return name.startsWith("session") || name.includes("session/");
+}
+
+function isExecEvent(row: EventRow): boolean {
+  const text = eventText(row);
+  return text.includes("exec") || text.includes("command") || eventCommand(row) !== "";
+}
+
+function topCounts(rows: EventRow[], value: (row: EventRow) => string, limit: number): NamedCount[] {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const key = value(row).trim();
+    if (!key) {
+      continue;
+    }
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, limit);
+}
+
 function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: InsightsPayload): string {
   if (events.length === 0) {
     return "No events recorded in the current window.";
@@ -1399,7 +1607,7 @@ function sourceFor(row: EventRow): SourceFilter {
 }
 
 function statusFor(row: EventRow): string {
-  return valueFromMeta(row, "status") || valueFromMeta(row, "result") || row.event || "";
+  return rawStatus(row) || (isAttentionEvent(row) ? "attention" : "ok");
 }
 
 function valueFromMeta(row: EventRow, key: string): string {
@@ -1535,6 +1743,14 @@ function adminPath(path: string, params: Record<string, string | number | undefi
   }
   const query = q.toString();
   return query ? `${path}?${query}` : path;
+}
+
+function explorerURL(path: string): string {
+  const clean = cleanPath(path);
+  if (!clean) {
+    return "/admin/explorer/";
+  }
+  return `/admin/explorer/${clean.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function readURLParam(key: string): string {

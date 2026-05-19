@@ -213,6 +213,11 @@ select {
   gap: 16px;
 }
 
+.activity-grid {
+  display: grid;
+  gap: 16px;
+}
+
 .metric-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -560,6 +565,39 @@ select {
   color: var(--ink);
 }
 
+.filter-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.filter-tabs button {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.filter-tabs button.active {
+  border-color: var(--accent-line);
+  background: color-mix(in srgb, var(--accent-soft), #0b1116 34%);
+  color: var(--accent-strong);
+}
+
+.actor-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.actor-columns h3 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
 .path-row,
 .event-row,
 .dense-row {
@@ -611,7 +649,7 @@ select {
 .event-head,
 .event-row {
   display: grid;
-  grid-template-columns: 135px 86px 122px minmax(160px, 1.2fr) minmax(84px, 0.7fr) 112px minmax(100px, 0.85fr);
+  grid-template-columns: 132px 80px 130px 92px minmax(160px, 1.2fr) minmax(82px, 0.62fr) 108px minmax(96px, 0.78fr);
   gap: 8px;
   align-items: center;
 }
@@ -632,6 +670,12 @@ select {
 
 .event-row:disabled {
   opacity: 1;
+}
+
+.event-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 button.dense-row {
@@ -853,6 +897,8 @@ button.dense-row {
   background: #0d141a;
   font-family: var(--mono);
   font-size: 12px;
+  color: var(--ink);
+  text-align: left;
 }
 
 .timeline-row span,
@@ -881,6 +927,10 @@ button.dense-row {
 
 .inspector-actions {
   margin-top: 14px;
+}
+
+.event-actions {
+  margin: -2px 0 12px;
 }
 
 .notice {
@@ -935,6 +985,10 @@ button.dense-row {
 
   .bar-row,
   .timeline-row {
+    grid-template-columns: 1fr;
+  }
+
+  .actor-columns {
     grid-template-columns: 1fr;
   }
 
