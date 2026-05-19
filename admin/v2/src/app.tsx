@@ -22,8 +22,10 @@ type ThumbnailKind = "image" | "video" | "pdf" | "archive" | "text" | "model" | 
 type ThumbnailFilter = "all" | "visual" | ThumbnailKind;
 type ThumbnailSort = "recent" | "kind" | "source" | "name";
 type ThumbnailSize = "compact" | "normal" | "large";
+type ThumbnailMode = "grid" | "list";
 type UserFilter = "all" | "active" | "uploaders" | "downloaders" | "banned" | "quiet";
 type UserSort = "activity" | "uploads" | "downloads" | "sessions" | "last_login";
+type InsightRow = { label: string; value?: string };
 
 type EventsPayload = {
   events?: EventRow[];
@@ -199,22 +201,28 @@ const rangeOptions = ["15m", "1h", "6h", "24h", "48h", "7d", "30d", "all"];
 export function App() {
   const queryClient = useQueryClient();
   const initialHueParam = hasHueParam();
-  const [view, setView] = useState<View>("overview");
+  const [view, setView] = useState<View>(parseViewParam());
   const [inspectorTarget, setInspectorTarget] = useState<InspectorTarget>({ type: "none" });
   const [range, setRange] = useState(readURLParam("range") || "24h");
   const [query, setQuery] = useState(readURLParam("q"));
-  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>(parseSourceParam());
   const [hue, setHue] = useState(parseHueParam());
   const [hueInURL, setHueInURL] = useState(initialHueParam);
 
   useEffect(() => {
     document.documentElement.style.setProperty("--hue", String(hue));
+    const params = {
+      view: view === "overview" ? "" : view,
+      range: range === "24h" ? "" : range,
+      q: query,
+      source: sourceFilter === "all" ? "" : sourceFilter
+    };
     if (hueInURL) {
-      replaceURLParams({ hue: String(hue), range: range === "24h" ? "" : range, q: query });
+      replaceURLParams({ ...params, hue: String(hue) });
     } else {
-      replaceURLParams({ range: range === "24h" ? "" : range, q: query });
+      replaceURLParams(params);
     }
-  }, [hue, hueInURL, query, range]);
+  }, [hue, hueInURL, query, range, sourceFilter, view]);
 
   const summary = useQuery({
     queryKey: ["summary"],
@@ -421,6 +429,7 @@ export function App() {
           banIPPending={banIP.isPending}
           onBanIP={(ip) => banIP.mutate(ip)}
           onInspectEvent={inspectEvent}
+          onInspectUser={inspectUser}
           onOpenPath={openInspector}
           onClose={() => setInspectorTarget({ type: "none" })}
         />
@@ -685,23 +694,53 @@ function ThumbnailView(props: {
   const [kindFilter, setKindFilter] = useState<ThumbnailFilter>("visual");
   const [sort, setSort] = useState<ThumbnailSort>("recent");
   const [size, setSize] = useState<ThumbnailSize>("normal");
+  const [mode, setMode] = useState<ThumbnailMode>("grid");
+  const [folder, setFolder] = useState("all");
+  const [localQuery, setLocalQuery] = useState("");
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const rawCandidates = useMemo(
     () => collectThumbnailCandidates(props.eventRows, props.uploads, props.downloads),
     [props.downloads, props.eventRows, props.uploads]
   );
-  const candidates = useMemo(() => sortThumbnailCandidates(filterThumbnailCandidates(rawCandidates, kindFilter), sort).slice(0, 72), [kindFilter, rawCandidates, sort]);
+  const scopedCandidates = useMemo(
+    () => filterThumbnailSearch(filterThumbnailFolder(filterThumbnailCandidates(rawCandidates, kindFilter), folder), localQuery),
+    [folder, kindFilter, localQuery, rawCandidates]
+  );
+  const candidates = useMemo(() => sortThumbnailCandidates(scopedCandidates, sort).slice(0, mode === "list" ? 120 : 72), [mode, scopedCandidates, sort]);
   const sourceCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.source), 6);
   const kindCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.kind), 8);
+  const folderCounts = useMemo(() => thumbnailFolders(rawCandidates, 12), [rawCandidates]);
+  const selectedSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
+
+  function toggleSelected(path: string) {
+    setSelectedPaths((current) => (current.includes(path) ? current.filter((item) => item !== path) : [...current, path]));
+  }
+
+  function clearSelected() {
+    setSelectedPaths([]);
+  }
+
+  async function copySelected() {
+    if (selectedPaths.length === 0) {
+      return;
+    }
+    await navigator.clipboard.writeText(selectedPaths.join("\n"));
+  }
+
   return (
     <div class="activity-grid">
       <section class="insights-band">
         <div>
-          <h2>Thumbnail Wall</h2>
-          <p>{props.loading ? "Loading candidate paths..." : `${candidates.length} visible of ${rawCandidates.length} recent paths from uploads, downloads, and events.`}</p>
+          <h2>Explorer Gallery</h2>
+          <p>
+            {props.loading
+              ? "Loading candidate paths..."
+              : `${candidates.length} visible of ${rawCandidates.length} recent paths, scoped to ${folder === "all" ? "all folders" : folder}.`}
+          </p>
         </div>
         <div class="release">
-          <span>Tile Size</span>
-          <strong>{size}</strong>
+          <span>Selected</span>
+          <strong>{selectedPaths.length}</strong>
         </div>
       </section>
 
@@ -714,16 +753,39 @@ function ThumbnailView(props: {
         </DataPanel>
       </section>
 
+      <section class="split gallery-browser">
+        <ThumbnailFolders folders={folderCounts} total={rawCandidates.length} active={folder} onSelect={setFolder} />
+        <ThumbnailSelection paths={selectedPaths} onCopy={copySelected} onClear={clearSelected} />
+      </section>
+
       <section class="wide-panel">
         <div class="panel-heading">
-          <h2>Thumbnails</h2>
-          <span>{props.loading ? "Refreshing" : `${candidates.length} tiles`}</span>
+          <h2>Gallery</h2>
+          <span>{props.loading ? "Refreshing" : `${candidates.length} of ${scopedCandidates.length} matches`}</span>
         </div>
-        <ThumbnailControls filter={kindFilter} sort={sort} size={size} onFilter={setKindFilter} onSort={setSort} onSize={setSize} />
+        <ThumbnailControls
+          filter={kindFilter}
+          sort={sort}
+          size={size}
+          mode={mode}
+          query={localQuery}
+          onFilter={setKindFilter}
+          onSort={setSort}
+          onSize={setSize}
+          onMode={setMode}
+          onQuery={setLocalQuery}
+        />
         {candidates.length > 0 ? (
-          <div class={`thumbnail-grid ${size}`}>
+          <div class={`thumbnail-grid ${size} ${mode}`}>
             {candidates.map((candidate) => (
-              <ThumbnailCard key={candidate.path} candidate={candidate} onOpenPath={props.onOpenPath} />
+              <ThumbnailCard
+                key={candidate.path}
+                candidate={candidate}
+                selected={selectedSet.has(candidate.path)}
+                mode={mode}
+                onOpenPath={props.onOpenPath}
+                onToggleSelected={toggleSelected}
+              />
             ))}
           </div>
         ) : (
@@ -738,9 +800,13 @@ function ThumbnailControls(props: {
   filter: ThumbnailFilter;
   sort: ThumbnailSort;
   size: ThumbnailSize;
+  mode: ThumbnailMode;
+  query: string;
   onFilter: (filter: ThumbnailFilter) => void;
   onSort: (sort: ThumbnailSort) => void;
   onSize: (size: ThumbnailSize) => void;
+  onMode: (mode: ThumbnailMode) => void;
+  onQuery: (query: string) => void;
 }) {
   const filters: Array<{ value: ThumbnailFilter; label: string }> = [
     { value: "visual", label: "Visual" },
@@ -762,7 +828,11 @@ function ThumbnailControls(props: {
           </button>
         ))}
       </div>
-      <div class="control-pair">
+      <div class="control-pair gallery-control-pair">
+        <label class="control">
+          <span>Find</span>
+          <input value={props.query} placeholder="filter paths" onInput={(event) => props.onQuery((event.currentTarget as HTMLInputElement).value)} />
+        </label>
         <label class="control">
           <span>Sort</span>
           <select value={props.sort} onInput={(event) => props.onSort((event.currentTarget as HTMLSelectElement).value as ThumbnailSort)}>
@@ -780,15 +850,78 @@ function ThumbnailControls(props: {
             <option value="large">Large</option>
           </select>
         </label>
+        <label class="control">
+          <span>Mode</span>
+          <select value={props.mode} onInput={(event) => props.onMode((event.currentTarget as HTMLSelectElement).value as ThumbnailMode)}>
+            <option value="grid">Grid</option>
+            <option value="list">List</option>
+          </select>
+        </label>
       </div>
     </div>
   );
 }
 
-function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidate; onOpenPath: (path?: string) => void }) {
+function ThumbnailFolders(props: { folders: NamedCount[]; total: number; active: string; onSelect: (folder: string) => void }) {
+  return (
+    <DataPanel title="Folders" empty="No folders in this window">
+      <button class={`dense-row folder-row ${props.active === "all" ? "active" : ""}`} type="button" onClick={() => props.onSelect("all")}>
+        <div>
+          <strong>All folders</strong>
+          <small>Everything in the current activity window</small>
+        </div>
+        <span>{formatNumber(props.total)}</span>
+      </button>
+      {props.folders.map((row) => (
+        <button class={`dense-row folder-row ${props.active === row.name ? "active" : ""}`} type="button" key={row.name} onClick={() => props.onSelect(row.name)}>
+          <div>
+            <strong>{row.name}</strong>
+            <small>{row.name === "/" ? "archive root" : `/${row.name}`}</small>
+          </div>
+          <span>{formatNumber(row.count)}</span>
+        </button>
+      ))}
+    </DataPanel>
+  );
+}
+
+function ThumbnailSelection(props: { paths: string[]; onCopy: () => void; onClear: () => void }) {
+  return (
+    <DataPanel title="Selection" empty="No selected paths">
+      {props.paths.length > 0 ? (
+        <>
+          <div class="selection-actions">
+            <button type="button" onClick={props.onCopy}>
+              Copy Paths
+            </button>
+            <button type="button" onClick={props.onClear}>
+              Clear
+            </button>
+          </div>
+          <div class="selection-list">
+            {props.paths.slice(0, 8).map((path) => (
+              <a href={explorerURL(path)} key={path}>
+                {path}
+              </a>
+            ))}
+            {props.paths.length > 8 ? <small>{props.paths.length - 8} more selected</small> : null}
+          </div>
+        </>
+      ) : null}
+    </DataPanel>
+  );
+}
+
+function ThumbnailCard(props: {
+  candidate: ThumbnailCandidate;
+  selected: boolean;
+  mode: ThumbnailMode;
+  onOpenPath: (path?: string) => void;
+  onToggleSelected: (path: string) => void;
+}) {
   const preview = useQuery({
-    queryKey: ["thumbnail-card-preview", candidate.path],
-    queryFn: () => api<PreviewPayload>(previewURL(candidate.path)),
+    queryKey: ["thumbnail-card-preview", props.candidate.path],
+    queryFn: () => api<PreviewPayload>(previewURL(props.candidate.path)),
     staleTime: 60_000
   });
   const thumb = useQuery({
@@ -798,10 +931,10 @@ function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidat
     staleTime: 60_000
   });
   const data = preview.data;
-  const label = data?.name || basename(candidate.path);
+  const label = data?.name || basename(props.candidate.path);
   return (
-    <button class="thumbnail-card" type="button" onClick={() => onOpenPath(candidate.path)}>
-      <span class="thumbnail-frame">
+    <article class={`thumbnail-card ${props.selected ? "selected" : ""} ${props.mode}`}>
+      <button class="thumbnail-frame" type="button" onClick={() => props.onOpenPath(props.candidate.path)} aria-label={`Inspect ${label}`}>
         {thumb.data ? (
           <img src={thumb.data} alt={label} />
         ) : (
@@ -809,16 +942,34 @@ function ThumbnailCard({ candidate, onOpenPath }: { candidate: ThumbnailCandidat
             {preview.isLoading ? "loading" : preview.isError ? "unavailable" : previewKind(data)}
           </span>
         )}
-      </span>
+      </button>
       <span class="thumbnail-body">
         <strong>{label}</strong>
-        <small>{candidate.detail}</small>
+        <small>{props.candidate.path}</small>
         <em>
-          <SourcePill source={candidate.source} />
-          <span>{candidate.kind}{candidate.meta ? ` / ${candidate.meta}` : ""}</span>
+          <SourcePill source={props.candidate.source} />
+          <span>{props.candidate.kind}{props.candidate.meta ? ` / ${props.candidate.meta}` : ""}</span>
         </em>
+        <span class="thumbnail-meta-line">{thumbnailMetaLine(data, props.candidate.detail)}</span>
+        <span class="thumbnail-meta-line">{thumbnailDetailLine(data)}</span>
       </span>
-    </button>
+      <span class="thumbnail-actions">
+        <button type="button" class={props.selected ? "active" : ""} onClick={() => props.onToggleSelected(props.candidate.path)}>
+          {props.selected ? "Selected" : "Select"}
+        </button>
+        <button type="button" onClick={() => props.onOpenPath(props.candidate.path)}>
+          Inspect
+        </button>
+        <a class="button-link" href={explorerURL(props.candidate.path)}>
+          Explorer
+        </a>
+        {data?.download_url ? (
+          <a class="button-link" href={data.download_url}>
+            Download
+          </a>
+        ) : null}
+      </span>
+    </article>
   );
 }
 
@@ -1275,7 +1426,7 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
               <span class={statusClass(row)}>{statusFor(row)}</span>
             </span>
             <span class="path-cell">{rowPath}</span>
-            <span>{shortValue(row.user_id)}</span>
+            <span>{shortValue(eventUser(row))}</span>
             <span>{row.ip || ""}</span>
             <span class="truncate">{row.session || ""}</span>
           </button>
@@ -1563,6 +1714,7 @@ function Inspector(props: {
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
   onInspectEvent: (event: EventRow) => void;
+  onInspectUser: (user: UserRow) => void;
   onOpenPath: (path?: string) => void;
   onClose: () => void;
 }) {
@@ -1691,7 +1843,16 @@ function Inspector(props: {
           </div>
 
           {event ? <EventSummary event={event} /> : null}
-          {event ? <EventActions event={event} path={selectedPath} banIPPending={props.banIPPending} onBanIP={props.onBanIP} /> : null}
+          {event ? (
+            <EventActions
+              event={event}
+              path={selectedPath}
+              banIPPending={props.banIPPending}
+              onBanIP={props.onBanIP}
+              onInspectUser={props.onInspectUser}
+              onNotice={setNotice}
+            />
+          ) : null}
           {user ? (
             <UserDetailBox
               user={user}
@@ -1752,6 +1913,11 @@ function Inspector(props: {
                     Download
                   </a>
                 ) : null}
+                {data.owner ? (
+                  <button type="button" onClick={() => props.onInspectUser({ hash: data.owner || "" })}>
+                    Inspect Owner
+                  </button>
+                ) : null}
                 <button type="button" onClick={rename} disabled={action.isPending}>
                   Rename
                 </button>
@@ -1781,6 +1947,7 @@ function Inspector(props: {
 function EventSummary({ event }: { event: EventRow }) {
   const path = targetPath({ type: "event", event });
   const session = eventSession(event);
+  const user = eventUser(event);
   const command = eventCommand(event);
   const target = metaString(event, ["target", "new_path", "old_path", "name", "file"]);
   const error = metaString(event, ["error", "err", "message"]);
@@ -1796,22 +1963,59 @@ function EventSummary({ event }: { event: EventRow }) {
         <Meta label="Path" value={path} />
         <Meta label="Target" value={target} />
         <Meta label="Command" value={command} />
-        <Meta label="User" value={event.user_id} />
+        <Meta label="User" value={user} />
         <Meta label="IP" value={event.ip} />
         <Meta label="Session" value={session} />
         <Meta label="Error" value={error} />
       </dl>
+      <EventInsightBox event={event} />
       {eventIsDelete(event) ? <div class="detail-box subtle">Delete events often point at a path that no longer exists; keep the metadata as the record of what happened.</div> : null}
       <EventMetaBlock event={event} />
     </div>
   );
 }
 
-function EventActions(props: { event: EventRow; path: string; banIPPending: boolean; onBanIP: (ip: string) => void }) {
-  const session = eventSession(props.event);
-  const ip = props.event.ip || metaString(props.event, ["ip", "ip_address", "remote_addr"]);
-  if (!props.path && !ip && !session) {
+function EventInsightBox({ event }: { event: EventRow }) {
+  const insight = eventInsight(event);
+  if (!insight) {
     return null;
+  }
+  return (
+    <div class={`event-insight ${insight.tone === "warn" ? "warn" : ""}`}>
+      <div class="panel-heading">
+        <h3>{insight.title}</h3>
+        <span>{insight.label}</span>
+      </div>
+      <dl class="metadata compact-meta">
+        {insight.rows.map((row) => (
+          <Meta label={row.label} value={row.value} key={row.label} />
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function EventActions(props: {
+  event: EventRow;
+  path: string;
+  banIPPending: boolean;
+  onBanIP: (ip: string) => void;
+  onInspectUser: (user: UserRow) => void;
+  onNotice: (notice: string) => void;
+}) {
+  const session = eventSession(props.event);
+  const user = eventUser(props.event);
+  const ip = props.event.ip || metaString(props.event, ["ip", "ip_address", "remote_addr"]);
+  if (!props.path && !ip && !session && !user) {
+    return null;
+  }
+  async function copyEvent() {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(eventCopyPayload(props.event), null, 2));
+      props.onNotice("Event JSON copied");
+    } catch {
+      props.onNotice("Unable to copy event JSON");
+    }
   }
   return (
     <div class="inspector-actions event-actions">
@@ -1820,9 +2024,24 @@ function EventActions(props: { event: EventRow; path: string; banIPPending: bool
           Open Explorer
         </a>
       ) : null}
+      {user ? (
+        <button type="button" onClick={() => props.onInspectUser({ hash: user })}>
+          Inspect User
+        </button>
+      ) : null}
+      {user ? (
+        <a class="button-link" href={adminPath("/admin/v2/", { view: "users", q: user })}>
+          Filter User
+        </a>
+      ) : null}
       {session ? (
-        <a class="button-link" href={adminPath("/admin/v2/", { q: session })}>
+        <a class="button-link" href={adminPath("/admin/v2/", { view: "activity", q: session })}>
           Filter Session
+        </a>
+      ) : null}
+      {ip ? (
+        <a class="button-link" href={adminPath("/admin/v2/", { view: "security", q: ip })}>
+          Filter IP
         </a>
       ) : null}
       {ip ? (
@@ -1830,6 +2049,9 @@ function EventActions(props: { event: EventRow; path: string; banIPPending: bool
           Ban IP
         </button>
       ) : null}
+      <button type="button" onClick={copyEvent}>
+        Copy JSON
+      </button>
     </div>
   );
 }
@@ -2181,6 +2403,18 @@ function eventFromUserEvent(event: UserEventRow, hash: string, index: number): E
   };
 }
 
+function eventCopyPayload(event: EventRow): Record<string, unknown> {
+  return {
+    ...event,
+    source: sourceFor(event),
+    status: statusFor(event),
+    path: targetPath({ type: "event", event }),
+    user_id: eventUser(event),
+    session: eventSession(event),
+    meta_obj: metaRecord(event)
+  };
+}
+
 function credentialLabel(username?: string, password?: string): string {
   const user = username || "(empty)";
   const pass = password || "(empty)";
@@ -2204,8 +2438,98 @@ function eventSession(event?: EventRow): string {
   return event.session || metaString(event, ["session", "session_id", "user_session"]);
 }
 
+function eventUser(event?: EventRow): string {
+  if (!event) {
+    return "";
+  }
+  return event.user_id || metaString(event, ["user", "user_id", "owner", "owner_hash", "generated_hash"]);
+}
+
 function eventCommand(event: EventRow): string {
   return metaString(event, ["command", "cmd", "exec", "argv", "args"]);
+}
+
+function eventInsight(event: EventRow): { title: string; label: string; tone?: "warn"; rows: InsightRow[] } | null {
+  const path = targetPath({ type: "event", event });
+  const user = eventUser(event);
+  const session = eventSession(event);
+  const status = statusFor(event);
+  const error = metaString(event, ["error", "err", "message"]);
+  if (eventIsDelete(event)) {
+    return {
+      title: "Delete Context",
+      label: "mutation",
+      tone: "warn",
+      rows: [
+        { label: "Deleted Path", value: path },
+        { label: "Target", value: metaString(event, ["target", "old_path", "new_path", "file"]) },
+        { label: "Actor", value: user },
+        { label: "Session", value: session },
+        { label: "Status", value: status },
+        { label: "Error", value: error }
+      ]
+    };
+  }
+  if (isExecEvent(event)) {
+    return {
+      title: "Exec Context",
+      label: "command",
+      tone: "warn",
+      rows: [
+        { label: "Command", value: eventCommand(event) },
+        { label: "Actor", value: user },
+        { label: "IP", value: event.ip || metaString(event, ["ip", "remote_addr"]) },
+        { label: "Session", value: session },
+        { label: "Status", value: status },
+        { label: "Error", value: error }
+      ]
+    };
+  }
+  if (isSessionEvent(event)) {
+    return {
+      title: "Session Context",
+      label: "timeline",
+      rows: [
+        { label: "Session", value: session },
+        { label: "Actor", value: user },
+        { label: "IP", value: event.ip || metaString(event, ["ip", "remote_addr"]) },
+        { label: "Started", value: metaString(event, ["start_time", "started_at"]) || event.time },
+        { label: "Ended", value: metaString(event, ["end_time", "ended_at"]) },
+        { label: "Duration", value: metaString(event, ["duration", "duration_sec"]) },
+        { label: "Events", value: metaString(event, ["event_count", "events"]) }
+      ]
+    };
+  }
+  if ((event.event || "").toLowerCase().includes("auth")) {
+    return {
+      title: "Auth Context",
+      label: "identity",
+      tone: "warn",
+      rows: [
+        { label: "Username", value: metaString(event, ["username", "login"]) },
+        { label: "Password", value: metaString(event, ["password"]) },
+        { label: "Generated Hash", value: metaString(event, ["generated_hash"]) || user },
+        { label: "IP", value: event.ip || metaString(event, ["ip", "remote_addr"]) },
+        { label: "Session", value: session },
+        { label: "Status", value: status }
+      ]
+    };
+  }
+  if (isTransferEvent(event)) {
+    return {
+      title: "Transfer Context",
+      label: "file",
+      rows: [
+        { label: "Path", value: path },
+        { label: "Actor", value: user },
+        { label: "IP", value: event.ip || metaString(event, ["ip", "remote_addr"]) },
+        { label: "Session", value: session },
+        { label: "Bytes", value: metaString(event, ["size", "bytes", "delta", "upload_bytes", "download_bytes"]) },
+        { label: "Status", value: status }
+      ]
+    };
+  }
+  return null;
 }
 
 function eventIsDelete(event: EventRow): boolean {
@@ -2564,6 +2888,71 @@ function sortThumbnailCandidates(candidates: ThumbnailCandidate[], sort: Thumbna
   });
 }
 
+function filterThumbnailFolder(candidates: ThumbnailCandidate[], folder: string): ThumbnailCandidate[] {
+  if (folder === "all") {
+    return candidates;
+  }
+  return candidates.filter((candidate) => folderForPath(candidate.path) === folder);
+}
+
+function filterThumbnailSearch(candidates: ThumbnailCandidate[], query: string): ThumbnailCandidate[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) {
+    return candidates;
+  }
+  return candidates.filter((candidate) =>
+    `${candidate.path} ${candidate.detail} ${candidate.meta || ""} ${candidate.source} ${candidate.kind}`.toLowerCase().includes(needle)
+  );
+}
+
+function thumbnailFolders(candidates: ThumbnailCandidate[], limit: number): NamedCount[] {
+  return topCountsFromStrings(candidates.map((candidate) => folderForPath(candidate.path)), limit);
+}
+
+function folderForPath(path: string): string {
+  const clean = cleanPath(path);
+  if (!clean || !clean.includes("/")) {
+    return "/";
+  }
+  return clean.slice(0, clean.lastIndexOf("/")) || "/";
+}
+
+function thumbnailMetaLine(preview: PreviewPayload | undefined, fallback: string): string {
+  if (!preview) {
+    return fallback;
+  }
+  const parts = [preview.size || preview.total_size || "", preview.owner ? `owner ${shortValue(preview.owner, 12)}` : "", `${formatNumber(preview.downloads)} downloads`].filter(Boolean);
+  return parts.join(" / ") || fallback;
+}
+
+function thumbnailDetailLine(preview: PreviewPayload | undefined): string {
+  if (!preview) {
+    return "";
+  }
+  if (preview.is_image && preview.image_width && preview.image_height) {
+    return `${preview.image_width} x ${preview.image_height} ${preview.image_mode || ""}`.trim();
+  }
+  if (preview.is_video) {
+    return preview.video_native ? "native video preview" : "video file";
+  }
+  if (preview.is_pdf) {
+    return `${formatNumber(preview.pdf_page_count)} PDF pages`;
+  }
+  if (preview.is_archive) {
+    return `${formatNumber(preview.archive_entries?.length)} archive entries`;
+  }
+  if (preview.is_text) {
+    return `${formatNumber(preview.text_line_count)} lines / ${formatNumber(preview.text_word_count)} words`;
+  }
+  if (preview.is_stl) {
+    return `${formatNumber(preview.stl_triangles)} STL triangles`;
+  }
+  if (preview.is_dir) {
+    return `${formatNumber(preview.child_dirs)} dirs / ${formatNumber(preview.child_files)} files`;
+  }
+  return preview.mod_time || "";
+}
+
 function thumbnailKindForPath(path: string): ThumbnailKind {
   const clean = cleanPath(path).toLowerCase();
   if (!clean) {
@@ -2829,6 +3218,22 @@ function explorerURL(path: string): string {
 
 function readURLParam(key: string): string {
   return new URLSearchParams(window.location.search).get(key)?.trim() || "";
+}
+
+function parseViewParam(): View {
+  const value = readURLParam("view");
+  if (value === "activity" || value === "thumbnails" || value === "users" || value === "security") {
+    return value;
+  }
+  return "overview";
+}
+
+function parseSourceParam(): SourceFilter {
+  const value = readURLParam("source");
+  if (value === "sftp" || value === "admin" || value === "explorer") {
+    return value;
+  }
+  return "all";
 }
 
 function hasHueParam(): boolean {
