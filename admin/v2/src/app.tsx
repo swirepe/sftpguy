@@ -18,12 +18,21 @@ type View = "overview" | "activity" | "thumbnails" | "users" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
 type ActorType = "ip" | "user";
+type LiveTargetKind = "connection" | "session" | "transfer" | "request";
+type MetricTarget = {
+  title: string;
+  value: string;
+  summary?: string;
+  rows: InsightRow[];
+};
 type InspectorTarget =
   | { type: "none" }
   | { type: "path"; path: string }
   | { type: "event"; event: EventRow }
   | { type: "user"; user: UserRow }
-  | { type: "actor"; actorType: ActorType; value: string };
+  | { type: "actor"; actorType: ActorType; value: string }
+  | { type: "live"; liveType: LiveTargetKind; row: Record<string, unknown> }
+  | { type: "metric"; metric: MetricTarget };
 type ThumbnailKind = "image" | "video" | "pdf" | "archive" | "text" | "model" | "directory" | "other";
 type ThumbnailFilter = "all" | "visual" | ThumbnailKind;
 type ThumbnailSort = "recent" | "kind" | "source" | "name";
@@ -269,6 +278,9 @@ export function App() {
   const [range, setRange] = useState(readURLParam("range") || "24h");
   const [query, setQuery] = useState(readURLParam("q"));
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>(parseSourceParam());
+  const [activityKind, setActivityKind] = useState<ActivityKind>("all");
+  const [userFilter, setUserFilter] = useState<UserFilter>("all");
+  const [userSort, setUserSort] = useState<UserSort>("activity");
   const [hue, setHue] = useState(parseHueParam());
   const [hueInURL, setHueInURL] = useState(initialHueParam);
 
@@ -400,14 +412,46 @@ export function App() {
     }
   }
 
+  function inspectLive(liveType: LiveTargetKind, row: Record<string, unknown>) {
+    setInspectorTarget({ type: "live", liveType, row });
+  }
+
+  function inspectMetric(metric: MetricTarget) {
+    setInspectorTarget({ type: "metric", metric });
+  }
+
   function drillSearch(value: string, nextView: View = "activity") {
     setQuery(value);
     setView(nextView);
   }
 
+  function openActivity(kind: ActivityKind, source: SourceFilter = "all", nextQuery = "") {
+    setActivityKind(kind);
+    setSourceFilter(source);
+    setQuery(nextQuery);
+    setView("activity");
+  }
+
+  function openUsers(filter: UserFilter = "all", sort: UserSort = "activity") {
+    setUserFilter(filter);
+    setUserSort(sort);
+    setQuery("");
+    setView("users");
+  }
+
   function updateHueFromColor(hex: string) {
     setHue(hexToHue(hex));
     setHueInURL(true);
+  }
+
+  function confirmedBanIP(ip: string) {
+    const clean = ip.trim();
+    if (!clean) {
+      return;
+    }
+    if (window.confirm(`Ban IP ${clean}? This will block future access from this address.`)) {
+      banIP.mutate(clean);
+    }
   }
 
   return (
@@ -462,15 +506,21 @@ export function App() {
               onInspectSession={inspectSession}
               onInspectUser={inspectUser}
               onInspectActor={inspectActor}
+              onInspectLive={inspectLive}
+              onInspectMetric={inspectMetric}
+              onOpenActivity={openActivity}
+              onOpenUsers={openUsers}
               onDrillSearch={drillSearch}
               onRunMaintenance={() => runMaintenance.mutate()}
-              onBanIP={(ip) => banIP.mutate(ip)}
+              onBanIP={confirmedBanIP}
             />
           ) : view === "activity" ? (
             <Activity
               rows={filteredEventRows}
               loading={events.isLoading}
               sourceFilter={sourceFilter}
+              kind={activityKind}
+              onKind={setActivityKind}
               onInspectEvent={inspectEvent}
               onInspectActor={inspectActor}
             />
@@ -486,6 +536,10 @@ export function App() {
             <UsersView
               users={users.data?.users ?? []}
               loading={users.isLoading}
+              filter={userFilter}
+              sort={userSort}
+              onFilter={setUserFilter}
+              onSort={setUserSort}
               onInspectUser={inspectUser}
             />
           ) : (
@@ -495,7 +549,9 @@ export function App() {
               auth={authAttempts.data}
               loading={authAttempts.isLoading || insights.isLoading}
               banIPPending={banIP.isPending}
-              onBanIP={(ip) => banIP.mutate(ip)}
+              onBanIP={confirmedBanIP}
+              onInspectMetric={inspectMetric}
+              onOpenActivity={openActivity}
               onInspectEvent={inspectEvent}
               onInspectActor={inspectActor}
             />
@@ -506,7 +562,7 @@ export function App() {
           target={inspectorTarget}
           range={range}
           banIPPending={banIP.isPending}
-          onBanIP={(ip) => banIP.mutate(ip)}
+          onBanIP={confirmedBanIP}
           onInspectEvent={inspectEvent}
           onInspectUser={inspectUser}
           onInspectActor={inspectActor}
@@ -531,27 +587,44 @@ function Toolbar(props: {
   onHue: (hex: string) => void;
   onRefresh: () => void;
 }) {
+  const [filtersOpen, setFiltersOpen] = useState(false);
   return (
     <div class="toolbar">
-      <div class="segmented" role="tablist" aria-label="Admin v2 views">
-        <button class={props.view === "overview" ? "active" : ""} type="button" onClick={() => props.onView("overview")}>
-          Overview
-        </button>
-        <button class={props.view === "activity" ? "active" : ""} type="button" onClick={() => props.onView("activity")}>
-          Activity
-        </button>
-        <button class={props.view === "thumbnails" ? "active" : ""} type="button" onClick={() => props.onView("thumbnails")}>
-          Thumbnails
-        </button>
-        <button class={props.view === "users" ? "active" : ""} type="button" onClick={() => props.onView("users")}>
-          Users
-        </button>
-        <button class={props.view === "security" ? "active" : ""} type="button" onClick={() => props.onView("security")}>
-          Security
-        </button>
+      <div class="toolbar-head">
+        <div class="segmented" role="tablist" aria-label="Admin v2 views">
+          <button class={props.view === "overview" ? "active" : ""} type="button" onClick={() => props.onView("overview")}>
+            Overview
+          </button>
+          <button class={props.view === "activity" ? "active" : ""} type="button" onClick={() => props.onView("activity")}>
+            Activity
+          </button>
+          <button class={props.view === "thumbnails" ? "active" : ""} type="button" onClick={() => props.onView("thumbnails")}>
+            Thumbnails
+          </button>
+          <button class={props.view === "users" ? "active" : ""} type="button" onClick={() => props.onView("users")}>
+            Users
+          </button>
+          <button class={props.view === "security" ? "active" : ""} type="button" onClick={() => props.onView("security")}>
+            Security
+          </button>
+        </div>
+        <div class="mobile-filter-actions">
+          <button type="button" class="filter-toggle" aria-expanded={filtersOpen} onClick={() => setFiltersOpen((value) => !value)}>
+            {filtersOpen ? "Hide" : "Filters"}
+          </button>
+          <button type="button" class="refresh-button mobile-refresh" onClick={props.onRefresh}>
+            Refresh
+          </button>
+        </div>
       </div>
 
-      <div class="control-cluster">
+      <div class="mobile-filter-summary" aria-live="polite">
+        <span>{rangeLabel(props.range)}</span>
+        <span>{sourceFilterLabel(props.sourceFilter)}</span>
+        <span>{props.query.trim() ? props.query.trim() : "No search"}</span>
+      </div>
+
+      <div class={`control-cluster ${filtersOpen ? "open" : ""}`}>
         <label class="control">
           <span>Range</span>
           <select value={props.range} onInput={(event) => props.onRange((event.currentTarget as HTMLSelectElement).value)}>
@@ -586,7 +659,7 @@ function Toolbar(props: {
           <span>Hue</span>
           <input type="color" value={hslToHex(props.hue, 72, 54)} onInput={(event) => props.onHue((event.currentTarget as HTMLInputElement).value)} />
         </label>
-        <button type="button" class="refresh-button" onClick={props.onRefresh}>
+        <button type="button" class="refresh-button desktop-refresh" onClick={props.onRefresh}>
           Refresh
         </button>
       </div>
@@ -615,6 +688,10 @@ function Overview(props: {
   onInspectSession: (session: SessionRow) => void;
   onInspectUser: (user: UserRow) => void;
   onInspectActor: (actorType: ActorType, value: string) => void;
+  onInspectLive: (liveType: LiveTargetKind, row: Record<string, unknown>) => void;
+  onInspectMetric: (metric: MetricTarget) => void;
+  onOpenActivity: (kind: ActivityKind, source?: SourceFilter, query?: string) => void;
+  onOpenUsers: (filter?: UserFilter, sort?: UserSort) => void;
   onDrillSearch: (value: string, view?: View) => void;
   onRunMaintenance: () => void;
   onBanIP: (ip: string) => void;
@@ -632,18 +709,23 @@ function Overview(props: {
   return (
     <div class="overview-grid">
       <section class="metric-strip" aria-label="Summary">
-        <Metric label="Files" value={formatNumber(summary?.files)} />
-        <Metric label="Stored" value={summary?.formatted_bytes || formatBytes(summary?.bytes)} />
-        <Metric label="Uptime" value={summary?.uptime || formatDuration(summary?.uptime_seconds)} />
-        <Metric label="Dirs" value={formatNumber(summary?.directories)} />
-        <Metric label="Users" value={formatNumber(summary?.users)} />
-        <Metric label="Contrib" value={formatNumber(summary?.contributors)} />
-        <Metric label="Events" value={formatNumber(kpi.events)} />
-        <Metric label="Uploads" value={formatNumber(kpi.uploads)} />
-        <Metric label="Downloads" value={formatNumber(kpi.downloads)} />
-        <Metric label="Denied" value={formatNumber(kpi.denied)} tone={Number(kpi.denied || 0) > 0 ? "warn" : "normal"} />
-        <Metric label="Live" value={formatNumber(props.liveCount)} />
-        <Metric label="Explorer" value={`${explorerShare}%`} />
+        <Metric label="Files" value={formatNumber(summary?.files)} onClick={() => props.onInspectMetric(filesMetric(summary))} />
+        <Metric label="Stored" value={summary?.formatted_bytes || formatBytes(summary?.bytes)} onClick={() => props.onInspectMetric(storageMetric(summary))} />
+        <Metric label="Uptime" value={summary?.uptime || formatDuration(summary?.uptime_seconds)} onClick={() => props.onInspectMetric(uptimeMetric(summary))} />
+        <Metric label="Dirs" value={formatNumber(summary?.directories)} onClick={() => props.onInspectMetric(directoriesMetric(summary))} />
+        <Metric label="Users" value={formatNumber(summary?.users)} onClick={() => props.onOpenUsers("all", "activity")} />
+        <Metric label="Contrib" value={formatNumber(summary?.contributors)} onClick={() => props.onOpenUsers("uploaders", "uploads")} />
+        <Metric label="Events" value={formatNumber(kpi.events)} onClick={() => props.onOpenActivity("all")} />
+        <Metric label="Uploads" value={formatNumber(kpi.uploads)} onClick={() => props.onOpenActivity("transfer", "all", "upload")} />
+        <Metric label="Downloads" value={formatNumber(kpi.downloads)} onClick={() => props.onOpenActivity("transfer", "all", "download")} />
+        <Metric
+          label="Denied"
+          value={formatNumber(kpi.denied)}
+          tone={Number(kpi.denied || 0) > 0 ? "warn" : "normal"}
+          onClick={() => props.onOpenActivity("denied")}
+        />
+        <Metric label="Live" value={formatNumber(props.liveCount)} onClick={() => props.onInspectMetric(liveMetric(props.live, props.liveCount))} />
+        <Metric label="Explorer" value={`${explorerShare}%`} onClick={() => props.onOpenActivity("all", "explorer")} />
       </section>
 
       <section class="insights-band">
@@ -722,7 +804,7 @@ function Overview(props: {
       </section>
 
       <section class="split">
-        <LivePanel live={props.live} />
+        <LivePanel live={props.live} onInspectLive={props.onInspectLive} />
         <RiskPanel
           insights={props.insights}
           bannedHashes={bannedHashes}
@@ -751,23 +833,42 @@ function Activity(props: {
   rows: EventRow[];
   loading: boolean;
   sourceFilter: SourceFilter;
+  kind: ActivityKind;
+  onKind: (kind: ActivityKind) => void;
   onInspectEvent: (event: EventRow) => void;
   onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
-  const [kind, setKind] = useState<ActivityKind>("all");
-  const rows = useMemo(() => props.rows.filter((row) => matchesActivityKind(row, kind)), [props.rows, kind]);
+  const rows = useMemo(() => props.rows.filter((row) => matchesActivityKind(row, props.kind)), [props.rows, props.kind]);
   const profile = useMemo(() => activityProfile(props.rows), [props.rows]);
 
   return (
     <div class="activity-grid">
       <section class="metric-strip activity-metrics" aria-label="Activity summary">
-        <Metric label="Rows" value={formatNumber(props.rows.length)} />
-        <Metric label="Attention" value={formatNumber(profile.attention)} tone={profile.attention > 0 ? "warn" : "normal"} />
-        <Metric label="Denied" value={formatNumber(profile.denied)} tone={profile.denied > 0 ? "warn" : "normal"} />
-        <Metric label="Transfers" value={formatNumber(profile.transfer)} />
-        <Metric label="Mutations" value={formatNumber(profile.mutating)} />
-        <Metric label="Sessions" value={formatNumber(profile.session)} />
-        <Metric label="Exec" value={formatNumber(profile.exec)} tone={profile.exec > 0 ? "warn" : "normal"} />
+        <Metric label="Rows" value={formatNumber(props.rows.length)} active={props.kind === "all"} onClick={() => props.onKind("all")} />
+        <Metric
+          label="Attention"
+          value={formatNumber(profile.attention)}
+          tone={profile.attention > 0 ? "warn" : "normal"}
+          active={props.kind === "attention"}
+          onClick={() => props.onKind("attention")}
+        />
+        <Metric
+          label="Denied"
+          value={formatNumber(profile.denied)}
+          tone={profile.denied > 0 ? "warn" : "normal"}
+          active={props.kind === "denied"}
+          onClick={() => props.onKind("denied")}
+        />
+        <Metric label="Transfers" value={formatNumber(profile.transfer)} active={props.kind === "transfer"} onClick={() => props.onKind("transfer")} />
+        <Metric label="Mutations" value={formatNumber(profile.mutating)} active={props.kind === "mutating"} onClick={() => props.onKind("mutating")} />
+        <Metric label="Sessions" value={formatNumber(profile.session)} active={props.kind === "session"} onClick={() => props.onKind("session")} />
+        <Metric
+          label="Exec"
+          value={formatNumber(profile.exec)}
+          tone={profile.exec > 0 ? "warn" : "normal"}
+          active={props.kind === "exec"}
+          onClick={() => props.onKind("exec")}
+        />
       </section>
 
       <section class="split">
@@ -780,7 +881,7 @@ function Activity(props: {
           <h2>Event Stream</h2>
           <span>{props.loading ? "Refreshing" : `${rows.length} of ${props.rows.length} ${props.sourceFilter} rows`}</span>
         </div>
-        <ActivityKindTabs value={kind} onChange={setKind} />
+        <ActivityKindTabs value={props.kind} onChange={props.onKind} />
         <EventTable rows={rows} onInspectEvent={props.onInspectEvent} />
       </section>
     </div>
@@ -796,8 +897,8 @@ function ThumbnailView(props: {
 }) {
   const [kindFilter, setKindFilter] = useState<ThumbnailFilter>("visual");
   const [sort, setSort] = useState<ThumbnailSort>("recent");
-  const [size, setSize] = useState<ThumbnailSize>("normal");
-  const [mode, setMode] = useState<ThumbnailMode>("grid");
+  const [size, setSize] = useState<ThumbnailSize>(() => (isSmallViewport() ? "compact" : "normal"));
+  const [mode, setMode] = useState<ThumbnailMode>(() => (isSmallViewport() ? "list" : "grid"));
   const [folder, setFolder] = useState("all");
   const [localQuery, setLocalQuery] = useState("");
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
@@ -809,7 +910,8 @@ function ThumbnailView(props: {
     () => filterThumbnailSearch(filterThumbnailFolder(filterThumbnailCandidates(rawCandidates, kindFilter), folder), localQuery),
     [folder, kindFilter, localQuery, rawCandidates]
   );
-  const candidates = useMemo(() => sortThumbnailCandidates(scopedCandidates, sort).slice(0, mode === "list" ? 120 : 72), [mode, scopedCandidates, sort]);
+  const mobileLimit = isSmallViewport() ? 48 : mode === "list" ? 120 : 72;
+  const candidates = useMemo(() => sortThumbnailCandidates(scopedCandidates, sort).slice(0, mobileLimit), [mobileLimit, scopedCandidates, sort]);
   const sourceCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.source), 6);
   const kindCounts = topCountsFromStrings(rawCandidates.map((candidate) => candidate.kind), 8);
   const folderCounts = useMemo(() => thumbnailFolders(rawCandidates, 12), [rawCandidates]);
@@ -1039,7 +1141,7 @@ function ThumbnailCard(props: {
     <article class={`thumbnail-card ${props.selected ? "selected" : ""} ${props.mode}`}>
       <button class="thumbnail-frame" type="button" onClick={() => props.onOpenPath(props.candidate.path)} aria-label={`Inspect ${label}`}>
         {thumb.data ? (
-          <img src={thumb.data} alt={label} />
+          <img src={thumb.data} alt={label} loading="lazy" />
         ) : (
           <span class={`thumbnail-placeholder ${preview.isError ? "error-state" : ""}`}>
             {preview.isLoading ? "loading" : preview.isError ? "unavailable" : <FileIcon kind={data ? kindForPreview(data) : props.candidate.kind} label={label} />}
@@ -1076,27 +1178,44 @@ function ThumbnailCard(props: {
   );
 }
 
-function UsersView(props: { users: UserRow[]; loading: boolean; onInspectUser: (user: UserRow) => void }) {
-  const [filter, setFilter] = useState<UserFilter>("all");
-  const [sort, setSort] = useState<UserSort>("activity");
+function UsersView(props: {
+  users: UserRow[];
+  loading: boolean;
+  filter: UserFilter;
+  sort: UserSort;
+  onFilter: (filter: UserFilter) => void;
+  onSort: (sort: UserSort) => void;
+  onInspectUser: (user: UserRow) => void;
+}) {
   const profile = useMemo(() => userProfile(props.users), [props.users]);
-  const filteredUsers = useMemo(() => filterUsers(props.users, filter), [filter, props.users]);
-  const visibleUsers = useMemo(() => sortUsers(filteredUsers, sort).slice(0, 100), [filteredUsers, sort]);
+  const filteredUsers = useMemo(() => filterUsers(props.users, props.filter), [props.filter, props.users]);
+  const visibleUsers = useMemo(() => sortUsers(filteredUsers, props.sort).slice(0, 100), [filteredUsers, props.sort]);
   const uploadLeaders = useMemo(() => sortUsers(props.users, "uploads"), [props.users]);
   const downloadLeaders = useMemo(() => sortUsers(props.users, "downloads"), [props.users]);
   const sessionLeaders = useMemo(() => sortUsers(props.users, "sessions"), [props.users]);
 
+  function setUserLens(filter: UserFilter, sort: UserSort) {
+    props.onFilter(filter);
+    props.onSort(sort);
+  }
+
   return (
     <div class="activity-grid users-view">
       <section class="metric-strip activity-metrics" aria-label="User summary">
-        <Metric label="Users" value={formatNumber(profile.total)} />
-        <Metric label="Active" value={formatNumber(profile.active)} />
-        <Metric label="Quiet" value={formatNumber(profile.quiet)} />
-        <Metric label="Banned" value={formatNumber(profile.banned)} tone={profile.banned > 0 ? "warn" : "normal"} />
-        <Metric label="Sessions" value={formatNumber(profile.sessions)} />
-        <Metric label="Uploads" value={formatNumber(profile.uploadCount)} />
-        <Metric label="Uploaded" value={formatBytes(profile.uploadBytes)} />
-        <Metric label="Downloaded" value={formatBytes(profile.downloadBytes)} />
+        <Metric label="Users" value={formatNumber(profile.total)} active={props.filter === "all"} onClick={() => setUserLens("all", "activity")} />
+        <Metric label="Active" value={formatNumber(profile.active)} active={props.filter === "active"} onClick={() => setUserLens("active", "activity")} />
+        <Metric label="Quiet" value={formatNumber(profile.quiet)} active={props.filter === "quiet"} onClick={() => setUserLens("quiet", "activity")} />
+        <Metric
+          label="Banned"
+          value={formatNumber(profile.banned)}
+          tone={profile.banned > 0 ? "warn" : "normal"}
+          active={props.filter === "banned"}
+          onClick={() => setUserLens("banned", "activity")}
+        />
+        <Metric label="Sessions" value={formatNumber(profile.sessions)} active={props.sort === "sessions"} onClick={() => setUserLens("all", "sessions")} />
+        <Metric label="Uploads" value={formatNumber(profile.uploadCount)} active={props.filter === "uploaders"} onClick={() => setUserLens("uploaders", "uploads")} />
+        <Metric label="Uploaded" value={formatBytes(profile.uploadBytes)} active={props.sort === "uploads"} onClick={() => setUserLens("uploaders", "uploads")} />
+        <Metric label="Downloaded" value={formatBytes(profile.downloadBytes)} active={props.sort === "downloads"} onClick={() => setUserLens("downloaders", "downloads")} />
       </section>
 
       <section class="insights-band">
@@ -1106,7 +1225,7 @@ function UsersView(props: { users: UserRow[]; loading: boolean; onInspectUser: (
         </div>
         <div class="release">
           <span>Sort</span>
-          <strong>{sortLabel(sort)}</strong>
+          <strong>{sortLabel(props.sort)}</strong>
         </div>
       </section>
 
@@ -1149,7 +1268,7 @@ function UsersView(props: { users: UserRow[]; loading: boolean; onInspectUser: (
           <h2>Users</h2>
           <span>{props.loading ? "Refreshing" : `${visibleUsers.length} of ${props.users.length} users`}</span>
         </div>
-        <UserControls filter={filter} sort={sort} onFilter={setFilter} onSort={setSort} />
+        <UserControls filter={props.filter} sort={props.sort} onFilter={props.onFilter} onSort={props.onSort} />
         <UserTable users={visibleUsers} onInspectUser={props.onInspectUser} />
       </section>
     </div>
@@ -1207,16 +1326,16 @@ function UserTable({ users, onInspectUser }: { users: UserRow[]; onInspectUser: 
       </div>
       {users.map((user) => (
         <button class={`user-list-row ${user.is_banned ? "banned" : ""}`} type="button" role="row" key={user.hash} onClick={() => onInspectUser(user)}>
-          <span class="user-primary">
+          <span class="user-primary" data-label="User">
             <strong>{shortValue(user.hash, 24)}</strong>
             <small>{user.last_login || "no login time"}</small>
           </span>
-          <span>{formatNumber(user.seen)}</span>
-          <span>{formatNumber(user.upload_count)}</span>
-          <span>{formatBytes(user.upload_bytes)}</span>
-          <span>{formatNumber(user.download_count)}</span>
-          <span>{formatBytes(user.download_bytes)}</span>
-          <span>
+          <span data-label="Sessions">{formatNumber(user.seen)}</span>
+          <span data-label="Uploads">{formatNumber(user.upload_count)}</span>
+          <span data-label="Uploaded">{formatBytes(user.upload_bytes)}</span>
+          <span data-label="Downloads">{formatNumber(user.download_count)}</span>
+          <span data-label="Downloaded">{formatBytes(user.download_bytes)}</span>
+          <span data-label="Status">
             <span class={user.is_banned ? "status-chip hot" : "status-chip"}>{user.is_banned ? "banned" : userActivityScore(user) > 0 ? "active" : "quiet"}</span>
           </span>
         </button>
@@ -1280,6 +1399,8 @@ function Security(props: {
   loading: boolean;
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
+  onInspectMetric: (metric: MetricTarget) => void;
+  onOpenActivity: (kind: ActivityKind, source?: SourceFilter, query?: string) => void;
   onInspectEvent: (event: EventRow) => void;
   onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
@@ -1293,13 +1414,33 @@ function Security(props: {
   return (
     <div class="activity-grid">
       <section class="metric-strip activity-metrics" aria-label="Security summary">
-        <Metric label="Auth" value={formatNumber(attempts.length)} tone={attempts.length > 0 ? "warn" : "normal"} />
-        <Metric label="Combos" value={formatNumber(combos.length)} tone={combos.length > 0 ? "warn" : "normal"} />
-        <Metric label="Suspicious" value={formatNumber(suspicious.length)} tone={suspicious.length > 0 ? "warn" : "normal"} />
-        <Metric label="Denied" value={formatNumber(denied)} tone={denied > 0 ? "warn" : "normal"} />
-        <Metric label="Panics" value={formatNumber(panics)} tone={panics > 0 ? "warn" : "normal"} />
-        <Metric label="Banned IPs" value={formatNumber(bannedIPs.length)} />
-        <Metric label="Banned Users" value={formatNumber(bannedHashes.length)} />
+        <Metric
+          label="Auth"
+          value={formatNumber(attempts.length)}
+          tone={attempts.length > 0 ? "warn" : "normal"}
+          onClick={() => props.onInspectMetric(authMetric(props.auth))}
+        />
+        <Metric
+          label="Combos"
+          value={formatNumber(combos.length)}
+          tone={combos.length > 0 ? "warn" : "normal"}
+          onClick={() => props.onInspectMetric(authCombosMetric(props.auth))}
+        />
+        <Metric
+          label="Suspicious"
+          value={formatNumber(suspicious.length)}
+          tone={suspicious.length > 0 ? "warn" : "normal"}
+          onClick={() => props.onInspectMetric(suspiciousMetric(suspicious))}
+        />
+        <Metric
+          label="Denied"
+          value={formatNumber(denied)}
+          tone={denied > 0 ? "warn" : "normal"}
+          onClick={() => props.onOpenActivity("denied")}
+        />
+        <Metric label="Panics" value={formatNumber(panics)} tone={panics > 0 ? "warn" : "normal"} onClick={() => props.onInspectMetric(panicMetric(props.insights))} />
+        <Metric label="Banned IPs" value={formatNumber(bannedIPs.length)} onClick={() => props.onInspectMetric(bannedIPMetric(props.banned))} />
+        <Metric label="Banned Users" value={formatNumber(bannedHashes.length)} onClick={() => props.onInspectMetric(bannedUserMetric(props.banned))} />
       </section>
 
       <section class="insights-band">
@@ -1520,24 +1661,24 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
         const rowPath = targetPath({ type: "event", event: row });
         return (
           <button
-            class="event-row"
+            class={`event-row ${isMutatingEvent(row) ? "mutating" : ""} ${isAttentionEvent(row) ? "attention" : ""}`}
             type="button"
             role="row"
             key={row.id}
             onClick={() => props.onInspectEvent(row)}
           >
-            <span>{row.time || row.timestamp || ""}</span>
-            <span>
+            <span class="event-cell" data-label="Time">{row.time || row.timestamp || ""}</span>
+            <span class="event-cell" data-label="Source">
               <SourcePill source={sourceFor(row)} />
             </span>
-            <span class="event-name">{row.event || ""}</span>
-            <span>
+            <span class="event-cell event-name" data-label="Event">{row.event || ""}</span>
+            <span class="event-cell" data-label="Status">
               <span class={statusClass(row)}>{statusFor(row)}</span>
             </span>
-            <span class="path-cell">{rowPath}</span>
-            <span>{shortValue(eventUser(row))}</span>
-            <span>{row.ip || ""}</span>
-            <span class="truncate">{row.session || ""}</span>
+            <span class="event-cell path-cell" data-label="Path">{rowPath}</span>
+            <span class="event-cell" data-label="User">{shortValue(eventUser(row))}</span>
+            <span class="event-cell" data-label="IP">{row.ip || ""}</span>
+            <span class="event-cell truncate" data-label="Session">{row.session || ""}</span>
           </button>
         );
       })}
@@ -1787,36 +1928,84 @@ function SessionsPanel({ sessions, onInspectSession }: { sessions: SessionRow[];
   );
 }
 
-function LivePanel({ live }: { live?: LivePayload }) {
+function LivePanel({ live, onInspectLive }: { live?: LivePayload; onInspectLive: (liveType: LiveTargetKind, row: Record<string, unknown>) => void }) {
   const connections = recordArray(live?.connections).slice(0, 6);
   const sessions = recordArray(live?.sessions).slice(0, 6);
-  const requests = recordArray(live?.requests).slice(0, 6);
+  const transfers = recordArray(live?.transfers).slice(0, 8);
+  const requests = recordArray(live?.requests).slice(0, 4);
   return (
     <DataPanel title="Live" empty="No live activity">
       {connections.map((row, index) => (
-        <LiveRow key={`conn-${index}`} label="Connection" row={row} />
+        <LiveRow key={`conn-${liveRowID(row, index)}`} liveType="connection" row={row} onInspectLive={onInspectLive} />
       ))}
       {sessions.map((row, index) => (
-        <LiveRow key={`session-${index}`} label="Session" row={row} />
+        <LiveRow key={`session-${liveRowID(row, index)}`} liveType="session" row={row} onInspectLive={onInspectLive} />
+      ))}
+      {transfers.map((row, index) => (
+        <LiveRow key={`transfer-${liveRowID(row, index)}`} liveType="transfer" row={row} onInspectLive={onInspectLive} />
       ))}
       {requests.map((row, index) => (
-        <LiveRow key={`request-${index}`} label="Request" row={row} />
+        <LiveRow key={`request-${liveRowID(row, index)}`} liveType="request" row={row} onInspectLive={onInspectLive} />
       ))}
     </DataPanel>
   );
 }
 
-function LiveRow({ label, row }: { label: string; row: Record<string, unknown> }) {
+function LiveRow({
+  liveType,
+  row,
+  onInspectLive
+}: {
+  liveType: LiveTargetKind;
+  row: Record<string, unknown>;
+  onInspectLive: (liveType: LiveTargetKind, row: Record<string, unknown>) => void;
+}) {
   return (
-    <div class="dense-row">
+    <button class={`dense-row live-row ${liveType}`} type="button" onClick={() => onInspectLive(liveType, row)}>
       <div>
-        <strong>{label}</strong>
-        <small>{stringFromRecord(row, ["path", "operation", "session_id", "id"])}</small>
+        <strong>{liveRowTitle(liveType, row)}</strong>
+        <small>{liveRowDetail(liveType, row)}</small>
       </div>
-      <span>{stringFromRecord(row, ["source", "protocol", "user_id"])}</span>
-      <span>{stringFromRecord(row, ["remote_addr", "ip"])}</span>
-    </div>
+      <span>{liveRowMetric(liveType, row)}</span>
+      <span>{liveRowActor(row)}</span>
+    </button>
   );
+}
+
+function liveRowID(row: Record<string, unknown>, index: number): string {
+  return stringFromRecord(row, ["id", "session", "connection_id", "path", "last_path"]) || String(index);
+}
+
+function liveRowTitle(kind: LiveTargetKind, row: Record<string, unknown>): string {
+  if (kind === "transfer") {
+    const direction = stringFromRecord(row, ["direction"]) || "transfer";
+    return `${titleCase(direction)} ${basename(livePath(row)) || shortValue(liveSessionID(row), 14) || "active"}`;
+  }
+  if (kind === "session") {
+    return `Session ${shortValue(liveSessionID(row), 18) || "active"}`;
+  }
+  if (kind === "request") {
+    return `${titleCase(stringFromRecord(row, ["operation"]) || "Request")} ${basename(livePath(row)) || ""}`.trim();
+  }
+  return `Connection ${shortValue(stringFromRecord(row, ["id", "connection_id"]), 18) || stringFromRecord(row, ["state"]) || "active"}`;
+}
+
+function liveRowDetail(kind: LiveTargetKind, row: Record<string, unknown>): string {
+  if (kind === "transfer") {
+    return livePath(row) || liveSessionID(row) || liveIP(row);
+  }
+  return stringFromRecord(row, ["last_path", "path"]) || stringFromRecord(row, ["last_operation", "operation"]) || liveSessionID(row) || stringFromRecord(row, ["remote_addr", "ip"]);
+}
+
+function liveRowMetric(kind: LiveTargetKind, row: Record<string, unknown>): string {
+  if (kind === "transfer") {
+    return liveRate(row) || liveBytes(row) || liveDuration(row, "age_sec");
+  }
+  return liveActiveLine(row) || liveRate(row) || liveDuration(row, "idle_sec");
+}
+
+function liveRowActor(row: Record<string, unknown>): string {
+  return liveUser(row) || liveIP(row) || stringFromRecord(row, ["source", "protocol"]);
 }
 
 function RiskPanel(props: {
@@ -1907,8 +2096,10 @@ function Inspector(props: {
   const event = props.target.type === "event" ? props.target.event : undefined;
   const user = props.target.type === "user" ? props.target.user : undefined;
   const actor = props.target.type === "actor" ? props.target : undefined;
+  const live = props.target.type === "live" ? props.target : undefined;
+  const metric = props.target.type === "metric" ? props.target.metric : undefined;
   const selectedPath = targetPath(props.target);
-  const sessionID = eventSession(event);
+  const sessionID = eventSession(event) || liveSessionID(live?.row);
   const selectedUser = user?.hash || "";
 
   useEffect(() => {
@@ -2033,7 +2224,19 @@ function Inspector(props: {
           <div class="inspector-head">
             <div>
               <span class="eyebrow">Inspector</span>
-              <h2>{actor ? `${actor.actorType.toUpperCase()} ${shortValue(actor.value, 22)}` : user ? shortValue(user.hash, 22) : event ? event.event || "Event" : data?.name || selectedPath}</h2>
+              <h2>
+                {live
+                  ? liveInspectorTitle(live.liveType, live.row)
+                  : metric
+                    ? metric.title
+                    : actor
+                      ? `${actor.actorType.toUpperCase()} ${shortValue(actor.value, 22)}`
+                      : user
+                        ? shortValue(user.hash, 22)
+                        : event
+                          ? event.event || "Event"
+                          : data?.name || selectedPath}
+              </h2>
             </div>
             <button type="button" onClick={props.onClose} aria-label="Close inspector">
               Close
@@ -2052,6 +2255,18 @@ function Inspector(props: {
               onNotice={setNotice}
             />
           ) : null}
+          {live ? (
+            <LiveDetailBox
+              target={live}
+              banIPPending={props.banIPPending}
+              onBanIP={props.onBanIP}
+              onInspectUser={props.onInspectUser}
+              onInspectActor={props.onInspectActor}
+              onOpenPath={props.onOpenPath}
+              onNotice={setNotice}
+            />
+          ) : null}
+          {metric ? <MetricDetailBox metric={metric} /> : null}
           {actor ? (
             <ActorDetailBox
               actor={actor}
@@ -2151,6 +2366,134 @@ function Inspector(props: {
         </>
       )}
     </aside>
+  );
+}
+
+function LiveDetailBox(props: {
+  target: { liveType: LiveTargetKind; row: Record<string, unknown> };
+  banIPPending: boolean;
+  onBanIP: (ip: string) => void;
+  onInspectUser: (user: UserRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
+  onOpenPath: (path?: string) => void;
+  onNotice: (notice: string) => void;
+}) {
+  const row = props.target.row;
+  const kind = props.target.liveType;
+  const path = livePath(row);
+  const user = liveUser(row);
+  const ip = liveIP(row);
+  const session = liveSessionID(row);
+  const connectionID = stringFromRecord(row, ["connection_id", "id"]);
+  const rate = liveRate(row);
+  const bytes = liveBytes(row);
+
+  async function copyLiveDetails() {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({ type: kind, ...row }, null, 2));
+      props.onNotice("Live details copied");
+    } catch {
+      props.onNotice("Unable to copy live details");
+    }
+  }
+
+  return (
+    <>
+      <div class="event-card live-card">
+        <div class="event-card-head">
+          <SourcePill source={stringFromRecord(row, ["source"]) || "live"} />
+          <span class={liveStatusClass(row)}>{liveStatusLabel(kind, row)}</span>
+        </div>
+        <dl class="metadata">
+          <Meta label="Type" value={titleCase(kind)} />
+          <Meta label="Direction" value={stringFromRecord(row, ["direction"])} />
+          <Meta label="State" value={stringFromRecord(row, ["state"])} />
+          <Meta label="Protocol" value={stringFromRecord(row, ["protocol"])} />
+          <Meta label="User" value={user} />
+          <Meta label="Auth User" value={stringFromRecord(row, ["auth_user"])} />
+          <Meta label="IP" value={ip} />
+          <Meta label="Remote" value={stringFromRecord(row, ["remote_addr"])} />
+          <Meta label="Local" value={stringFromRecord(row, ["local_addr"])} />
+          <Meta label="Session" value={session} />
+          <Meta label="Connection" value={connectionID} />
+          <Meta label="Started" value={stringFromRecord(row, ["start_time", "started_time"])} />
+          <Meta label="Age" value={liveDuration(row, "age_sec")} />
+          <Meta label="Idle" value={liveDuration(row, "idle_sec")} />
+          <Meta label="Last Activity" value={stringFromRecord(row, ["last_activity"])} />
+          <Meta label="Last Operation" value={stringFromRecord(row, ["last_operation", "operation"])} />
+          <Meta label="Path" value={path} />
+          <Meta label="Last Error" value={stringFromRecord(row, ["last_error", "error"])} />
+          <Meta label="Active" value={liveActiveLine(row)} />
+          <Meta label="Transferred" value={bytes} />
+          <Meta label="Rate" value={rate} />
+          <Meta label="Client" value={liveClientLine(row)} />
+          <Meta label="Flags" value={liveFlagLine(row)} />
+        </dl>
+      </div>
+
+      <div class="inspector-actions event-actions">
+        {path ? (
+          <button type="button" onClick={() => props.onOpenPath(path)}>
+            Inspect File
+          </button>
+        ) : null}
+        {path ? (
+          <a class="button-link" href={explorerURL(path)}>
+            Open Explorer
+          </a>
+        ) : null}
+        {user ? (
+          <button type="button" onClick={() => props.onInspectUser({ hash: user })}>
+            Inspect User
+          </button>
+        ) : null}
+        {user ? (
+          <a class="button-link" href={adminPath("/admin/v2/", { view: "users", q: user })}>
+            Filter User
+          </a>
+        ) : null}
+        {ip ? (
+          <button type="button" onClick={() => props.onInspectActor("ip", ip)}>
+            Inspect IP
+          </button>
+        ) : null}
+        {ip ? (
+          <a class="button-link" href={adminPath("/admin/v2/", { view: "security", q: ip })}>
+            Filter IP
+          </a>
+        ) : null}
+        {session ? (
+          <a class="button-link" href={adminPath("/admin/v2/", { view: "activity", q: session })}>
+            Filter Session
+          </a>
+        ) : null}
+        {ip ? (
+          <button type="button" onClick={() => props.onBanIP(ip)} disabled={props.banIPPending}>
+            Ban IP
+          </button>
+        ) : null}
+        <button type="button" onClick={copyLiveDetails}>
+          Copy Details
+        </button>
+      </div>
+    </>
+  );
+}
+
+function MetricDetailBox({ metric }: { metric: MetricTarget }) {
+  return (
+    <div class="event-card metric-card">
+      <div class="event-card-head">
+        <SourcePill source="metric" />
+        <span class="status-chip">{metric.value}</span>
+      </div>
+      {metric.summary ? <p class="metric-detail-copy">{metric.summary}</p> : null}
+      <dl class="metadata">
+        {metric.rows.map((row) => (
+          <Meta label={row.label} value={row.value} key={row.label} />
+        ))}
+      </dl>
+    </div>
   );
 }
 
@@ -2630,11 +2973,38 @@ function PreviewDetails({ preview }: { preview: PreviewPayload }) {
   return null;
 }
 
-function Metric({ label, value, tone = "normal", compact = false }: { label: string; value: string; tone?: "normal" | "warn"; compact?: boolean }) {
-  return (
-    <div class={`metric ${tone === "warn" ? "warn" : ""} ${compact ? "compact" : ""}`}>
+function Metric({
+  label,
+  value,
+  tone = "normal",
+  compact = false,
+  active = false,
+  onClick
+}: {
+  label: string;
+  value: string;
+  tone?: "normal" | "warn";
+  compact?: boolean;
+  active?: boolean;
+  onClick?: () => void;
+}) {
+  const className = `metric ${tone === "warn" ? "warn" : ""} ${compact ? "compact" : ""} ${active ? "active" : ""} ${onClick ? "clickable" : ""}`;
+  const content = (
+    <>
       <span>{label}</span>
       <strong>{value}</strong>
+    </>
+  );
+  if (onClick) {
+    return (
+      <button class={className} type="button" data-metric={metricKey(label)} onClick={onClick}>
+        {content}
+      </button>
+    );
+  }
+  return (
+    <div class={className} data-metric={metricKey(label)}>
+      {content}
     </div>
   );
 }
@@ -2897,6 +3267,9 @@ function targetPath(target: InspectorTarget): string {
   }
   if (target.type === "event") {
     return cleanPath(target.event.path || metaString(target.event, ["path", "target_path", "old_path", "new_path", "file"]));
+  }
+  if (target.type === "live") {
+    return livePath(target.row);
   }
   return "";
 }
@@ -3651,8 +4024,9 @@ function basename(path: string): string {
 function countLive(payload?: LivePayload): number {
   const connections = Array.isArray(payload?.connections) ? payload.connections.length : 0;
   const sessions = Array.isArray(payload?.sessions) ? payload.sessions.length : 0;
+  const transfers = Array.isArray(payload?.transfers) ? payload.transfers.length : 0;
   const requests = Array.isArray(payload?.requests) ? payload.requests.length : 0;
-  return connections + sessions + requests;
+  return connections + sessions + transfers + requests;
 }
 
 function formatNumber(value: number | undefined): string {
@@ -3685,6 +4059,10 @@ function formatBytes(value: number | undefined): string {
     unit++;
   }
   return `${next.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function formatRate(value: number | undefined): string {
+  return value && value > 0 ? `${formatBytes(value)}/s` : "0 B/s";
 }
 
 function formatPercent(value: number | undefined): string {
@@ -3744,6 +4122,309 @@ function stringFromRecord(row: Record<string, unknown>, keys: string[]): string 
   return "";
 }
 
+function boolFromRecord(row: Record<string, unknown>, key: string): boolean {
+  return row[key] === true || row[key] === "true";
+}
+
+function livePath(row: Record<string, unknown>): string {
+  return cleanPath(stringFromRecord(row, ["path", "last_path"]));
+}
+
+function liveUser(row: Record<string, unknown>): string {
+  return stringFromRecord(row, ["user_id", "user", "owner", "owner_hash"]);
+}
+
+function liveIP(row: Record<string, unknown>): string {
+  return stringFromRecord(row, ["ip", "remote_ip"]) || hostFromAddress(stringFromRecord(row, ["remote_addr"]));
+}
+
+function liveSessionID(row: Record<string, unknown> | undefined): string {
+  if (!row) {
+    return "";
+  }
+  return stringFromRecord(row, ["session", "session_id"]);
+}
+
+function liveRate(row: Record<string, unknown>): string {
+  const direct = numberFromUnknown(row.rate_bps);
+  const total = numberFromUnknown(row.total_rate_bps);
+  const upload = numberFromUnknown(row.upload_rate_bps);
+  const download = numberFromUnknown(row.download_rate_bps);
+  const value = direct || total || upload + download;
+  return value > 0 ? `${formatBytes(value)}/s` : "";
+}
+
+function liveBytes(row: Record<string, unknown>): string {
+  const direct = numberFromUnknown(row.bytes);
+  const upload = numberFromUnknown(row.upload_bytes);
+  const download = numberFromUnknown(row.download_bytes);
+  if (direct > 0) {
+    return formatBytes(direct);
+  }
+  const parts = [];
+  if (upload > 0) {
+    parts.push(`${formatBytes(upload)} up`);
+  }
+  if (download > 0) {
+    parts.push(`${formatBytes(download)} down`);
+  }
+  return parts.join(" / ");
+}
+
+function liveDuration(row: Record<string, unknown>, key: string): string {
+  const seconds = numberFromUnknown(row[key]);
+  return seconds > 0 ? formatDuration(seconds) : "";
+}
+
+function liveActiveLine(row: Record<string, unknown>): string {
+  const requests = numberFromUnknown(row.requests_active);
+  const transfers = numberFromUnknown(row.active_transfers);
+  const parts = [];
+  if (requests > 0) {
+    parts.push(`${formatNumber(requests)} requests`);
+  }
+  if (transfers > 0) {
+    parts.push(`${formatNumber(transfers)} transfers`);
+  }
+  return parts.join(" / ");
+}
+
+function liveClientLine(row: Record<string, unknown>): string {
+  return [stringFromRecord(row, ["client_version"]), stringFromRecord(row, ["user_agent"])].filter(Boolean).join(" / ");
+}
+
+function liveFlagLine(row: Record<string, unknown>): string {
+  const flags = [];
+  if (boolFromRecord(row, "admin")) {
+    flags.push("admin");
+  }
+  if (boolFromRecord(row, "banned")) {
+    flags.push("banned");
+  }
+  if (boolFromRecord(row, "throttled")) {
+    flags.push("throttled");
+  }
+  const loginType = stringFromRecord(row, ["login_type"]);
+  if (loginType) {
+    flags.push(loginType);
+  }
+  return flags.join(" / ");
+}
+
+function liveStatusLabel(kind: LiveTargetKind, row: Record<string, unknown>): string {
+  if (boolFromRecord(row, "banned")) {
+    return "banned";
+  }
+  if (kind === "transfer") {
+    return stringFromRecord(row, ["direction"]) || "transfer";
+  }
+  return stringFromRecord(row, ["state", "direction"]) || kind;
+}
+
+function liveStatusClass(row: Record<string, unknown>): string {
+  if (boolFromRecord(row, "banned") || stringFromRecord(row, ["last_error", "error"])) {
+    return "status-chip hot";
+  }
+  return "status-chip";
+}
+
+function liveInspectorTitle(kind: LiveTargetKind, row: Record<string, unknown>): string {
+  return liveRowTitle(kind, row);
+}
+
+function filesMetric(summary?: SummaryPayload): MetricTarget {
+  return {
+    title: "File Inventory",
+    value: formatNumber(summary?.files),
+    summary: "Archive file and directory totals from the current summary snapshot.",
+    rows: [
+      { label: "Files", value: formatNumber(summary?.files) },
+      { label: "Directories", value: formatNumber(summary?.directories) },
+      { label: "Stored", value: summary?.formatted_bytes || formatBytes(summary?.bytes) },
+      { label: "Contributor Min", value: formatBytes(summary?.contributor_threshold) }
+    ]
+  };
+}
+
+function directoriesMetric(summary?: SummaryPayload): MetricTarget {
+  return {
+    title: "Directory Inventory",
+    value: formatNumber(summary?.directories),
+    summary: "Directory count and storage context for the archive.",
+    rows: [
+      { label: "Directories", value: formatNumber(summary?.directories) },
+      { label: "Files", value: formatNumber(summary?.files) },
+      { label: "Stored", value: summary?.formatted_bytes || formatBytes(summary?.bytes) },
+      { label: "Archive", value: summary?.archive }
+    ]
+  };
+}
+
+function storageMetric(summary?: SummaryPayload): MetricTarget {
+  const storage = summary?.storage ?? [];
+  const rows: InsightRow[] = [
+    { label: "Stored", value: summary?.formatted_bytes || formatBytes(summary?.bytes) },
+    { label: "Volumes", value: formatNumber(storage.length) }
+  ];
+  for (const volume of storage.slice(0, 5)) {
+    rows.push({
+      label: volume.label || volume.id || volume.kind || "Storage",
+      value: volume.error || `${volume.used || formatBytes(volume.used_bytes)} used / ${volume.free || formatBytes(volume.free_bytes)} free`
+    });
+  }
+  return {
+    title: "Storage",
+    value: summary?.formatted_bytes || formatBytes(summary?.bytes),
+    summary: "Storage health for uploads, logs, and database files.",
+    rows
+  };
+}
+
+function uptimeMetric(summary?: SummaryPayload): MetricTarget {
+  return {
+    title: "Runtime",
+    value: summary?.uptime || formatDuration(summary?.uptime_seconds),
+    summary: "Process and listener details from the admin summary.",
+    rows: [
+      { label: "Uptime", value: summary?.uptime || formatDuration(summary?.uptime_seconds) },
+      { label: "Version", value: summary?.version },
+      { label: "Admin HTTP", value: summary?.admin_http },
+      { label: "SSH", value: summary?.ssh_port ? `:${summary.ssh_port}` : "" },
+      { label: "Archive", value: summary?.archive }
+    ]
+  };
+}
+
+function liveMetric(live: LivePayload | undefined, liveCount: number): MetricTarget {
+  const payload = (live ?? {}) as Record<string, unknown>;
+  const connections = numberFromUnknown(payload.connection_count) || recordArray(live?.connections).length;
+  const sessions = numberFromUnknown(payload.session_count) || recordArray(live?.sessions).length;
+  const transfers = numberFromUnknown(payload.transfer_count) || recordArray(live?.transfers).length;
+  return {
+    title: "Live Activity",
+    value: formatNumber(liveCount),
+    summary: "Current in-flight connections, sessions, and transfers.",
+    rows: [
+      { label: "Connections", value: formatNumber(connections) },
+      { label: "Sessions", value: formatNumber(sessions) },
+      { label: "Transfers", value: formatNumber(transfers) },
+      { label: "Upload Rate", value: formatRate(numberFromUnknown(payload.upload_rate_bps)) },
+      { label: "Download Rate", value: formatRate(numberFromUnknown(payload.download_rate_bps)) },
+      { label: "Total Rate", value: formatRate(numberFromUnknown(payload.total_rate_bps)) },
+      { label: "Uploaded", value: formatBytes(numberFromUnknown(payload.upload_bytes)) },
+      { label: "Downloaded", value: formatBytes(numberFromUnknown(payload.download_bytes)) },
+      { label: "Window", value: `${formatNumber(numberFromUnknown(payload.rate_window_sec))}s` }
+    ]
+  };
+}
+
+function authMetric(auth?: AuthAttemptsPayload): MetricTarget {
+  const attempts = auth?.attempts ?? [];
+  const latest = attempts[0];
+  return {
+    title: "Auth Attempts",
+    value: formatNumber(attempts.length),
+    summary: "Recent login attempts in the current security window.",
+    rows: [
+      { label: "Attempts", value: formatNumber(attempts.length) },
+      { label: "Window", value: auth?.window?.label },
+      { label: "Latest", value: latest ? `${latest.time || ""} ${latest.ip || ""}`.trim() : "" },
+      { label: "Latest Username", value: latest?.username },
+      { label: "Generated Hash", value: shortValue(latest?.generated_hash, 22) }
+    ]
+  };
+}
+
+function authCombosMetric(auth?: AuthAttemptsPayload): MetricTarget {
+  const combos = auth?.combos ?? [];
+  return {
+    title: "Credential Combos",
+    value: formatNumber(combos.length),
+    summary: "Credential pairs seen in recent auth attempts.",
+    rows: [
+      { label: "Combos", value: formatNumber(combos.length) },
+      { label: "Window", value: auth?.window?.label },
+      ...combos.slice(0, 6).map((combo, index) => ({
+        label: `#${index + 1}`,
+        value: `${credentialLabel(combo.username, combo.password)} / ${formatNumber(combo.count)} tries`
+      }))
+    ]
+  };
+}
+
+function suspiciousMetric(rows: NamedPair[]): MetricTarget {
+  return {
+    title: "Suspicious IPs",
+    value: formatNumber(rows.length),
+    summary: "IPs with suspicious or denied activity in the current window.",
+    rows: [
+      { label: "IPs", value: formatNumber(rows.length) },
+      ...rows.slice(0, 7).map((row) => ({ label: row.name, value: `${formatNumber(row.count)} events / ${formatNumber(row.denied ?? 0)} denied` }))
+    ]
+  };
+}
+
+function panicMetric(insights?: InsightsPayload): MetricTarget {
+  const rows = insights?.recent_panics ?? [];
+  return {
+    title: "Panics",
+    value: formatNumber(insights?.parsed_panics),
+    summary: "Parsed panic signals from recent logs.",
+    rows: [
+      { label: "Panics", value: formatNumber(insights?.parsed_panics) },
+      ...rows.slice(0, 6).map((row, index) => ({ label: `Recent ${index + 1}`, value: shortValue(panicText(row), 72) }))
+    ]
+  };
+}
+
+function bannedIPMetric(banned?: BannedPayload): MetricTarget {
+  const rows = banned?.ips ?? [];
+  return {
+    title: "Banned IPs",
+    value: formatNumber(rows.length),
+    summary: "IP addresses currently blocked by admin policy.",
+    rows: [
+      { label: "Banned IPs", value: formatNumber(rows.length) },
+      ...rows.slice(0, 8).map((row) => ({ label: row.ip || "ip", value: [row.comment, row.banned_at].filter(Boolean).join(" / ") }))
+    ]
+  };
+}
+
+function bannedUserMetric(banned?: BannedPayload): MetricTarget {
+  const rows = banned?.hashes ?? [];
+  return {
+    title: "Banned Users",
+    value: formatNumber(rows.length),
+    summary: "User hashes currently shadow-banned.",
+    rows: [
+      { label: "Banned Users", value: formatNumber(rows.length) },
+      ...rows.slice(0, 8).map((row) => ({ label: shortValue(row.hash, 18), value: row.banned_at }))
+    ]
+  };
+}
+
+function hostFromAddress(value: string): string {
+  if (!value) {
+    return "";
+  }
+  const bracketed = value.match(/^\[([^\]]+)\]:\d+$/);
+  if (bracketed) {
+    return bracketed[1];
+  }
+  const parts = value.split(":");
+  if (parts.length === 2 && /^\d+$/.test(parts[1])) {
+    return parts[0];
+  }
+  return value;
+}
+
+function titleCase(value: string): string {
+  if (!value) {
+    return "";
+  }
+  return value.slice(0, 1).toUpperCase() + value.slice(1).replace(/[_-]+/g, " ");
+}
+
 function rangeLabel(range: string): string {
   switch (range) {
     case "15m":
@@ -3765,6 +4446,28 @@ function rangeLabel(range: string): string {
     default:
       return range;
   }
+}
+
+function sourceFilterLabel(source: SourceFilter): string {
+  switch (source) {
+    case "sftp":
+      return "SFTP";
+    case "admin":
+      return "Admin";
+    case "explorer":
+      return "Explorer";
+    case "all":
+    default:
+      return "All sources";
+  }
+}
+
+function metricKey(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+}
+
+function isSmallViewport(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(max-width: 820px)").matches;
 }
 
 function adminPath(path: string, params: Record<string, string | number | undefined>): string {

@@ -89,6 +89,7 @@ export type DownloadFileRow = {
 export type LivePayload = {
   connections?: unknown[];
   sessions?: unknown[];
+  transfers?: unknown[];
   requests?: unknown[];
 };
 
