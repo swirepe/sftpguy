@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -343,5 +344,75 @@ func TestHandleAdminInsightsIncludesRecentPanics(t *testing.T) {
 	}
 	if resp.RecentPanics[0].Panic != "boom" {
 		t.Fatalf("unexpected recent panic value: got=%q", resp.RecentPanics[0].Panic)
+	}
+}
+
+func TestHandleAdminInsightsIncludesUserAgentDeviceStats(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	srv.store.LogEvent(EventDownload, "ua-user", "ua-session-1", nil,
+		"path", "docs/report.pdf",
+		"user_agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1",
+	)
+	srv.store.LogEvent(EventUpload, "ua-user", "ua-session-2", nil,
+		"path", "docs/upload.txt",
+		"source", "explorer",
+		"explorer_meta", map[string]any{
+			"headers": map[string]any{
+				"User-Agent": []any{"curl/8.4.0"},
+			},
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/insights?range=24h", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminInsights(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/insights status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		UserAgents []struct {
+			UserAgent string `json:"user_agent"`
+			Device    string `json:"device"`
+			Browser   string `json:"browser"`
+			Uploads   int64  `json:"uploads"`
+			Downloads int64  `json:"downloads"`
+			Explorer  int64  `json:"explorer"`
+		} `json:"user_agents"`
+		DeviceTypes []struct {
+			Name      string `json:"name"`
+			Count     int64  `json:"count"`
+			Uploads   int64  `json:"uploads"`
+			Downloads int64  `json:"downloads"`
+		} `json:"device_types"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode insights response: %v", err)
+	}
+
+	var sawMobile, sawCLI bool
+	for _, row := range resp.UserAgents {
+		if strings.Contains(row.UserAgent, "iPhone") {
+			sawMobile = row.Device == "mobile" && row.Browser == "Safari" && row.Downloads == 1
+		}
+		if row.UserAgent == "curl/8.4.0" {
+			sawCLI = row.Device == "cli" && row.Browser == "curl" && row.Uploads == 1 && row.Explorer == 1
+		}
+	}
+	if !sawMobile {
+		t.Fatalf("expected mobile Safari download user-agent in insights: %#v", resp.UserAgents)
+	}
+	if !sawCLI {
+		t.Fatalf("expected curl explorer upload user-agent in insights: %#v", resp.UserAgents)
+	}
+
+	deviceCounts := map[string]int64{}
+	for _, row := range resp.DeviceTypes {
+		deviceCounts[row.Name] = row.Count
+	}
+	if deviceCounts["mobile"] != 1 || deviceCounts["cli"] != 1 {
+		t.Fatalf("unexpected device counts: %#v", resp.DeviceTypes)
 	}
 }

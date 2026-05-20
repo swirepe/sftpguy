@@ -29,6 +29,7 @@ func storageVolumeForTarget(target storageTarget, format func(int64) string) adm
 		Label: target.Label,
 		Path:  absStoragePath(target.Path),
 	}
+	addStorageFileInfo(&volume, target, format)
 	if volume.Path == "" {
 		volume.Error = "path is not configured"
 		return volume

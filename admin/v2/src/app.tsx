@@ -17,7 +17,13 @@ import {
 type View = "overview" | "activity" | "thumbnails" | "users" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
 type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
-type InspectorTarget = { type: "none" } | { type: "path"; path: string } | { type: "event"; event: EventRow } | { type: "user"; user: UserRow };
+type ActorType = "ip" | "user";
+type InspectorTarget =
+  | { type: "none" }
+  | { type: "path"; path: string }
+  | { type: "event"; event: EventRow }
+  | { type: "user"; user: UserRow }
+  | { type: "actor"; actorType: ActorType; value: string };
 type ThumbnailKind = "image" | "video" | "pdf" | "archive" | "text" | "model" | "directory" | "other";
 type ThumbnailFilter = "all" | "visual" | ThumbnailKind;
 type ThumbnailSort = "recent" | "kind" | "source" | "name";
@@ -51,6 +57,33 @@ type NamedPair = NamedCount & {
   denied?: number;
 };
 
+type DeviceStat = NamedCount & {
+  uploads?: number;
+  downloads?: number;
+  denied?: number;
+  mutations?: number;
+  sessions?: number;
+  explorer?: number;
+  top_event?: string;
+};
+
+type UserAgentStat = {
+  user_agent: string;
+  device?: string;
+  browser?: string;
+  os?: string;
+  count?: number;
+  uploads?: number;
+  downloads?: number;
+  denied?: number;
+  mutations?: number;
+  sessions?: number;
+  explorer?: number;
+  last_time?: string;
+  last_ip?: string;
+  top_event?: string;
+};
+
 type ThumbnailCandidate = {
   path: string;
   source: string;
@@ -65,6 +98,8 @@ type InsightsPayload = {
   top_users?: NamedPair[];
   top_ips?: NamedPair[];
   suspicious_ips?: NamedPair[];
+  user_agents?: UserAgentStat[];
+  device_types?: DeviceStat[];
   parsed_levels?: NamedCount[];
   parsed_panics?: number;
   recent_panics?: unknown[];
@@ -153,6 +188,34 @@ type SessionTimelinePayload = {
   start_time?: string;
   end_time?: string;
   events?: EventRow[];
+};
+
+type ActorFileRow = {
+  path?: string;
+  name?: string;
+  owner?: string;
+  size?: number;
+  size_human?: string;
+  is_dir?: boolean;
+  event_count?: number;
+  upload_count?: number;
+  download_count?: number;
+  denied_count?: number;
+  last_time?: string;
+  last_event?: string;
+  last_user?: string;
+  last_ip?: string;
+};
+
+type ActorDetailPayload = {
+  actor_type?: ActorType;
+  actor?: string;
+  summary?: Record<string, unknown>;
+  events?: EventRow[];
+  recent_uploads?: UploadRow[];
+  sessions?: SessionRow[];
+  files?: ActorFileRow[];
+  window?: { label?: string };
 };
 
 type BannedPayload = {
@@ -331,6 +394,17 @@ export function App() {
     setInspectorTarget({ type: "user", user });
   }
 
+  function inspectActor(actorType: ActorType, value: string) {
+    if (value.trim() !== "") {
+      setInspectorTarget({ type: "actor", actorType, value });
+    }
+  }
+
+  function drillSearch(value: string, nextView: View = "activity") {
+    setQuery(value);
+    setView(nextView);
+  }
+
   function updateHueFromColor(hex: string) {
     setHue(hexToHue(hex));
     setHueInURL(true);
@@ -387,6 +461,8 @@ export function App() {
               onInspectEvent={inspectEvent}
               onInspectSession={inspectSession}
               onInspectUser={inspectUser}
+              onInspectActor={inspectActor}
+              onDrillSearch={drillSearch}
               onRunMaintenance={() => runMaintenance.mutate()}
               onBanIP={(ip) => banIP.mutate(ip)}
             />
@@ -396,6 +472,7 @@ export function App() {
               loading={events.isLoading}
               sourceFilter={sourceFilter}
               onInspectEvent={inspectEvent}
+              onInspectActor={inspectActor}
             />
           ) : view === "thumbnails" ? (
             <ThumbnailView
@@ -420,16 +497,19 @@ export function App() {
               banIPPending={banIP.isPending}
               onBanIP={(ip) => banIP.mutate(ip)}
               onInspectEvent={inspectEvent}
+              onInspectActor={inspectActor}
             />
           )}
         </section>
 
         <Inspector
           target={inspectorTarget}
+          range={range}
           banIPPending={banIP.isPending}
           onBanIP={(ip) => banIP.mutate(ip)}
           onInspectEvent={inspectEvent}
           onInspectUser={inspectUser}
+          onInspectActor={inspectActor}
           onOpenPath={openInspector}
           onClose={() => setInspectorTarget({ type: "none" })}
         />
@@ -534,6 +614,8 @@ function Overview(props: {
   onInspectEvent: (event: EventRow) => void;
   onInspectSession: (session: SessionRow) => void;
   onInspectUser: (user: UserRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
+  onDrillSearch: (value: string, view?: View) => void;
   onRunMaintenance: () => void;
   onBanIP: (ip: string) => void;
 }) {
@@ -544,6 +626,8 @@ function Overview(props: {
   const explorerShare = totalEvents > 0 ? Math.round((props.explorerEvents.length / totalEvents) * 100) : 0;
   const bannedHashes = props.banned?.hashes?.length ?? 0;
   const bannedIPs = props.banned?.ips?.length ?? 0;
+  const [showUploadThumbs, setShowUploadThumbs] = useState(false);
+  const [showDownloadThumbs, setShowDownloadThumbs] = useState(false);
 
   return (
     <div class="overview-grid">
@@ -584,25 +668,42 @@ function Overview(props: {
       </section>
 
       <section class="split">
-        <DataPanel title="Recent Uploads" empty="No uploads in this window">
+        <DevicePanel rows={props.insights?.device_types ?? []} />
+        <UserAgentPanel rows={props.insights?.user_agents ?? []} onDrill={(ua) => props.onDrillSearch(ua, "activity")} />
+      </section>
+
+      <section class="split">
+        <DataPanel
+          title="Recent Uploads"
+          empty="No uploads in this window"
+          action={<ToggleButton active={showUploadThumbs} label="Thumbnails" onClick={() => setShowUploadThumbs((value) => !value)} />}
+        >
           {props.uploads.map((row) => (
             <PathRow
               key={row.id}
               title={row.path || "(no path)"}
               detail={`${row.time || ""} ${row.user_id || ""}`}
               meta={formatBytes(row.size)}
+              path={row.path}
+              thumbnail={showUploadThumbs}
               onClick={() => props.onOpenPath(row.path)}
             />
           ))}
         </DataPanel>
 
-        <DataPanel title="Downloaded Files" empty="No download activity yet">
+        <DataPanel
+          title="Downloaded Files"
+          empty="No download activity yet"
+          action={<ToggleButton active={showDownloadThumbs} label="Thumbnails" onClick={() => setShowDownloadThumbs((value) => !value)} />}
+        >
           {downloads.map((row) => (
             <PathRow
               key={row.path}
               title={row.path}
               detail={`${row.downloads_total ?? 0} total, ${row.downloads_in_range ?? 0} in range`}
               meta={row.size_human || ""}
+              path={row.path}
+              thumbnail={showDownloadThumbs}
               onClick={() => props.onOpenPath(row.path)}
             />
           ))}
@@ -610,9 +711,9 @@ function Overview(props: {
       </section>
 
       <section class="triple">
-        <CountPanel title="Top Events" rows={props.insights?.top_events ?? []} />
-        <CountPanel title="Top Users" rows={props.insights?.top_users ?? []} denied />
-        <CountPanel title="Top IPs" rows={props.insights?.top_ips ?? []} denied />
+        <CountPanel title="Top Events" rows={props.insights?.top_events ?? []} onSelect={(name) => props.onDrillSearch(name, "activity")} />
+        <CountPanel title="Top Users" rows={props.insights?.top_users ?? []} denied onSelect={(name) => props.onInspectActor("user", name)} />
+        <CountPanel title="Top IPs" rows={props.insights?.top_ips ?? []} denied onSelect={(name) => props.onInspectActor("ip", name)} />
       </section>
 
       <section class="split">
@@ -631,6 +732,7 @@ function Overview(props: {
           banIPPending={props.banIPPending}
           onRunMaintenance={props.onRunMaintenance}
           onBanIP={props.onBanIP}
+          onInspectActor={props.onInspectActor}
         />
       </section>
 
@@ -650,6 +752,7 @@ function Activity(props: {
   loading: boolean;
   sourceFilter: SourceFilter;
   onInspectEvent: (event: EventRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
   const [kind, setKind] = useState<ActivityKind>("all");
   const rows = useMemo(() => props.rows.filter((row) => matchesActivityKind(row, kind)), [props.rows, kind]);
@@ -669,7 +772,7 @@ function Activity(props: {
 
       <section class="split">
         <ActivityBreakdownPanel profile={profile} />
-        <ActorBreakdownPanel rows={props.rows} />
+        <ActorBreakdownPanel rows={props.rows} onInspectActor={props.onInspectActor} />
       </section>
 
       <section class="wide-panel">
@@ -939,7 +1042,7 @@ function ThumbnailCard(props: {
           <img src={thumb.data} alt={label} />
         ) : (
           <span class={`thumbnail-placeholder ${preview.isError ? "error-state" : ""}`}>
-            {preview.isLoading ? "loading" : preview.isError ? "unavailable" : previewKind(data)}
+            {preview.isLoading ? "loading" : preview.isError ? "unavailable" : <FileIcon kind={data ? kindForPreview(data) : props.candidate.kind} label={label} />}
           </span>
         )}
       </button>
@@ -1178,6 +1281,7 @@ function Security(props: {
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
   onInspectEvent: (event: EventRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
   const attempts = props.auth?.attempts ?? [];
   const combos = props.auth?.combos ?? [];
@@ -1210,7 +1314,7 @@ function Security(props: {
       </section>
 
       <section class="split">
-        <SuspiciousPanel rows={suspicious} banIPPending={props.banIPPending} onBanIP={props.onBanIP} />
+        <SuspiciousPanel rows={suspicious} banIPPending={props.banIPPending} onBanIP={props.onBanIP} onInspectActor={props.onInspectActor} />
         <AuthCombosPanel combos={combos} banIPPending={props.banIPPending} onBanIP={props.onBanIP} />
       </section>
 
@@ -1227,18 +1331,23 @@ function Security(props: {
   );
 }
 
-function SuspiciousPanel(props: { rows: NamedPair[]; banIPPending: boolean; onBanIP: (ip: string) => void }) {
+function SuspiciousPanel(props: {
+  rows: NamedPair[];
+  banIPPending: boolean;
+  onBanIP: (ip: string) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
+}) {
   return (
     <DataPanel title="Suspicious IPs" empty="No suspicious IPs in this window">
       {props.rows.slice(0, 12).map((row) => (
         <div class="dense-row risk-row" key={row.name}>
-          <div>
+          <button class="dense-row-main" type="button" onClick={() => props.onInspectActor("ip", row.name)}>
             <strong>{row.name}</strong>
             <small>{row.count} events, {row.denied ?? 0} denied</small>
             <div class="mini-track">
               <i style={{ width: `${Math.max(5, Math.min(100, (row.denied ?? 0) * 12))}%` }} />
             </div>
-          </div>
+          </button>
           <button type="button" onClick={() => props.onBanIP(row.name)} disabled={props.banIPPending}>
             Ban IP
           </button>
@@ -1371,7 +1480,7 @@ function ActivityBreakdownPanel({ profile }: { profile: ReturnType<typeof activi
   );
 }
 
-function ActorBreakdownPanel({ rows }: { rows: EventRow[] }) {
+function ActorBreakdownPanel({ rows, onInspectActor }: { rows: EventRow[]; onInspectActor: (actorType: ActorType, value: string) => void }) {
   const users = topCounts(rows, (row) => row.user_id || "anonymous", 5);
   const ips = topCounts(rows, (row) => row.ip || "unknown", 5);
   return (
@@ -1379,11 +1488,11 @@ function ActorBreakdownPanel({ rows }: { rows: EventRow[] }) {
       <div class="actor-columns">
         <div>
           <h3>Users</h3>
-          <BarList rows={users} />
+          <BarList rows={users} onSelect={(name) => onInspectActor("user", name)} />
         </div>
         <div>
           <h3>IPs</h3>
-          <BarList rows={ips} />
+          <BarList rows={ips} onSelect={(name) => onInspectActor("ip", name)} />
         </div>
       </div>
     </DataPanel>
@@ -1463,6 +1572,7 @@ function StorageRow({ volume }: { volume: NonNullable<SummaryPayload["storage"]>
   const free = volume.free || formatBytes(volume.free_bytes);
   const total = volume.total || formatBytes(volume.total_bytes);
   const usedPercent = clampPercent(volume.used_percent);
+  const sidecars = volume.sidecars ?? [];
   return (
     <div class={`storage-row ${volume.error ? "warning" : ""}`}>
       <div class="storage-row-head">
@@ -1477,6 +1587,16 @@ function StorageRow({ volume }: { volume: NonNullable<SummaryPayload["storage"]>
           <small>
             {free} free of {total}
           </small>
+          {volume.file_exists ? <small>{volume.file_size || formatBytes(volume.file_bytes)} file</small> : volume.kind === "log" || volume.kind === "database" ? <small>file not present yet</small> : null}
+          {sidecars.length > 0 ? (
+            <div class="storage-sidecars">
+              {sidecars.map((file) => (
+                <span key={file.path || file.label}>
+                  {file.label}: {file.size || formatBytes(file.size_bytes)}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </>
       ) : (
         <small>{volume.error}</small>
@@ -1544,19 +1664,69 @@ function EventTimelinePanel({ rows }: { rows: EventRow[] }) {
   );
 }
 
-function BarList({ rows }: { rows: NamedCount[] }) {
+function DevicePanel({ rows }: { rows: DeviceStat[] }) {
+  return (
+    <DataPanel title="Device Types" empty="No user-agent data in this window">
+      {rows.slice(0, 8).map((row) => (
+        <div class="dense-row device-row" key={row.name}>
+          <div>
+            <strong>{row.name}</strong>
+            <small>
+              {formatNumber(row.uploads)} up / {formatNumber(row.downloads)} down / {formatNumber(row.sessions)} sessions
+            </small>
+            <div class="mini-track">
+              <i style={{ width: `${Math.max(4, Math.min(100, percentOf(row.explorer ?? 0, row.count || 1)))}%` }} />
+            </div>
+          </div>
+          <span>{formatNumber(row.count)}</span>
+          <span>{row.top_event || "events"}</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function UserAgentPanel({ rows, onDrill }: { rows: UserAgentStat[]; onDrill: (ua: string) => void }) {
+  return (
+    <DataPanel title="User Agents" empty="No user-agent strings captured">
+      {rows.slice(0, 8).map((row) => (
+        <button class="dense-row ua-row" type="button" key={row.user_agent} onClick={() => onDrill(row.user_agent)}>
+          <div>
+            <strong>{shortUserAgent(row.user_agent)}</strong>
+            <small>
+              {[row.device, row.browser, row.os].filter(Boolean).join(" / ")} {row.last_ip ? `from ${row.last_ip}` : ""}
+            </small>
+          </div>
+          <span>{formatNumber(row.count)} hits</span>
+          <span>{uaActivityLabel(row)}</span>
+        </button>
+      ))}
+    </DataPanel>
+  );
+}
+
+function BarList({ rows, onSelect }: { rows: NamedCount[]; onSelect?: (name: string) => void }) {
   const max = Math.max(...rows.map((row) => row.count), 1);
   return (
     <div class="bar-list">
       {rows.map((row) => {
         const width = Math.max(2, Math.round((row.count / max) * 100));
-        return (
-          <div class="bar-row" key={row.name}>
+        const content = (
+          <>
             <span>{row.name}</span>
             <div class="bar-track">
               <i style={{ width: `${width}%` }} />
             </div>
             <strong>{formatNumber(row.count)}</strong>
+          </>
+        );
+        return onSelect ? (
+          <button class="bar-row clickable" type="button" key={row.name} onClick={() => onSelect(row.name)}>
+            {content}
+          </button>
+        ) : (
+          <div class="bar-row" key={row.name}>
+            {content}
           </div>
         );
       })}
@@ -1658,6 +1828,7 @@ function RiskPanel(props: {
   banIPPending: boolean;
   onRunMaintenance: () => void;
   onBanIP: (ip: string) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
   const suspicious = props.insights?.suspicious_ips ?? [];
   const running = Boolean(props.maintenance?.running);
@@ -1676,10 +1847,10 @@ function RiskPanel(props: {
       </div>
       {suspicious.map((ip) => (
         <div class="dense-row risk-row" key={ip.name}>
-          <div>
+          <button class="dense-row-main" type="button" onClick={() => props.onInspectActor("ip", ip.name)}>
             <strong>{ip.name}</strong>
             <small>{ip.count} events, {ip.denied ?? 0} denied</small>
-          </div>
+          </button>
           <button type="button" onClick={() => props.onBanIP(ip.name)} disabled={props.banIPPending}>
             Ban IP
           </button>
@@ -1689,32 +1860,45 @@ function RiskPanel(props: {
   );
 }
 
-function CountPanel({ title, rows, denied }: { title: string; rows: NamedPair[]; denied?: boolean }) {
+function CountPanel({ title, rows, denied, onSelect }: { title: string; rows: NamedPair[]; denied?: boolean; onSelect?: (name: string) => void }) {
   const max = Math.max(...rows.slice(0, 10).map((row) => row.count), 1);
   return (
     <DataPanel title={title} empty="No rows">
-      {rows.slice(0, 10).map((row) => (
-        <div class="dense-row" key={row.name}>
-          <div>
+      {rows.slice(0, 10).map((row) => {
+        const content = (
+          <>
             <strong>{shortValue(row.name, 28)}</strong>
             {denied ? <small>{row.denied ?? 0} denied</small> : null}
             <div class="mini-track">
               <i style={{ width: `${Math.max(3, Math.round((row.count / max) * 100))}%` }} />
             </div>
+          </>
+        );
+        return (
+          <div class="dense-row" key={row.name}>
+            {onSelect ? (
+              <button class="dense-row-main" type="button" onClick={() => onSelect(row.name)}>
+                {content}
+              </button>
+            ) : (
+              <div>{content}</div>
+            )}
+            <span>{formatNumber(row.count)}</span>
           </div>
-          <span>{formatNumber(row.count)}</span>
-        </div>
-      ))}
+        );
+      })}
     </DataPanel>
   );
 }
 
 function Inspector(props: {
   target: InspectorTarget;
+  range: string;
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
   onInspectEvent: (event: EventRow) => void;
   onInspectUser: (user: UserRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
   onOpenPath: (path?: string) => void;
   onClose: () => void;
 }) {
@@ -1722,6 +1906,7 @@ function Inspector(props: {
   const [notice, setNotice] = useState("");
   const event = props.target.type === "event" ? props.target.event : undefined;
   const user = props.target.type === "user" ? props.target.user : undefined;
+  const actor = props.target.type === "actor" ? props.target : undefined;
   const selectedPath = targetPath(props.target);
   const sessionID = eventSession(event);
   const selectedUser = user?.hash || "";
@@ -1744,7 +1929,7 @@ function Inspector(props: {
 
   const sessionTimeline = useQuery({
     queryKey: ["session-timeline", sessionID],
-    queryFn: () => api<SessionTimelinePayload>(adminPath(`/admin/api/sessions/${encodeURIComponent(sessionID)}`, { limit: 36 })),
+    queryFn: () => api<SessionTimelinePayload>(adminPath(`/admin/api/sessions/${encodeURIComponent(sessionID)}`, { limit: 120 })),
     enabled: sessionID !== ""
   });
 
@@ -1752,6 +1937,19 @@ function Inspector(props: {
     queryKey: ["user-detail", selectedUser],
     queryFn: () => api<UserDetailPayload>(`/admin/api/users/${encodeURIComponent(selectedUser)}`),
     enabled: selectedUser !== ""
+  });
+
+  const actorDetails = useQuery({
+    queryKey: ["actor-detail", actor?.actorType, actor?.value, props.range],
+    queryFn: () =>
+      api<ActorDetailPayload>(
+        adminPath("/admin/api/actor", {
+          type: actor?.actorType || "ip",
+          value: actor?.value || "",
+          range: props.range
+        })
+      ),
+    enabled: Boolean(actor?.value)
   });
 
   const action = useMutation({
@@ -1835,7 +2033,7 @@ function Inspector(props: {
           <div class="inspector-head">
             <div>
               <span class="eyebrow">Inspector</span>
-              <h2>{user ? shortValue(user.hash, 22) : event ? event.event || "Event" : data?.name || selectedPath}</h2>
+              <h2>{actor ? `${actor.actorType.toUpperCase()} ${shortValue(actor.value, 22)}` : user ? shortValue(user.hash, 22) : event ? event.event || "Event" : data?.name || selectedPath}</h2>
             </div>
             <button type="button" onClick={props.onClose} aria-label="Close inspector">
               Close
@@ -1850,7 +2048,19 @@ function Inspector(props: {
               banIPPending={props.banIPPending}
               onBanIP={props.onBanIP}
               onInspectUser={props.onInspectUser}
+              onInspectActor={props.onInspectActor}
               onNotice={setNotice}
+            />
+          ) : null}
+          {actor ? (
+            <ActorDetailBox
+              actor={actor}
+              details={actorDetails.data}
+              loading={actorDetails.isLoading}
+              onInspectEvent={props.onInspectEvent}
+              onInspectSession={(session) => props.onInspectEvent(eventFromSession(session))}
+              onInspectUser={props.onInspectUser}
+              onOpenPath={props.onOpenPath}
             />
           ) : null}
           {user ? (
@@ -2001,6 +2211,7 @@ function EventActions(props: {
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
   onInspectUser: (user: UserRow) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
   onNotice: (notice: string) => void;
 }) {
   const session = eventSession(props.event);
@@ -2040,6 +2251,11 @@ function EventActions(props: {
         </a>
       ) : null}
       {ip ? (
+        <button type="button" onClick={() => props.onInspectActor("ip", ip)}>
+          Inspect IP
+        </button>
+      ) : null}
+      {ip ? (
         <a class="button-link" href={adminPath("/admin/v2/", { view: "security", q: ip })}>
           Filter IP
         </a>
@@ -2070,6 +2286,7 @@ function UserDetailBox(props: {
   const banned = Boolean(props.details?.is_banned ?? props.user.is_banned);
   const files = props.details?.files ?? [];
   const events = props.details?.events ?? [];
+  const [showFileThumbs, setShowFileThumbs] = useState(false);
   if (props.loading) {
     return <div class="detail-box subtle">Loading user details...</div>;
   }
@@ -2104,11 +2321,20 @@ function UserDetailBox(props: {
       <div class="session-box">
         <div class="panel-heading">
           <h3>User Files</h3>
-          <span>{files.length} files</span>
+          <div class="heading-actions">
+            <span>{files.length} files</span>
+            <ToggleButton active={showFileThumbs} label="Thumbnails" onClick={() => setShowFileThumbs((value) => !value)} />
+          </div>
         </div>
         <div class="timeline-list">
           {files.slice(0, 12).map((file) => (
-            <button class="timeline-row user-file-row" type="button" key={file.path || file.name} onClick={() => props.onOpenPath(file.path)}>
+            <button
+              class={`timeline-row user-file-row ${showFileThumbs ? "with-file-preview" : ""}`}
+              type="button"
+              key={file.path || file.name}
+              onClick={() => props.onOpenPath(file.path)}
+            >
+              {showFileThumbs && file.path ? <FilePreviewBadge path={file.path} /> : null}
               <span>{file.is_dir ? "dir" : file.size_human || formatBytes(file.size)}</span>
               <strong>{file.name || file.path || "file"}</strong>
               <em>{file.path || ""}</em>
@@ -2138,6 +2364,109 @@ function UserDetailBox(props: {
   );
 }
 
+function ActorDetailBox(props: {
+  actor: { actorType: ActorType; value: string };
+  details?: ActorDetailPayload;
+  loading: boolean;
+  onInspectEvent: (event: EventRow) => void;
+  onInspectSession: (session: SessionRow) => void;
+  onInspectUser: (user: UserRow) => void;
+  onOpenPath: (path?: string) => void;
+}) {
+  const files = props.details?.files ?? [];
+  const sessions = props.details?.sessions ?? [];
+  const events = props.details?.events ?? [];
+  const summary = props.details?.summary ?? {};
+  const isBanned = Boolean(summary.is_banned);
+  const [showThumbs, setShowThumbs] = useState(true);
+  if (props.loading) {
+    return <div class="detail-box subtle">Loading actor drilldown...</div>;
+  }
+  return (
+    <>
+      <div class="event-card actor-card">
+        <div class="event-card-head">
+          <SourcePill source={props.actor.actorType === "ip" ? "explorer" : "sftp"} />
+          <span class={isBanned ? "status-chip hot" : "status-chip"}>{isBanned ? "banned" : "observed"}</span>
+        </div>
+        <dl class="metadata">
+          <Meta label={props.actor.actorType === "ip" ? "IP" : "User"} value={props.details?.actor || props.actor.value} />
+          <Meta label="Window" value={props.details?.window?.label} />
+          <Meta label="Events" value={formatNumber(numberFromUnknown(summary.events))} />
+          <Meta label="Files" value={formatNumber(numberFromUnknown(summary.files))} />
+          <Meta label="Sessions" value={formatNumber(numberFromUnknown(summary.sessions))} />
+          <Meta label="Uploads" value={formatNumber(numberFromUnknown(summary.recent_uploads))} />
+        </dl>
+        <div class="inspector-actions event-actions">
+          {props.actor.actorType === "user" ? (
+            <button type="button" onClick={() => props.onInspectUser({ hash: props.details?.actor || props.actor.value })}>
+              Inspect User
+            </button>
+          ) : null}
+          <a class="button-link" href={adminPath("/admin/v2/", { view: "activity", q: props.details?.actor || props.actor.value })}>
+            Filter Activity
+          </a>
+        </div>
+      </div>
+
+      <div class="session-box">
+        <div class="panel-heading">
+          <h3>Files</h3>
+          <div class="heading-actions">
+            <span>{files.length} touched</span>
+            <ToggleButton active={showThumbs} label="Thumbnails" onClick={() => setShowThumbs((value) => !value)} />
+          </div>
+        </div>
+        <div class="timeline-list">
+          {files.slice(0, 18).map((file) => (
+            <button class={`timeline-row actor-file-row ${showThumbs ? "with-file-preview" : ""}`} type="button" key={file.path || file.name} onClick={() => props.onOpenPath(file.path)}>
+              {showThumbs && file.path ? <FilePreviewBadge path={file.path} /> : null}
+              <span>{file.is_dir ? "dir" : file.size_human || formatBytes(file.size)}</span>
+              <strong>{file.path || file.name || "file"}</strong>
+              <em>{actorFileDetail(file)}</em>
+            </button>
+          ))}
+          {files.length === 0 ? <div class="empty">No file paths for this actor in the current window.</div> : null}
+        </div>
+      </div>
+
+      <div class="session-box">
+        <div class="panel-heading">
+          <h3>Sessions</h3>
+          <span>{sessions.length} sessions</span>
+        </div>
+        <div class="timeline-list">
+          {sessions.slice(0, 10).map((session) => (
+            <button class="timeline-row" type="button" key={session.session} onClick={() => props.onInspectSession(session)}>
+              <span>{formatDuration(session.duration_sec)}</span>
+              <strong>{shortValue(session.session, 18)}</strong>
+              <em>{`${formatNumber(session.event_count)} events ${session.ip || ""}`}</em>
+            </button>
+          ))}
+          {sessions.length === 0 ? <div class="empty">No sessions for this actor.</div> : null}
+        </div>
+      </div>
+
+      <div class="session-box">
+        <div class="panel-heading">
+          <h3>Recent Events</h3>
+          <span>{events.length} events</span>
+        </div>
+        <div class="timeline-list">
+          {events.slice(0, 14).map((event) => (
+            <button class="timeline-row" type="button" key={event.id} onClick={() => props.onInspectEvent(event)}>
+              <span>{event.time || ""}</span>
+              <strong>{event.event || "event"}</strong>
+              <em>{targetPath({ type: "event", event }) || event.session || event.ip || ""}</em>
+            </button>
+          ))}
+          {events.length === 0 ? <div class="empty">No recent events for this actor.</div> : null}
+        </div>
+      </div>
+    </>
+  );
+}
+
 function EventMetaBlock({ event }: { event: EventRow }) {
   const metaObject = event.meta_obj && Object.keys(event.meta_obj).length > 0 ? event.meta_obj : null;
   const text = metaObject ? JSON.stringify(metaObject, null, 2) : event.meta || "";
@@ -2155,7 +2484,15 @@ function EventMetaBlock({ event }: { event: EventRow }) {
 }
 
 function SessionTimelineBox({ session, loading, onInspectEvent }: { session?: SessionTimelinePayload; loading: boolean; onInspectEvent: (event: EventRow) => void }) {
-  const rows = session?.events ?? [];
+  const rows = useMemo(
+    () => [...(session?.events ?? [])].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0) || a.id - b.id),
+    [session?.events]
+  );
+  const profile = useMemo(() => activityProfile(rows), [rows]);
+  const started = session?.started_at ?? rows[0]?.timestamp ?? 0;
+  const ended = session?.ended_at ?? rows[rows.length - 1]?.timestamp ?? started;
+  const duration = Math.max(0, ended - started);
+  const hasEndEvent = rows.some((row) => (row.event || "").toLowerCase() === "session/end");
   if (loading) {
     return <div class="detail-box subtle">Loading session timeline...</div>;
   }
@@ -2163,10 +2500,10 @@ function SessionTimelineBox({ session, loading, onInspectEvent }: { session?: Se
     return null;
   }
   return (
-    <div class="session-box">
+    <div class="session-box session-viewer">
       <div class="panel-heading">
         <h3>Session Timeline</h3>
-        <span>{rows.length} events</span>
+        <span class={hasEndEvent ? "status-chip" : "status-chip hot"}>{hasEndEvent ? "complete" : "active"}</span>
       </div>
       <dl class="metadata compact-meta">
         <Meta label="Session" value={session.session} />
@@ -2175,10 +2512,36 @@ function SessionTimelineBox({ session, loading, onInspectEvent }: { session?: Se
         <Meta label="Started" value={session.start_time} />
         <Meta label="Ended" value={session.end_time} />
       </dl>
-      <div class="timeline-list">
-        {rows.slice(0, 16).map((row) => (
-          <button class="timeline-row" type="button" key={row.id} onClick={() => onInspectEvent({ ...row, session: session.session })}>
-            <span>{row.time || ""}</span>
+      <div class="session-stat-strip">
+        <Metric label="Events" value={formatNumber(rows.length)} compact />
+        <Metric label="Duration" value={formatDuration(duration)} compact />
+        <Metric label="Transfers" value={formatNumber(profile.transfer)} compact />
+        <Metric label="Denied" value={formatNumber(profile.denied)} compact tone={profile.denied > 0 ? "warn" : "normal"} />
+      </div>
+      <div class="session-rail" aria-label="Session event timeline">
+        <div class="session-rail-line" />
+        {rows.map((row, index) => (
+          <button
+            class={`session-node ${sessionNodeClass(row)}`}
+            type="button"
+            key={row.id}
+            style={{ left: `${sessionNodeLeft(row, started, ended, index, rows.length)}%` }}
+            title={`${row.time || ""} ${row.event || "event"}`}
+            onClick={() => onInspectEvent({ ...row, session: session.session })}
+          >
+            <span>{shortEventName(row.event)}</span>
+          </button>
+        ))}
+      </div>
+      <div class="session-axis">
+        <span>{session.start_time || "start"}</span>
+        <strong>{formatDuration(duration)}</strong>
+        <span>{hasEndEvent ? session.end_time || "end" : "now"}</span>
+      </div>
+      <div class="timeline-list session-event-list">
+        {rows.map((row) => (
+          <button class={`timeline-row session-event-row ${sessionNodeClass(row)}`} type="button" key={row.id} onClick={() => onInspectEvent({ ...row, session: session.session })}>
+            <span>{sessionOffset(row, started)}</span>
             <strong>{row.event || "event"}</strong>
             <em>{targetPath({ type: "event", event: row }) || statusFor(row)}</em>
           </button>
@@ -2280,12 +2643,13 @@ function SourcePill({ source }: { source: string }) {
   return <span class={`source-pill ${source}`}>{source}</span>;
 }
 
-function DataPanel(props: { title: string; empty: string; children: ComponentChildren }) {
+function DataPanel(props: { title: string; empty: string; children: ComponentChildren; action?: ComponentChildren }) {
   const hasChildren = hasRenderableChildren(props.children);
   return (
     <section class="data-panel">
       <div class="panel-heading">
         <h2>{props.title}</h2>
+        {props.action ? <div class="heading-actions">{props.action}</div> : null}
       </div>
       {hasChildren ? props.children : <div class="empty">{props.empty}</div>}
     </section>
@@ -2299,9 +2663,115 @@ function hasRenderableChildren(children: ComponentChildren): boolean {
   return children !== null && children !== undefined && children !== false;
 }
 
-function PathRow(props: { title: string; detail: string; meta: string; onClick: () => void }) {
+function ToggleButton(props: { active: boolean; label: string; onClick: () => void }) {
   return (
-    <button class="path-row" type="button" onClick={props.onClick}>
+    <button class={`toggle-button ${props.active ? "active" : ""}`} type="button" onClick={props.onClick}>
+      {props.label}
+    </button>
+  );
+}
+
+function FilePreviewBadge({ path, size = "small" }: { path: string; size?: "small" | "large" }) {
+  const preview = useQuery({
+    queryKey: ["file-preview-badge", path],
+    queryFn: () => api<PreviewPayload>(previewURL(path)),
+    staleTime: 60_000
+  });
+  const thumb = useQuery({
+    queryKey: ["file-preview-badge-thumb", preview.data?.thumb_url],
+    queryFn: () => fetchBlobURL(preview.data?.thumb_url || ""),
+    enabled: Boolean(preview.data?.thumb_url),
+    staleTime: 60_000
+  });
+  const kind = preview.data ? kindForPreview(preview.data) : thumbnailKindForPath(path);
+  const label = preview.data?.name || basename(path);
+  return (
+    <span class={`file-preview-badge ${size} ${kind}`} aria-hidden="true">
+      {thumb.data && !thumb.isError ? <img src={thumb.data} alt="" /> : <FileIcon kind={kind} label={label} />}
+    </span>
+  );
+}
+
+function FileIcon({ kind, label }: { kind: ThumbnailKind | "danger"; label?: string }) {
+  const title = label || kind;
+  switch (kind) {
+    case "image":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <circle cx="8.5" cy="8.5" r="1.5" />
+          <polyline points="21 15 16 10 5 21" />
+        </svg>
+      );
+    case "video":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <rect x="2" y="3" width="20" height="18" rx="2" />
+          <path d="m10 8 5 4-5 4V8z" />
+        </svg>
+      );
+    case "text":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <line x1="8" y1="13" x2="16" y2="13" />
+          <line x1="8" y1="17" x2="16" y2="17" />
+        </svg>
+      );
+    case "archive":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <polyline points="21 8 21 21 3 21 3 8" />
+          <rect x="1" y="3" width="22" height="5" />
+          <line x1="10" y1="12" x2="14" y2="12" />
+        </svg>
+      );
+    case "pdf":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <line x1="8" y1="13" x2="12" y2="13" />
+          <line x1="8" y1="17" x2="16" y2="17" />
+        </svg>
+      );
+    case "model":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M12 2 2 7l10 5 10-5-10-5z" />
+          <path d="m2 17 10 5 10-5" />
+          <path d="m2 12 10 5 10-5" />
+        </svg>
+      );
+    case "directory":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
+      );
+    case "danger":
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M10.29 3.86 1.82 18A2 2 0 0 0 3.53 21h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+          <line x1="12" y1="9" x2="12" y2="13" />
+          <line x1="12" y1="17" x2="12.01" y2="17" />
+        </svg>
+      );
+    default:
+      return (
+        <svg viewBox="0 0 24 24" role="img" aria-label={title}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+      );
+  }
+}
+
+function PathRow(props: { title: string; detail: string; meta: string; path?: string; thumbnail?: boolean; onClick: () => void }) {
+  return (
+    <button class={`path-row ${props.thumbnail ? "with-thumbnail" : ""}`} type="button" onClick={props.onClick}>
+      {props.thumbnail && props.path ? <FilePreviewBadge path={props.path} /> : null}
       <span>
         <strong>{props.title}</strong>
         <small>{props.detail}</small>
@@ -2690,6 +3160,42 @@ function isExecEvent(row: EventRow): boolean {
   return text.includes("exec") || text.includes("command") || eventCommand(row) !== "";
 }
 
+function sessionNodeClass(row: EventRow): string {
+  if (isDeniedEvent(row) || isAttentionEvent(row)) {
+    return "attention";
+  }
+  if (isTransferEvent(row)) {
+    return "transfer";
+  }
+  if (isMutatingEvent(row)) {
+    return "mutation";
+  }
+  if (isSessionEvent(row)) {
+    return "session";
+  }
+  return "neutral";
+}
+
+function sessionNodeLeft(row: EventRow, started: number, ended: number, index: number, total: number): number {
+  if (ended > started && row.timestamp) {
+    return Math.max(1, Math.min(99, ((row.timestamp - started) / (ended - started)) * 100));
+  }
+  if (total <= 1) {
+    return 50;
+  }
+  return Math.max(1, Math.min(99, (index / (total - 1)) * 100));
+}
+
+function shortEventName(event: string | undefined): string {
+  const name = (event || "event").replace("session/", "sess/").replace("download", "down").replace("upload", "up");
+  return name.length > 9 ? `${name.slice(0, 8)}.` : name;
+}
+
+function sessionOffset(row: EventRow, started: number): string {
+  const offset = Math.max(0, (row.timestamp ?? started) - started);
+  return `+${formatDuration(offset)}`;
+}
+
 function topCounts(rows: EventRow[], value: (row: EventRow) => string, limit: number): NamedCount[] {
   const counts = new Map<string, number>();
   for (const row of rows) {
@@ -3011,6 +3517,31 @@ function previewKind(preview?: PreviewPayload): string {
   return preview.ext || "file";
 }
 
+function kindForPreview(preview: PreviewPayload): ThumbnailKind {
+  if (preview.is_dir) {
+    return "directory";
+  }
+  if (preview.is_image) {
+    return "image";
+  }
+  if (preview.is_video) {
+    return "video";
+  }
+  if (preview.is_pdf) {
+    return "pdf";
+  }
+  if (preview.is_archive) {
+    return "archive";
+  }
+  if (preview.is_text) {
+    return "text";
+  }
+  if (preview.is_stl) {
+    return "model";
+  }
+  return thumbnailKindForPath(preview.rel_path || preview.name);
+}
+
 function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: InsightsPayload): string {
   if (events.length === 0) {
     return "No events recorded in the current window.";
@@ -3033,6 +3564,35 @@ function securityCopy(attempts: AuthAttemptRow[], suspicious: NamedPair[], denie
     return `${attempts.length} auth attempts in view, no suspicious IPs flagged.`;
   }
   return "No auth attempts or high-risk signals in this window.";
+}
+
+function shortUserAgent(ua: string): string {
+  return ua
+    .replace(/\s+/g, " ")
+    .replace(/Mozilla\/5\.0\s*/i, "")
+    .trim()
+    .slice(0, 86);
+}
+
+function uaActivityLabel(row: UserAgentStat): string {
+  const parts = [
+    (row.uploads ?? 0) > 0 ? `${formatNumber(row.uploads)} up` : "",
+    (row.downloads ?? 0) > 0 ? `${formatNumber(row.downloads)} down` : "",
+    (row.denied ?? 0) > 0 ? `${formatNumber(row.denied)} denied` : "",
+    (row.mutations ?? 0) > 0 ? `${formatNumber(row.mutations)} changes` : ""
+  ].filter(Boolean);
+  return parts.join(" / ") || row.top_event || "activity";
+}
+
+function actorFileDetail(file: ActorFileRow): string {
+  const parts = [
+    file.last_event || "",
+    file.last_time || "",
+    file.upload_count ? `${formatNumber(file.upload_count)} up` : "",
+    file.download_count ? `${formatNumber(file.download_count)} down` : "",
+    file.denied_count ? `${formatNumber(file.denied_count)} denied` : ""
+  ].filter(Boolean);
+  return parts.join(" / ");
 }
 
 function panicText(row: unknown): string {
@@ -3100,6 +3660,17 @@ function formatNumber(value: number | undefined): string {
     return "0";
   }
   return new Intl.NumberFormat().format(value);
+}
+
+function numberFromUnknown(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
 }
 
 function formatBytes(value: number | undefined): string {

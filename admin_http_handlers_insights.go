@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -13,6 +14,41 @@ var (
 	ipBanTimestampPattern      = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b`)
 	ipBanLegacyBannedAtPattern = regexp.MustCompile(`\bbanned_at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\b`)
 )
+
+type adminUserAgentStat struct {
+	UserAgent string `json:"user_agent"`
+	Device    string `json:"device"`
+	Browser   string `json:"browser"`
+	OS        string `json:"os"`
+	Count     int64  `json:"count"`
+	Uploads   int64  `json:"uploads"`
+	Downloads int64  `json:"downloads"`
+	Denied    int64  `json:"denied"`
+	Mutations int64  `json:"mutations"`
+	Sessions  int64  `json:"sessions"`
+	Explorer  int64  `json:"explorer"`
+	LastTime  string `json:"last_time"`
+	LastIP    string `json:"last_ip"`
+	TopEvent  string `json:"top_event"`
+}
+
+type adminDeviceStat struct {
+	Name      string `json:"name"`
+	Count     int64  `json:"count"`
+	Uploads   int64  `json:"uploads"`
+	Downloads int64  `json:"downloads"`
+	Denied    int64  `json:"denied"`
+	Mutations int64  `json:"mutations"`
+	Sessions  int64  `json:"sessions"`
+	Explorer  int64  `json:"explorer"`
+	TopEvent  string `json:"top_event"`
+}
+
+type adminUAProfile struct {
+	Device  string
+	Browser string
+	OS      string
+}
 
 func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -120,6 +156,8 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	userAgents, deviceTypes := s.adminUserAgentInsights(since)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"window": map[string]any{
 			"label":      window.Label,
@@ -148,7 +186,308 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		"parsed_lines_considered": len(lines),
 		"parsed_panics":           panicCount,
 		"recent_panics":           recentPanics,
+		"user_agents":             userAgents,
+		"device_types":            deviceTypes,
 	})
+}
+
+func (s *Server) adminUserAgentInsights(since int64) ([]adminUserAgentStat, []adminDeviceStat) {
+	rows, err := s.store.db.Query(`
+		SELECT timestamp, event, IFNULL(ip_address, ''), IFNULL(meta, '')
+		FROM log
+		WHERE timestamp >= ? AND IFNULL(meta, '') != ''
+		ORDER BY id DESC
+		LIMIT 5000`, since)
+	if err != nil {
+		return nil, nil
+	}
+	defer rows.Close()
+
+	agents := map[string]*adminUserAgentStat{}
+	devices := map[string]*adminDeviceStat{}
+	agentEvents := map[string]map[string]int64{}
+	deviceEvents := map[string]map[string]int64{}
+
+	for rows.Next() {
+		var ts int64
+		var event, ip, meta string
+		if err := rows.Scan(&ts, &event, &ip, &meta); err != nil {
+			continue
+		}
+		metaObj := parseJSONMap(meta)
+		ua := userAgentFromMeta(metaObj)
+		if ua == "" {
+			continue
+		}
+		profile := classifyUserAgent(ua)
+		agent := agents[ua]
+		if agent == nil {
+			agent = &adminUserAgentStat{
+				UserAgent: ua,
+				Device:    profile.Device,
+				Browser:   profile.Browser,
+				OS:        profile.OS,
+			}
+			agents[ua] = agent
+		}
+		device := devices[profile.Device]
+		if device == nil {
+			device = &adminDeviceStat{Name: profile.Device}
+			devices[profile.Device] = device
+		}
+
+		applyUserAgentActivity(agent, event)
+		applyDeviceActivity(device, event)
+		agent.Count++
+		device.Count++
+		if ts > 0 && (agent.LastTime == "" || formatUnix(ts) > agent.LastTime) {
+			agent.LastTime = formatUnix(ts)
+			agent.LastIP = ip
+		}
+		if sourceFromEventMeta(event, metaObj) == "explorer" {
+			agent.Explorer++
+			device.Explorer++
+		}
+		if agentEvents[ua] == nil {
+			agentEvents[ua] = map[string]int64{}
+		}
+		if deviceEvents[profile.Device] == nil {
+			deviceEvents[profile.Device] = map[string]int64{}
+		}
+		agentEvents[ua][event]++
+		deviceEvents[profile.Device][event]++
+	}
+
+	agentOut := make([]adminUserAgentStat, 0, len(agents))
+	for ua, item := range agents {
+		item.TopEvent = topEventName(agentEvents[ua])
+		agentOut = append(agentOut, *item)
+	}
+	sort.Slice(agentOut, func(i, j int) bool {
+		if agentOut[i].Count == agentOut[j].Count {
+			return agentOut[i].UserAgent < agentOut[j].UserAgent
+		}
+		return agentOut[i].Count > agentOut[j].Count
+	})
+	if len(agentOut) > 12 {
+		agentOut = agentOut[:12]
+	}
+
+	deviceOut := make([]adminDeviceStat, 0, len(devices))
+	for name, item := range devices {
+		item.TopEvent = topEventName(deviceEvents[name])
+		deviceOut = append(deviceOut, *item)
+	}
+	sort.Slice(deviceOut, func(i, j int) bool {
+		if deviceOut[i].Count == deviceOut[j].Count {
+			return deviceOut[i].Name < deviceOut[j].Name
+		}
+		return deviceOut[i].Count > deviceOut[j].Count
+	})
+	return agentOut, deviceOut
+}
+
+func userAgentFromMeta(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	for _, key := range []string{"user_agent", "user-agent", "User-Agent", "userAgent"} {
+		if value := userAgentValue(meta[key]); value != "" {
+			return value
+		}
+	}
+	if value := userAgentFromHeaders(meta["headers"]); value != "" {
+		return value
+	}
+	if nested, ok := meta["explorer_meta"].(map[string]any); ok {
+		for _, key := range []string{"user_agent", "user-agent", "User-Agent", "userAgent"} {
+			if value := userAgentValue(nested[key]); value != "" {
+				return value
+			}
+		}
+		if value := userAgentFromHeaders(nested["headers"]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func userAgentFromHeaders(raw any) string {
+	headers, ok := raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for key, value := range headers {
+		if strings.EqualFold(key, "User-Agent") {
+			if ua := userAgentValue(value); ua != "" {
+				return ua
+			}
+		}
+	}
+	return ""
+}
+
+func userAgentValue(raw any) string {
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []string:
+		if len(value) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(value[0])
+	case []any:
+		if len(value) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(stringFromAny(value[0]))
+	default:
+		return strings.TrimSpace(stringFromAny(value))
+	}
+}
+
+func classifyUserAgent(ua string) adminUAProfile {
+	lower := strings.ToLower(ua)
+	profile := adminUAProfile{
+		Device:  "unknown",
+		Browser: "unknown",
+		OS:      "unknown",
+	}
+
+	switch {
+	case strings.Contains(lower, "bot") || strings.Contains(lower, "spider") || strings.Contains(lower, "crawler"):
+		profile.Device = "bot"
+	case strings.Contains(lower, "curl") || strings.Contains(lower, "wget") || strings.Contains(lower, "python-requests") ||
+		strings.Contains(lower, "go-http-client") || strings.Contains(lower, "httpie") || strings.Contains(lower, "okhttp"):
+		profile.Device = "cli"
+	case strings.Contains(lower, "ipad") || strings.Contains(lower, "tablet") || (strings.Contains(lower, "android") && !strings.Contains(lower, "mobile")):
+		profile.Device = "tablet"
+	case strings.Contains(lower, "mobile") || strings.Contains(lower, "iphone") || strings.Contains(lower, "android"):
+		profile.Device = "mobile"
+	case strings.Contains(lower, "windows") || strings.Contains(lower, "macintosh") || strings.Contains(lower, "x11") || strings.Contains(lower, "linux"):
+		profile.Device = "desktop"
+	}
+
+	switch {
+	case strings.Contains(lower, "edg/") || strings.Contains(lower, "edge/"):
+		profile.Browser = "Edge"
+	case strings.Contains(lower, "firefox/"):
+		profile.Browser = "Firefox"
+	case strings.Contains(lower, "chrome/") || strings.Contains(lower, "chromium/"):
+		profile.Browser = "Chrome"
+	case strings.Contains(lower, "safari/") && strings.Contains(lower, "version/"):
+		profile.Browser = "Safari"
+	case strings.Contains(lower, "curl/"):
+		profile.Browser = "curl"
+	case strings.Contains(lower, "wget/"):
+		profile.Browser = "wget"
+	case strings.Contains(lower, "python-requests"):
+		profile.Browser = "python-requests"
+	case strings.Contains(lower, "go-http-client"):
+		profile.Browser = "go-http-client"
+	case profile.Device == "bot":
+		profile.Browser = "bot"
+	}
+
+	switch {
+	case strings.Contains(lower, "iphone") || strings.Contains(lower, "ipad") || strings.Contains(lower, "cpu os"):
+		profile.OS = "iOS"
+	case strings.Contains(lower, "android"):
+		profile.OS = "Android"
+	case strings.Contains(lower, "windows"):
+		profile.OS = "Windows"
+	case strings.Contains(lower, "mac os x") || strings.Contains(lower, "macintosh"):
+		profile.OS = "macOS"
+	case strings.Contains(lower, "linux") || strings.Contains(lower, "x11"):
+		profile.OS = "Linux"
+	case profile.Device == "bot":
+		profile.OS = "bot"
+	}
+
+	return profile
+}
+
+func applyUserAgentActivity(row *adminUserAgentStat, event string) {
+	if row == nil {
+		return
+	}
+	kind := adminEventActivityKind(event)
+	switch kind {
+	case "upload":
+		row.Uploads++
+	case "download":
+		row.Downloads++
+	case "denied":
+		row.Denied++
+	case "mutation":
+		row.Mutations++
+	case "session":
+		row.Sessions++
+	}
+}
+
+func applyDeviceActivity(row *adminDeviceStat, event string) {
+	if row == nil {
+		return
+	}
+	kind := adminEventActivityKind(event)
+	switch kind {
+	case "upload":
+		row.Uploads++
+	case "download":
+		row.Downloads++
+	case "denied":
+		row.Denied++
+	case "mutation":
+		row.Mutations++
+	case "session":
+		row.Sessions++
+	}
+}
+
+func adminEventActivityKind(event string) string {
+	name := strings.ToLower(strings.TrimSpace(event))
+	switch {
+	case strings.Contains(name, "denied"):
+		return "denied"
+	case strings.Contains(name, "upload"):
+		return "upload"
+	case strings.Contains(name, "download"):
+		return "download"
+	case strings.Contains(name, "session"):
+		return "session"
+	case strings.Contains(name, "delete") || strings.Contains(name, "rename") || strings.Contains(name, "ban") || strings.Contains(name, "write"):
+		return "mutation"
+	default:
+		return "other"
+	}
+}
+
+func sourceFromEventMeta(event string, meta map[string]any) string {
+	source := strings.ToLower(strings.TrimSpace(stringFromAny(meta["source"])))
+	if source == "explorer" || source == "admin" || source == "sftp" {
+		return source
+	}
+	name := strings.ToLower(strings.TrimSpace(event))
+	if strings.HasPrefix(name, "explorer_") {
+		return "explorer"
+	}
+	if strings.HasPrefix(name, "admin/") {
+		return "admin"
+	}
+	return "sftp"
+}
+
+func topEventName(counts map[string]int64) string {
+	var best string
+	var bestCount int64
+	for name, count := range counts {
+		if count > bestCount || (count == bestCount && (best == "" || name < best)) {
+			best = name
+			bestCount = count
+		}
+	}
+	return best
 }
 
 func (s *Server) handleAdminSystemLog(w http.ResponseWriter, r *http.Request) {

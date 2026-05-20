@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -630,6 +631,23 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		DeniedCount int64  `json:"denied_count"`
 		HasEnd      bool   `json:"has_end"`
 	}
+	type actorFile struct {
+		Path          string `json:"path"`
+		Name          string `json:"name"`
+		Owner         string `json:"owner"`
+		Size          int64  `json:"size"`
+		SizeHuman     string `json:"size_human"`
+		IsDir         bool   `json:"is_dir"`
+		EventCount    int64  `json:"event_count"`
+		UploadCount   int64  `json:"upload_count"`
+		DownloadCount int64  `json:"download_count"`
+		DeniedCount   int64  `json:"denied_count"`
+		LastTimestamp int64  `json:"last_timestamp"`
+		LastTime      string `json:"last_time"`
+		LastEvent     string `json:"last_event"`
+		LastUser      string `json:"last_user"`
+		LastIP        string `json:"last_ip"`
+	}
 
 	whereField := "user_id"
 	if actorType == "ip" {
@@ -748,10 +766,73 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		sessions = append(sessions, row)
 	}
 
+	fileRows, err := s.store.db.Query(`
+		WITH latest_file AS (
+			SELECT path, MAX(id) AS latest_id
+			FROM log
+			WHERE `+whereField+` = ? AND timestamp >= ? AND path != ''
+			GROUP BY path
+		)
+		SELECT
+			l.path,
+			COUNT(*) AS event_count,
+			SUM(CASE WHEN l.event = 'upload' THEN 1 ELSE 0 END) AS upload_count,
+			SUM(CASE WHEN l.event = 'download' THEN 1 ELSE 0 END) AS download_count,
+			SUM(CASE WHEN l.event LIKE 'denied%' THEN 1 ELSE 0 END) AS denied_count,
+			MAX(l.timestamp) AS last_timestamp,
+			IFNULL(last_log.event, '') AS last_event,
+			IFNULL(last_log.user_id, '') AS last_user,
+			IFNULL(last_log.ip_address, '') AS last_ip,
+			IFNULL(f.owner_hash, '') AS owner,
+			IFNULL(f.size, 0) AS size,
+			IFNULL(f.is_dir, 0) AS is_dir
+		FROM log l
+		JOIN latest_file lf ON lf.path = l.path
+		JOIN log last_log ON last_log.id = lf.latest_id
+		LEFT JOIN files f ON f.path = l.path
+		WHERE l.`+whereField+` = ? AND l.timestamp >= ? AND l.path != ''
+		GROUP BY l.path, last_log.event, last_log.user_id, last_log.ip_address, f.owner_hash, f.size, f.is_dir
+		ORDER BY last_timestamp DESC, event_count DESC, l.path ASC
+		LIMIT 50`, value, window.SinceUnix, value, window.SinceUnix)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer fileRows.Close()
+
+	files := make([]actorFile, 0, 50)
+	for fileRows.Next() {
+		var row actorFile
+		var isDir int
+		if err := fileRows.Scan(
+			&row.Path,
+			&row.EventCount,
+			&row.UploadCount,
+			&row.DownloadCount,
+			&row.DeniedCount,
+			&row.LastTimestamp,
+			&row.LastEvent,
+			&row.LastUser,
+			&row.LastIP,
+			&row.Owner,
+			&row.Size,
+			&isDir,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		row.Name = filepath.Base(row.Path)
+		row.IsDir = isDir == 1
+		row.SizeHuman = formatBytes(row.Size)
+		row.LastTime = formatUnix(row.LastTimestamp)
+		files = append(files, row)
+	}
+
 	summary := map[string]any{
 		"events":         len(events),
 		"recent_uploads": len(uploads),
 		"sessions":       len(sessions),
+		"files":          len(files),
 	}
 
 	if actorType == "user" {
@@ -770,6 +851,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		"events":         events,
 		"recent_uploads": uploads,
 		"sessions":       sessions,
+		"files":          files,
 		"window": map[string]any{
 			"label":      window.Label,
 			"since_unix": window.SinceUnix,

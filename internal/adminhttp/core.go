@@ -20,21 +20,34 @@ type CoreDeps interface {
 }
 
 type StorageVolume struct {
-	ID          string  `json:"id"`
-	Kind        string  `json:"kind"`
-	Label       string  `json:"label"`
-	Path        string  `json:"path"`
-	StatPath    string  `json:"stat_path,omitempty"`
-	DeviceID    string  `json:"device_id,omitempty"`
-	TotalBytes  int64   `json:"total_bytes"`
-	FreeBytes   int64   `json:"free_bytes"`
-	UsedBytes   int64   `json:"used_bytes"`
-	Total       string  `json:"total,omitempty"`
-	Free        string  `json:"free,omitempty"`
-	Used        string  `json:"used,omitempty"`
-	UsedPercent float64 `json:"used_percent"`
-	FreePercent float64 `json:"free_percent"`
-	Error       string  `json:"error,omitempty"`
+	ID          string        `json:"id"`
+	Kind        string        `json:"kind"`
+	Label       string        `json:"label"`
+	Path        string        `json:"path"`
+	StatPath    string        `json:"stat_path,omitempty"`
+	DeviceID    string        `json:"device_id,omitempty"`
+	FileBytes   int64         `json:"file_bytes,omitempty"`
+	FileSize    string        `json:"file_size,omitempty"`
+	FileExists  bool          `json:"file_exists"`
+	Sidecars    []StorageFile `json:"sidecars,omitempty"`
+	TotalBytes  int64         `json:"total_bytes"`
+	FreeBytes   int64         `json:"free_bytes"`
+	UsedBytes   int64         `json:"used_bytes"`
+	Total       string        `json:"total,omitempty"`
+	Free        string        `json:"free,omitempty"`
+	Used        string        `json:"used,omitempty"`
+	UsedPercent float64       `json:"used_percent"`
+	FreePercent float64       `json:"free_percent"`
+	Error       string        `json:"error,omitempty"`
+}
+
+type StorageFile struct {
+	Label     string `json:"label"`
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	Size      string `json:"size,omitempty"`
+	Exists    bool   `json:"exists"`
+	Error     string `json:"error,omitempty"`
 }
 
 func HealthHandler(deps CoreDeps) http.HandlerFunc {

@@ -22,6 +22,10 @@ export type StorageVolume = {
   path?: string;
   stat_path?: string;
   device_id?: string;
+  file_bytes?: number;
+  file_size?: string;
+  file_exists?: boolean;
+  sidecars?: StorageFile[];
   total_bytes?: number;
   free_bytes?: number;
   used_bytes?: number;
@@ -30,6 +34,15 @@ export type StorageVolume = {
   used?: string;
   used_percent?: number;
   free_percent?: number;
+  error?: string;
+};
+
+export type StorageFile = {
+  label?: string;
+  path?: string;
+  size_bytes?: number;
+  size?: string;
+  exists?: boolean;
   error?: string;
 };
 
