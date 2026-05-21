@@ -59,6 +59,8 @@ type RouteHandlers struct {
 	Banned           http.HandlerFunc
 	BanIP            http.HandlerFunc
 	UnbanIP          http.HandlerFunc
+	GeoIP            http.HandlerFunc
+	GeoIPLookup      http.HandlerFunc
 	Maintenance      http.HandlerFunc
 	MaintenanceRun   http.HandlerFunc
 	MaintenanceLogs  http.HandlerFunc
@@ -158,6 +160,8 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/api/banned", cfg, handlers.Banned)
 	register(mux, "/admin/api/banned/ip", cfg, handlers.BanIP)
 	register(mux, "/admin/api/banned/ip/", cfg, handlers.UnbanIP)
+	register(mux, "/admin/api/geoip", cfg, handlers.GeoIP)
+	register(mux, "/admin/api/geoip/lookup", cfg, handlers.GeoIPLookup)
 	register(mux, "/admin/api/maintenance", cfg, handlers.Maintenance)
 	register(mux, "/admin/api/maintenance/run", cfg, handlers.MaintenanceRun)
 	register(mux, "/admin/api/maintenance/logs", cfg, handlers.MaintenanceLogs)

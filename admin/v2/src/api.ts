@@ -53,6 +53,7 @@ export type EventRow = {
   event?: string;
   user_id?: string;
   ip?: string;
+  geo?: GeoLocation;
   path?: string;
   meta?: string;
   meta_obj?: Record<string, unknown>;
@@ -64,6 +65,7 @@ export type UploadRow = {
   time?: string;
   user_id?: string;
   ip?: string;
+  geo?: GeoLocation;
   path?: string;
   size?: number;
   delta?: number;
@@ -91,6 +93,25 @@ export type LivePayload = {
   sessions?: unknown[];
   transfers?: unknown[];
   requests?: unknown[];
+};
+
+export type GeoLocation = {
+  ip?: string;
+  database?: string;
+  database_id?: string;
+  city?: string;
+  region?: string;
+  region_code?: string;
+  country?: string;
+  country_code?: string;
+  continent?: string;
+  continent_code?: string;
+  latitude?: number;
+  longitude?: number;
+  timezone?: string;
+  postal_code?: string;
+  accuracy_radius?: number;
+  attribution?: string;
 };
 
 export type ArchiveEntry = {

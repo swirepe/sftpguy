@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"sftpguy/internal/geoip"
 )
 
 func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
@@ -15,6 +17,7 @@ func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.flushConnectionLimitAggregatesForAdmin()
 	window := parseTimeWindow(r, "24h")
 	q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
 	limit := parseIntQuery(r, "limit", 100, 10, 500)
@@ -68,6 +71,7 @@ func (s *Server) handleAdminAuthAttempts(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.flushConnectionLimitAggregatesForAdmin()
 	window := parseTimeWindow(r, "24h")
 	limit := parseIntQuery(r, "limit", 500, 10, 3000)
 	comboLimit := parseIntQuery(r, "combo_limit", 120, 10, 500)
@@ -89,23 +93,25 @@ func (s *Server) handleAdminAuthAttempts(w http.ResponseWriter, r *http.Request)
 	defer rows.Close()
 
 	type authAttemptRow struct {
-		ID          int64  `json:"id"`
-		Timestamp   int64  `json:"timestamp"`
-		Time        string `json:"time"`
-		IP          string `json:"ip"`
-		UserID      string `json:"user_id"`
-		Session     string `json:"session"`
-		Username    string `json:"username"`
-		Password    string `json:"password"`
-		GeneratedID string `json:"generated_hash"`
+		ID          int64           `json:"id"`
+		Timestamp   int64           `json:"timestamp"`
+		Time        string          `json:"time"`
+		IP          string          `json:"ip"`
+		Geo         *geoip.Location `json:"geo,omitempty"`
+		UserID      string          `json:"user_id"`
+		Session     string          `json:"session"`
+		Username    string          `json:"username"`
+		Password    string          `json:"password"`
+		GeneratedID string          `json:"generated_hash"`
 	}
 	type comboRow struct {
-		Username      string `json:"username"`
-		Password      string `json:"password"`
-		Count         int64  `json:"count"`
-		LastTimestamp int64  `json:"last_timestamp"`
-		LastTime      string `json:"last_time"`
-		LastIP        string `json:"last_ip"`
+		Username      string          `json:"username"`
+		Password      string          `json:"password"`
+		Count         int64           `json:"count"`
+		LastTimestamp int64           `json:"last_timestamp"`
+		LastTime      string          `json:"last_time"`
+		LastIP        string          `json:"last_ip"`
+		LastGeo       *geoip.Location `json:"last_geo,omitempty"`
 	}
 
 	type comboAgg struct {
@@ -130,6 +136,7 @@ func (s *Server) handleAdminAuthAttempts(w http.ResponseWriter, r *http.Request)
 		row.Password = stringFromAny(metaObj["password"])
 		row.GeneratedID = stringFromAny(metaObj["generated_hash"])
 		row.Time = formatUnix(row.Timestamp)
+		row.Geo = geoLocationOrNil(s, row.IP)
 
 		key := row.Username + "\x00" + row.Password
 		agg := comboByKey[key]
@@ -160,6 +167,7 @@ func (s *Server) handleAdminAuthAttempts(w http.ResponseWriter, r *http.Request)
 			LastTimestamp: agg.LastTimestamp,
 			LastTime:      formatUnix(agg.LastTimestamp),
 			LastIP:        agg.LastIP,
+			LastGeo:       geoLocationOrNil(s, agg.LastIP),
 		})
 	}
 	sort.Slice(combos, func(i, j int) bool {
@@ -193,6 +201,7 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.flushConnectionLimitAggregatesForAdmin()
 	window := parseTimeWindow(r, "24h")
 	q := "%" + strings.TrimSpace(r.URL.Query().Get("q")) + "%"
 	limit := parseIntQuery(r, "limit", 300, 10, 2000)
@@ -226,16 +235,17 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type eventRow struct {
-		ID        int64          `json:"id"`
-		Timestamp int64          `json:"timestamp"`
-		Time      string         `json:"time"`
-		Event     string         `json:"event"`
-		UserID    string         `json:"user_id"`
-		IP        string         `json:"ip"`
-		Path      string         `json:"path"`
-		Meta      string         `json:"meta"`
-		MetaObj   map[string]any `json:"meta_obj,omitempty"`
-		Session   string         `json:"session"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		Event     string          `json:"event"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Meta      string          `json:"meta"`
+		MetaObj   map[string]any  `json:"meta_obj,omitempty"`
+		Session   string          `json:"session"`
 	}
 
 	out := make([]eventRow, 0, limit+1)
@@ -249,6 +259,7 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
 		row.MetaObj = parseJSONMap(row.Meta)
+		row.Geo = geoLocationOrNil(s, row.IP)
 		if row.ID > lastID {
 			lastID = row.ID
 		}
@@ -287,6 +298,7 @@ func (s *Server) handleAdminEventStream(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.flushConnectionLimitAggregatesForAdmin()
 	window := parseTimeWindow(r, "24h")
 	sinceID := parseInt64Query(r, "since_id", 0)
 	limit := parseIntQuery(r, "limit", 120, 10, 500)
@@ -306,16 +318,17 @@ func (s *Server) handleAdminEventStream(w http.ResponseWriter, r *http.Request) 
 	defer rows.Close()
 
 	type eventRow struct {
-		ID        int64          `json:"id"`
-		Timestamp int64          `json:"timestamp"`
-		Time      string         `json:"time"`
-		Event     string         `json:"event"`
-		UserID    string         `json:"user_id"`
-		IP        string         `json:"ip"`
-		Path      string         `json:"path"`
-		Meta      string         `json:"meta"`
-		MetaObj   map[string]any `json:"meta_obj,omitempty"`
-		Session   string         `json:"session"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		Event     string          `json:"event"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Meta      string          `json:"meta"`
+		MetaObj   map[string]any  `json:"meta_obj,omitempty"`
+		Session   string          `json:"session"`
 	}
 
 	out := make([]eventRow, 0, limit)
@@ -328,6 +341,7 @@ func (s *Server) handleAdminEventStream(w http.ResponseWriter, r *http.Request) 
 		}
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
 		row.MetaObj = parseJSONMap(row.Meta)
+		row.Geo = geoLocationOrNil(s, row.IP)
 		if row.ID > lastID {
 			lastID = row.ID
 		}
@@ -376,20 +390,21 @@ func (s *Server) handleAdminSessions(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	type sessionRow struct {
-		Session     string `json:"session"`
-		UserID      string `json:"user_id"`
-		IP          string `json:"ip"`
-		StartedAt   int64  `json:"started_at"`
-		EndedAt     int64  `json:"ended_at"`
-		StartTime   string `json:"start_time"`
-		EndTime     string `json:"end_time"`
-		DurationSec int64  `json:"duration_sec"`
-		EventCount  int64  `json:"event_count"`
-		UploadCount int64  `json:"upload_count"`
-		DownloadCnt int64  `json:"download_count"`
-		DeniedCount int64  `json:"denied_count"`
-		HasStart    bool   `json:"has_start"`
-		HasEnd      bool   `json:"has_end"`
+		Session     string          `json:"session"`
+		UserID      string          `json:"user_id"`
+		IP          string          `json:"ip"`
+		Geo         *geoip.Location `json:"geo,omitempty"`
+		StartedAt   int64           `json:"started_at"`
+		EndedAt     int64           `json:"ended_at"`
+		StartTime   string          `json:"start_time"`
+		EndTime     string          `json:"end_time"`
+		DurationSec int64           `json:"duration_sec"`
+		EventCount  int64           `json:"event_count"`
+		UploadCount int64           `json:"upload_count"`
+		DownloadCnt int64           `json:"download_count"`
+		DeniedCount int64           `json:"denied_count"`
+		HasStart    bool            `json:"has_start"`
+		HasEnd      bool            `json:"has_end"`
 	}
 
 	out := make([]sessionRow, 0, limit)
@@ -411,6 +426,7 @@ func (s *Server) handleAdminSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		row.HasStart = starts > 0
 		row.HasEnd = ends > 0
+		row.Geo = geoLocationOrNil(s, row.IP)
 		out = append(out, row)
 	}
 
@@ -462,15 +478,16 @@ func (s *Server) handleAdminSessionTimeline(w http.ResponseWriter, r *http.Reque
 	defer rows.Close()
 
 	type timelineRow struct {
-		ID        int64          `json:"id"`
-		Timestamp int64          `json:"timestamp"`
-		Time      string         `json:"time"`
-		Event     string         `json:"event"`
-		UserID    string         `json:"user_id"`
-		IP        string         `json:"ip"`
-		Path      string         `json:"path"`
-		Meta      string         `json:"meta"`
-		MetaObj   map[string]any `json:"meta_obj,omitempty"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		Event     string          `json:"event"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Meta      string          `json:"meta"`
+		MetaObj   map[string]any  `json:"meta_obj,omitempty"`
 	}
 
 	events := make([]timelineRow, 0, limit)
@@ -484,6 +501,7 @@ func (s *Server) handleAdminSessionTimeline(w http.ResponseWriter, r *http.Reque
 		}
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
 		row.MetaObj = parseJSONMap(row.Meta)
+		row.Geo = geoLocationOrNil(s, row.IP)
 		if startedAt == 0 || row.Timestamp < startedAt {
 			startedAt = row.Timestamp
 		}
@@ -503,6 +521,7 @@ func (s *Server) handleAdminSessionTimeline(w http.ResponseWriter, r *http.Reque
 		"session":    sessionID,
 		"user_id":    userID,
 		"ip":         ip,
+		"geo":        geoLocationOrNil(s, ip),
 		"started_at": startedAt,
 		"ended_at":   endedAt,
 		"start_time": formatUnix(startedAt),
@@ -535,16 +554,17 @@ func (s *Server) handleAdminRecentUploads(w http.ResponseWriter, r *http.Request
 	defer rows.Close()
 
 	type uploadRow struct {
-		ID        int64  `json:"id"`
-		Timestamp int64  `json:"timestamp"`
-		Time      string `json:"time"`
-		UserID    string `json:"user_id"`
-		IP        string `json:"ip"`
-		Path      string `json:"path"`
-		Size      int64  `json:"size"`
-		Delta     int64  `json:"delta"`
-		Session   string `json:"session"`
-		Meta      string `json:"meta"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Size      int64           `json:"size"`
+		Delta     int64           `json:"delta"`
+		Session   string          `json:"session"`
+		Meta      string          `json:"meta"`
 	}
 
 	out := make([]uploadRow, 0, limit)
@@ -560,6 +580,7 @@ func (s *Server) handleAdminRecentUploads(w http.ResponseWriter, r *http.Request
 		row.Size = int64FromAny(metaObj["size"])
 		row.Delta = int64FromAny(metaObj["delta"])
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
+		row.Geo = geoLocationOrNil(s, row.IP)
 		out = append(out, row)
 	}
 
@@ -593,43 +614,46 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type actorEvent struct {
-		ID        int64          `json:"id"`
-		Timestamp int64          `json:"timestamp"`
-		Time      string         `json:"time"`
-		Event     string         `json:"event"`
-		UserID    string         `json:"user_id"`
-		IP        string         `json:"ip"`
-		Path      string         `json:"path"`
-		Session   string         `json:"session"`
-		Meta      string         `json:"meta"`
-		MetaObj   map[string]any `json:"meta_obj,omitempty"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		Event     string          `json:"event"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Session   string          `json:"session"`
+		Meta      string          `json:"meta"`
+		MetaObj   map[string]any  `json:"meta_obj,omitempty"`
 	}
 	type actorUpload struct {
-		ID        int64  `json:"id"`
-		Timestamp int64  `json:"timestamp"`
-		Time      string `json:"time"`
-		UserID    string `json:"user_id"`
-		IP        string `json:"ip"`
-		Path      string `json:"path"`
-		Size      int64  `json:"size"`
-		Delta     int64  `json:"delta"`
-		Session   string `json:"session"`
-		Meta      string `json:"meta"`
+		ID        int64           `json:"id"`
+		Timestamp int64           `json:"timestamp"`
+		Time      string          `json:"time"`
+		UserID    string          `json:"user_id"`
+		IP        string          `json:"ip"`
+		Geo       *geoip.Location `json:"geo,omitempty"`
+		Path      string          `json:"path"`
+		Size      int64           `json:"size"`
+		Delta     int64           `json:"delta"`
+		Session   string          `json:"session"`
+		Meta      string          `json:"meta"`
 	}
 	type actorSession struct {
-		Session     string `json:"session"`
-		UserID      string `json:"user_id"`
-		IP          string `json:"ip"`
-		StartedAt   int64  `json:"started_at"`
-		EndedAt     int64  `json:"ended_at"`
-		StartTime   string `json:"start_time"`
-		EndTime     string `json:"end_time"`
-		DurationSec int64  `json:"duration_sec"`
-		EventCount  int64  `json:"event_count"`
-		UploadCount int64  `json:"upload_count"`
-		DownloadCnt int64  `json:"download_count"`
-		DeniedCount int64  `json:"denied_count"`
-		HasEnd      bool   `json:"has_end"`
+		Session     string          `json:"session"`
+		UserID      string          `json:"user_id"`
+		IP          string          `json:"ip"`
+		Geo         *geoip.Location `json:"geo,omitempty"`
+		StartedAt   int64           `json:"started_at"`
+		EndedAt     int64           `json:"ended_at"`
+		StartTime   string          `json:"start_time"`
+		EndTime     string          `json:"end_time"`
+		DurationSec int64           `json:"duration_sec"`
+		EventCount  int64           `json:"event_count"`
+		UploadCount int64           `json:"upload_count"`
+		DownloadCnt int64           `json:"download_count"`
+		DeniedCount int64           `json:"denied_count"`
+		HasEnd      bool            `json:"has_end"`
 	}
 	type actorFile struct {
 		Path          string `json:"path"`
@@ -694,6 +718,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		}
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
 		row.MetaObj = parseJSONMap(row.Meta)
+		row.Geo = geoLocationOrNil(s, row.IP)
 		events = append(events, row)
 	}
 
@@ -722,6 +747,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		row.Size = int64FromAny(metaObj["size"])
 		row.Delta = int64FromAny(metaObj["delta"])
 		row.Time = time.Unix(row.Timestamp, 0).Format("2006-01-02 15:04:05")
+		row.Geo = geoLocationOrNil(s, row.IP)
 		uploads = append(uploads, row)
 	}
 
@@ -763,6 +789,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		row.EndTime = formatUnix(row.EndedAt)
 		row.DurationSec = row.EndedAt - row.StartedAt
 		row.HasEnd = ends > 0
+		row.Geo = geoLocationOrNil(s, row.IP)
 		sessions = append(sessions, row)
 	}
 
@@ -842,6 +869,7 @@ func (s *Server) handleAdminActor(w http.ResponseWriter, r *http.Request) {
 		summary["is_banned"] = stats.IsBanned
 	} else {
 		summary["is_banned"] = s.store.IsIPBanned(value)
+		summary["geo"] = geoLocationOrNil(s, value)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

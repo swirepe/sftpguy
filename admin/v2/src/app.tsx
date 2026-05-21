@@ -8,6 +8,7 @@ import {
   previewURL,
   type DownloadFileRow,
   type EventRow,
+  type GeoLocation,
   type LivePayload,
   type PreviewPayload,
   type SummaryPayload,
@@ -64,6 +65,36 @@ type NamedCount = {
 
 type NamedPair = NamedCount & {
   denied?: number;
+  geo?: GeoLocation;
+};
+
+type GeoDatabaseStatus = {
+  id: string;
+  name: string;
+  path?: string;
+  source_url?: string;
+  source_repo?: string;
+  license?: string;
+  attribution?: string;
+  cadence?: string;
+  present?: boolean;
+  loaded?: boolean;
+  size?: string;
+  size_bytes?: number;
+  file_time?: string;
+  build_time?: string;
+  next_update?: string;
+  update_due?: boolean;
+  database_type?: string;
+  last_error?: string;
+};
+
+type GeoIPStatus = {
+  enabled?: boolean;
+  auto_update?: boolean;
+  data_dir?: string;
+  provider?: string;
+  databases?: GeoDatabaseStatus[];
 };
 
 type DeviceStat = NamedCount & {
@@ -107,6 +138,9 @@ type InsightsPayload = {
   top_users?: NamedPair[];
   top_ips?: NamedPair[];
   suspicious_ips?: NamedPair[];
+  geo_countries?: NamedCount[];
+  geo_cities?: NamedCount[];
+  geoip?: GeoIPStatus;
   user_agents?: UserAgentStat[];
   device_types?: DeviceStat[];
   parsed_levels?: NamedCount[];
@@ -172,6 +206,7 @@ type SessionRow = {
   session: string;
   user_id?: string;
   ip?: string;
+  geo?: GeoLocation;
   started_at?: number;
   ended_at?: number;
   start_time?: string;
@@ -192,6 +227,7 @@ type SessionTimelinePayload = {
   session?: string;
   user_id?: string;
   ip?: string;
+  geo?: GeoLocation;
   started_at?: number;
   ended_at?: number;
   start_time?: string;
@@ -237,6 +273,7 @@ type AuthAttemptRow = {
   timestamp?: number;
   time?: string;
   ip?: string;
+  geo?: GeoLocation;
   user_id?: string;
   session?: string;
   username?: string;
@@ -251,6 +288,7 @@ type AuthComboRow = {
   last_timestamp?: number;
   last_time?: string;
   last_ip?: string;
+  last_geo?: GeoLocation;
 };
 
 type AuthAttemptsPayload = {
@@ -699,6 +737,7 @@ function Overview(props: {
   const downloads = props.downloads?.files ?? [];
   const summary = props.summary;
   const kpi = props.insights?.kpi ?? {};
+  const connMaxHits = numberFromUnknown(kpi.conn_max_hits);
   const totalEvents = props.eventRows.length;
   const explorerShare = totalEvents > 0 ? Math.round((props.explorerEvents.length / totalEvents) * 100) : 0;
   const bannedHashes = props.banned?.hashes?.length ?? 0;
@@ -723,6 +762,12 @@ function Overview(props: {
           value={formatNumber(kpi.denied)}
           tone={Number(kpi.denied || 0) > 0 ? "warn" : "normal"}
           onClick={() => props.onOpenActivity("denied")}
+        />
+        <Metric
+          label="Conn Max"
+          value={formatNumber(connMaxHits)}
+          tone={connMaxHits > 0 ? "warn" : "normal"}
+          onClick={() => props.onOpenActivity("denied", "all", "denied/connection-limit")}
         />
         <Metric label="Live" value={formatNumber(props.liveCount)} onClick={() => props.onInspectMetric(liveMetric(props.live, props.liveCount))} />
         <Metric label="Explorer" value={`${explorerShare}%`} onClick={() => props.onOpenActivity("all", "explorer")} />
@@ -1410,7 +1455,9 @@ function Security(props: {
   const bannedIPs = props.banned?.ips ?? [];
   const bannedHashes = props.banned?.hashes ?? [];
   const denied = props.insights?.kpi?.denied ?? 0;
+  const connMaxHits = numberFromUnknown(props.insights?.kpi?.conn_max_hits);
   const panics = props.insights?.parsed_panics ?? 0;
+  const geoStatus = props.insights?.geoip;
   return (
     <div class="activity-grid">
       <section class="metric-strip activity-metrics" aria-label="Security summary">
@@ -1438,7 +1485,14 @@ function Security(props: {
           tone={denied > 0 ? "warn" : "normal"}
           onClick={() => props.onOpenActivity("denied")}
         />
+        <Metric
+          label="Conn Max"
+          value={formatNumber(connMaxHits)}
+          tone={connMaxHits > 0 ? "warn" : "normal"}
+          onClick={() => props.onInspectMetric(connectionLimitMetric(props.insights))}
+        />
         <Metric label="Panics" value={formatNumber(panics)} tone={panics > 0 ? "warn" : "normal"} onClick={() => props.onInspectMetric(panicMetric(props.insights))} />
+        <Metric label="Geo" value={geoStatusLabel(geoStatus)} onClick={() => props.onInspectMetric(geoMetric(geoStatus))} />
         <Metric label="Banned IPs" value={formatNumber(bannedIPs.length)} onClick={() => props.onInspectMetric(bannedIPMetric(props.banned))} />
         <Metric label="Banned Users" value={formatNumber(bannedHashes.length)} onClick={() => props.onInspectMetric(bannedUserMetric(props.banned))} />
       </section>
@@ -1446,7 +1500,7 @@ function Security(props: {
       <section class="insights-band">
         <div>
           <h2>Security Posture</h2>
-          <p>{props.loading ? "Loading security signals..." : securityCopy(attempts, suspicious, denied, panics)}</p>
+          <p>{props.loading ? "Loading security signals..." : securityCopy(attempts, suspicious, denied, panics, connMaxHits)}</p>
         </div>
         <div class="release">
           <span>Auth Window</span>
@@ -1462,6 +1516,11 @@ function Security(props: {
       <section class="split">
         <AuthAttemptsPanel attempts={attempts} onInspectEvent={props.onInspectEvent} />
         <BannedPanel banned={props.banned} />
+      </section>
+
+      <section class="split">
+        <GeoDistributionPanel countries={props.insights?.geo_countries ?? []} cities={props.insights?.geo_cities ?? []} />
+        <GeoIPPanel status={geoStatus} />
       </section>
 
       <section class="split">
@@ -1484,7 +1543,7 @@ function SuspiciousPanel(props: {
         <div class="dense-row risk-row" key={row.name}>
           <button class="dense-row-main" type="button" onClick={() => props.onInspectActor("ip", row.name)}>
             <strong>{row.name}</strong>
-            <small>{row.count} events, {row.denied ?? 0} denied</small>
+            <small>{[`${row.count} events, ${row.denied ?? 0} denied`, geoLabel(row.geo)].filter(Boolean).join(" / ")}</small>
             <div class="mini-track">
               <i style={{ width: `${Math.max(5, Math.min(100, (row.denied ?? 0) * 12))}%` }} />
             </div>
@@ -1505,7 +1564,7 @@ function AuthCombosPanel(props: { combos: AuthComboRow[]; banIPPending: boolean;
         <div class="dense-row auth-combo-row" key={`${combo.username || ""}:${combo.password || ""}:${index}`}>
           <div>
             <strong>{credentialLabel(combo.username, combo.password)}</strong>
-            <small>{combo.last_time || ""} {combo.last_ip || ""}</small>
+            <small>{[`${combo.last_time || ""} ${combo.last_ip || ""}`.trim(), geoLabel(combo.last_geo)].filter(Boolean).join(" / ")}</small>
           </div>
           <span>{formatNumber(combo.count)} tries</span>
           {combo.last_ip ? (
@@ -1526,7 +1585,7 @@ function AuthAttemptsPanel({ attempts, onInspectEvent }: { attempts: AuthAttempt
         <button class="dense-row auth-attempt-row" type="button" key={attempt.id} onClick={() => onInspectEvent(eventFromAuthAttempt(attempt))}>
           <div>
             <strong>{credentialLabel(attempt.username, attempt.password)}</strong>
-            <small>{attempt.time || ""} {attempt.ip || ""}</small>
+            <small>{[`${attempt.time || ""} ${attempt.ip || ""}`.trim(), geoLabel(attempt.geo)].filter(Boolean).join(" / ")}</small>
           </div>
           <span>{shortValue(attempt.generated_hash, 14)}</span>
           <span>{shortValue(attempt.session, 14)}</span>
@@ -1557,6 +1616,46 @@ function BannedPanel({ banned }: { banned?: BannedPayload }) {
             <small>{row.banned_at || ""}</small>
           </div>
           <span>user</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
+function GeoDistributionPanel({ countries, cities }: { countries: NamedCount[]; cities: NamedCount[] }) {
+  return (
+    <DataPanel title="Geo Distribution" empty="No public IP locations resolved">
+      <div class="actor-columns">
+        <div>
+          <h3>Countries</h3>
+          <BarList rows={countries.slice(0, 8)} />
+        </div>
+        <div>
+          <h3>Cities</h3>
+          <BarList rows={cities.slice(0, 8)} />
+        </div>
+      </div>
+    </DataPanel>
+  );
+}
+
+function GeoIPPanel({ status }: { status?: GeoIPStatus }) {
+  const databases = status?.databases ?? [];
+  return (
+    <DataPanel title="GeoIP Databases" empty="GeoIP is not configured">
+      <div class="action-line">
+        <span class={status?.enabled ? "status-chip" : "status-chip hot"}>{status?.enabled ? "Enabled" : "Disabled"}</span>
+        <span class="status-chip">{status?.auto_update ? "Auto update" : "Manual"}</span>
+        <span class="status-chip">{status?.provider || "dbip"}</span>
+      </div>
+      {databases.map((db) => (
+        <div class="dense-row geo-db-row" key={db.id}>
+          <div>
+            <strong>{db.name}</strong>
+            <small>{geoDatabaseLine(db)}</small>
+            {db.attribution ? <small>{db.attribution}</small> : null}
+          </div>
+          <span class={db.loaded ? "status-chip" : "status-chip hot"}>{db.loaded ? "loaded" : db.present ? "present" : "missing"}</span>
         </div>
       ))}
     </DataPanel>
@@ -1753,6 +1852,7 @@ function KPIBars({ kpi, liveCount }: { kpi: Record<string, number>; liveCount: n
     { name: "Uploads", count: kpi.uploads ?? 0 },
     { name: "Downloads", count: kpi.downloads ?? 0 },
     { name: "Denied", count: kpi.denied ?? 0 },
+    { name: "Conn Max", count: kpi.conn_max_hits ?? 0 },
     { name: "Admin", count: kpi.admin_actions ?? 0 },
     { name: "Sessions", count: kpi.session_starts ?? 0 },
     { name: "Live", count: liveCount }
@@ -1918,7 +2018,7 @@ function SessionsPanel({ sessions, onInspectSession }: { sessions: SessionRow[];
         <button class="dense-row session-row" type="button" key={session.session} onClick={() => onInspectSession(session)}>
           <div>
             <strong>{shortValue(session.session, 18)}</strong>
-            <small>{session.user_id || "unknown user"} {session.ip || ""}</small>
+            <small>{[`${session.user_id || "unknown user"} ${session.ip || ""}`.trim(), geoLabel(session.geo)].filter(Boolean).join(" / ")}</small>
           </div>
           <span>{formatDuration(session.duration_sec)}</span>
           <span>{session.event_count ?? 0} events</span>
@@ -2020,12 +2120,14 @@ function RiskPanel(props: {
   onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
   const suspicious = props.insights?.suspicious_ips ?? [];
+  const connMaxHits = numberFromUnknown(props.insights?.kpi?.conn_max_hits);
   const running = Boolean(props.maintenance?.running);
   return (
     <DataPanel title="Risk & Maintenance" empty="No risk data available">
       <div class="risk-summary">
         <Metric label="Banned Users" value={formatNumber(props.bannedHashes)} compact />
         <Metric label="Banned IPs" value={formatNumber(props.bannedIPs)} compact />
+        <Metric label="Conn Max" value={formatNumber(connMaxHits)} compact tone={connMaxHits > 0 ? "warn" : "normal"} />
         <Metric label="Panics" value={formatNumber(props.insights?.parsed_panics)} compact tone={Number(props.insights?.parsed_panics || 0) > 0 ? "warn" : "normal"} />
       </div>
       <div class="action-line">
@@ -2057,7 +2159,7 @@ function CountPanel({ title, rows, denied, onSelect }: { title: string; rows: Na
         const content = (
           <>
             <strong>{shortValue(row.name, 28)}</strong>
-            {denied ? <small>{row.denied ?? 0} denied</small> : null}
+            {denied || row.geo ? <small>{[denied ? `${row.denied ?? 0} denied` : "", geoLabel(row.geo)].filter(Boolean).join(" / ")}</small> : null}
             <div class="mini-track">
               <i style={{ width: `${Math.max(3, Math.round((row.count / max) * 100))}%` }} />
             </div>
@@ -2383,6 +2485,7 @@ function LiveDetailBox(props: {
   const path = livePath(row);
   const user = liveUser(row);
   const ip = liveIP(row);
+  const geo = geoFromUnknown(row["geo"]);
   const session = liveSessionID(row);
   const connectionID = stringFromRecord(row, ["connection_id", "id"]);
   const rate = liveRate(row);
@@ -2412,6 +2515,7 @@ function LiveDetailBox(props: {
           <Meta label="User" value={user} />
           <Meta label="Auth User" value={stringFromRecord(row, ["auth_user"])} />
           <Meta label="IP" value={ip} />
+          <Meta label="Geo" value={geoLabel(geo)} />
           <Meta label="Remote" value={stringFromRecord(row, ["remote_addr"])} />
           <Meta label="Local" value={stringFromRecord(row, ["local_addr"])} />
           <Meta label="Session" value={session} />
@@ -2518,6 +2622,7 @@ function EventSummary({ event }: { event: EventRow }) {
         <Meta label="Command" value={command} />
         <Meta label="User" value={user} />
         <Meta label="IP" value={event.ip} />
+        <Meta label="Geo" value={geoLabel(event.geo)} />
         <Meta label="Session" value={session} />
         <Meta label="Error" value={error} />
       </dl>
@@ -2721,6 +2826,7 @@ function ActorDetailBox(props: {
   const events = props.details?.events ?? [];
   const summary = props.details?.summary ?? {};
   const isBanned = Boolean(summary.is_banned);
+  const geo = geoFromUnknown(summary.geo);
   const [showThumbs, setShowThumbs] = useState(true);
   if (props.loading) {
     return <div class="detail-box subtle">Loading actor drilldown...</div>;
@@ -2734,6 +2840,7 @@ function ActorDetailBox(props: {
         </div>
         <dl class="metadata">
           <Meta label={props.actor.actorType === "ip" ? "IP" : "User"} value={props.details?.actor || props.actor.value} />
+          {props.actor.actorType === "ip" ? <Meta label="Geo" value={geoLabel(geo)} /> : null}
           <Meta label="Window" value={props.details?.window?.label} />
           <Meta label="Events" value={formatNumber(numberFromUnknown(summary.events))} />
           <Meta label="Files" value={formatNumber(numberFromUnknown(summary.files))} />
@@ -2852,6 +2959,7 @@ function SessionTimelineBox({ session, loading, onInspectEvent }: { session?: Se
         <Meta label="Session" value={session.session} />
         <Meta label="User" value={session.user_id} />
         <Meta label="IP" value={session.ip} />
+        <Meta label="Geo" value={geoLabel(session.geo)} />
         <Meta label="Started" value={session.start_time} />
         <Meta label="Ended" value={session.end_time} />
       </dl>
@@ -3218,6 +3326,7 @@ function eventFromAuthAttempt(attempt: AuthAttemptRow): EventRow {
     event: "auth/attempt",
     user_id: attempt.user_id || attempt.generated_hash,
     ip: attempt.ip,
+    geo: attempt.geo,
     session: attempt.session,
     meta_obj: {
       username: attempt.username || "",
@@ -3298,6 +3407,26 @@ function eventInsight(event: EventRow): { title: string; label: string; tone?: "
   const session = eventSession(event);
   const status = statusFor(event);
   const error = metaString(event, ["error", "err", "message"]);
+  if (isConnectionLimitEvent(event)) {
+    const meta = metaRecord(event);
+    const hits = Math.max(1, numberFromUnknown(meta.hits));
+    const windowSeconds = numberFromUnknown(meta.window_seconds);
+    return {
+      title: "Connection Maximum",
+      label: "aggregate",
+      tone: "warn",
+      rows: [
+        { label: "IP", value: event.ip || metaString(event, ["client_ip", "remote_addr"]) },
+        { label: "Hits", value: formatNumber(hits) },
+        { label: "First", value: metaString(event, ["first_time"]) || event.time },
+        { label: "Last", value: metaString(event, ["last_time"]) },
+        { label: "Window", value: windowSeconds > 0 ? formatDuration(windowSeconds) : "" },
+        { label: "Window Ends", value: metaString(event, ["window_end_time"]) },
+        { label: "Active", value: metaString(event, ["active_connections", "active"]) },
+        { label: "Limit", value: metaString(event, ["max_connections", "limit"]) }
+      ]
+    };
+  }
   if (eventIsDelete(event)) {
     return {
       title: "Delete Context",
@@ -3379,6 +3508,10 @@ function eventIsDelete(event: EventRow): boolean {
   const name = (event.event || "").toLowerCase();
   const action = metaString(event, ["action", "operation"]).toLowerCase();
   return name.includes("delete") || action.includes("delete") || action.includes("unlink");
+}
+
+function isConnectionLimitEvent(event: EventRow): boolean {
+  return (event.event || "").toLowerCase() === "denied/connection-limit";
 }
 
 function statusClass(event: EventRow): string {
@@ -3920,15 +4053,22 @@ function pulseCopy(events: EventRow[], explorerEvents: EventRow[], insights?: In
     return "No events recorded in the current window.";
   }
   const denied = insights?.kpi?.denied ?? 0;
+  const connMaxHits = numberFromUnknown(insights?.kpi?.conn_max_hits);
+  if (connMaxHits > 0) {
+    return `${events.length} events, ${denied} denied, ${connMaxHits} connection-max hits.`;
+  }
   if (denied > 0) {
     return `${events.length} events, ${denied} denied, ${explorerEvents.length} explorer-origin.`;
   }
   return `${events.length} events, ${explorerEvents.length} explorer-origin, no denied events in view.`;
 }
 
-function securityCopy(attempts: AuthAttemptRow[], suspicious: NamedPair[], denied: number, panics: number): string {
+function securityCopy(attempts: AuthAttemptRow[], suspicious: NamedPair[], denied: number, panics: number, connMaxHits: number): string {
   if (panics > 0) {
     return `${panics} parsed panics, ${denied} denied events, ${attempts.length} auth attempts.`;
+  }
+  if (connMaxHits > 0) {
+    return `${connMaxHits} connection maximum hits, ${denied} denied events, ${attempts.length} auth attempts.`;
   }
   if (suspicious.length > 0) {
     return `${suspicious.length} suspicious IPs, ${denied} denied events, ${attempts.length} auth attempts.`;
@@ -4107,6 +4247,52 @@ function recordArray(value: unknown): Array<Record<string, unknown>> {
     return [];
   }
   return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+}
+
+function geoFromUnknown(value: unknown): GeoLocation | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as GeoLocation;
+}
+
+function geoLabel(geo?: GeoLocation): string {
+  if (!geo) {
+    return "";
+  }
+  const place = [geo.city, geo.region_code || geo.region, geo.country_code || geo.country].filter(Boolean).join(", ");
+  return place || geo.country || geo.continent || "";
+}
+
+function geoDatabaseLine(db: GeoDatabaseStatus): string {
+  const parts = [
+    db.size || formatBytes(db.size_bytes),
+    db.build_time ? `built ${shortDate(db.build_time)}` : "",
+    db.next_update ? `next ${shortDate(db.next_update)}` : "",
+    db.update_due ? "due" : "",
+    db.last_error || ""
+  ].filter(Boolean);
+  return parts.join(" / ");
+}
+
+function geoStatusLabel(status?: GeoIPStatus): string {
+  if (!status?.enabled) {
+    return "off";
+  }
+  const loaded = (status.databases ?? []).filter((db) => db.loaded).length;
+  const total = status.databases?.length ?? 0;
+  return total > 0 ? `${loaded}/${total}` : "on";
+}
+
+function shortDate(value?: string): string {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function stringFromRecord(row: Record<string, unknown>, keys: string[]): string {
@@ -4359,7 +4545,24 @@ function suspiciousMetric(rows: NamedPair[]): MetricTarget {
     summary: "IPs with suspicious or denied activity in the current window.",
     rows: [
       { label: "IPs", value: formatNumber(rows.length) },
-      ...rows.slice(0, 7).map((row) => ({ label: row.name, value: `${formatNumber(row.count)} events / ${formatNumber(row.denied ?? 0)} denied` }))
+      ...rows.slice(0, 7).map((row) => ({ label: row.name, value: [`${formatNumber(row.count)} events / ${formatNumber(row.denied ?? 0)} denied`, geoLabel(row.geo)].filter(Boolean).join(" / ") }))
+    ]
+  };
+}
+
+function connectionLimitMetric(insights?: InsightsPayload): MetricTarget {
+  const kpi = insights?.kpi ?? {};
+  const hits = numberFromUnknown(kpi.conn_max_hits);
+  const rows = numberFromUnknown(kpi.conn_max_rows);
+  return {
+    title: "Connection Maximum",
+    value: formatNumber(hits),
+    summary: "Refused SSH connections after an IP reached the configured simultaneous connection maximum.",
+    rows: [
+      { label: "Hits", value: formatNumber(hits) },
+      { label: "Audit Rows", value: formatNumber(rows) },
+      { label: "Denied Rows", value: formatNumber(kpi.denied ?? 0) },
+      { label: "Events", value: formatNumber(kpi.events ?? 0) }
     ]
   };
 }
@@ -4373,6 +4576,24 @@ function panicMetric(insights?: InsightsPayload): MetricTarget {
     rows: [
       { label: "Panics", value: formatNumber(insights?.parsed_panics) },
       ...rows.slice(0, 6).map((row, index) => ({ label: `Recent ${index + 1}`, value: shortValue(panicText(row), 72) }))
+    ]
+  };
+}
+
+function geoMetric(status?: GeoIPStatus): MetricTarget {
+  const databases = status?.databases ?? [];
+  return {
+    title: "GeoIP",
+    value: geoStatusLabel(status),
+    summary: "Location lookup database status and refresh cadence.",
+    rows: [
+      { label: "Enabled", value: status?.enabled ? "yes" : "no" },
+      { label: "Auto Update", value: status?.auto_update ? "yes" : "no" },
+      { label: "Provider", value: status?.provider },
+      ...databases.map((db) => ({
+        label: db.name,
+        value: geoDatabaseLine(db)
+      }))
     ]
   };
 }

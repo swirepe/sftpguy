@@ -141,6 +141,7 @@ type liveConnectionSnapshot struct {
 	RemoteAddr      string  `json:"remote_addr"`
 	LocalAddr       string  `json:"local_addr"`
 	IP              string  `json:"ip"`
+	Geo             any     `json:"geo,omitempty"`
 	State           string  `json:"state"`
 	Session         string  `json:"session"`
 	UserID          string  `json:"user_id"`
@@ -178,6 +179,7 @@ type liveSessionSnapshot struct {
 	RemoteAddr      string  `json:"remote_addr"`
 	LocalAddr       string  `json:"local_addr"`
 	IP              string  `json:"ip"`
+	Geo             any     `json:"geo,omitempty"`
 	LoginType       string  `json:"login_type"`
 	UserAgent       string  `json:"user_agent"`
 	ClientVersion   string  `json:"client_version"`
@@ -210,6 +212,7 @@ type liveTransferSnapshot struct {
 	UserID         string  `json:"user_id"`
 	RemoteAddr     string  `json:"remote_addr"`
 	IP             string  `json:"ip"`
+	Geo            any     `json:"geo,omitempty"`
 	Direction      string  `json:"direction"`
 	Path           string  `json:"path"`
 	UserAgent      string  `json:"user_agent"`

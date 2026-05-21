@@ -586,6 +586,7 @@
         ["Uploads", kpi.uploads || 0],
         ["Downloads", kpi.downloads || 0],
         ["Denied", kpi.denied || 0],
+        ["Conn Max Hits", kpi.conn_max_hits || 0],
         ["Admin Actions", kpi.admin_actions || 0],
         ["Session Starts", kpi.session_starts || 0],
         ["Session Ends", kpi.session_ends || 0]
@@ -1152,8 +1153,20 @@
       const source = String(metaField(meta, "source") || "").trim();
       const headers = metaHeaders(meta);
       const headerCount = headers ? Object.keys(headers).length : 0;
+      const hits = metaNumber(meta, "hits");
+      const maxConnections = metaNumber(meta, "max_connections") || metaNumber(meta, "limit");
+      const activeConnections = metaNumber(meta, "active_connections") || metaNumber(meta, "active");
+      const firstTime = String(metaField(meta, "first_time") || "").trim();
+      const lastTime = String(metaField(meta, "last_time") || "").trim();
+      const windowSeconds = metaNumber(meta, "window_seconds");
 
       const chips = [];
+      if (hits) chips.push("<span class=\"meta-chip\">hits " + esc(hits) + "</span>");
+      if (maxConnections) chips.push("<span class=\"meta-chip\">limit " + esc(maxConnections) + "</span>");
+      if (activeConnections) chips.push("<span class=\"meta-chip\">active " + esc(activeConnections) + "</span>");
+      if (firstTime) chips.push("<span class=\"meta-chip\">first " + esc(firstTime) + "</span>");
+      if (lastTime && lastTime !== firstTime) chips.push("<span class=\"meta-chip\">last " + esc(lastTime) + "</span>");
+      if (windowSeconds) chips.push("<span class=\"meta-chip\">window " + esc(formatSeconds(windowSeconds)) + "</span>");
       if (file) chips.push("<span class=\"meta-chip meta-file\" title=\"" + esc(file) + "\">file " + esc(filename || file) + "</span>");
       if (method) chips.push("<span class=\"meta-chip\">" + esc(method) + "</span>");
       if (status) chips.push("<span class=\"meta-chip\">HTTP " + esc(status) + "</span>");
@@ -1171,6 +1184,12 @@
         ["url", url],
         ["client_ip", metaField(meta, "client_ip")],
         ["remote_addr", metaField(meta, "remote_addr")],
+        ["first_time", firstTime],
+        ["last_time", lastTime],
+        ["window_end", metaField(meta, "window_end_time")],
+        ["hits", hits],
+        ["active_connections", activeConnections],
+        ["max_connections", maxConnections],
         ["user_agent", metaField(meta, "user_agent") || nested.user_agent]
       ].filter(function(pair) { return String(pair[1] == null ? "" : pair[1]).trim() !== ""; });
       const details = detailRows.length

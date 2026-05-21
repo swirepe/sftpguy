@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"sftpguy/internal/geoip"
 )
 
 type badFileMatch struct {
@@ -29,6 +31,7 @@ type MaintenanceResult struct {
 	ReconcileOrphans      ReconcileOrphansResult      `json:"reconcile_orphans"`
 	PurgeSSHDBot          PurgeSSHDBotResult          `json:"purge_sshdbot"`
 	PurgeBlacklistedFiles PurgeBlackListedFilesResult `json:"purge_blacklisted_files"`
+	GeoIP                 geoip.UpdateResult          `json:"geoip"`
 }
 
 const maintenanceSkippedRoot = "#recycle"
@@ -168,6 +171,16 @@ func (s *Server) runMaintenancePass(ctx context.Context, includeBadFilePurge boo
 	}
 
 	mr.PurgeSSHDBot = s.PurgeSSHDBot()
+
+	select {
+	case <-ctx.Done():
+		return false, mr
+	default:
+	}
+
+	if s.geo != nil {
+		mr.GeoIP = s.geo.UpdateDue(ctx, time.Now())
+	}
 
 	select {
 	case <-ctx.Done():
@@ -797,6 +810,9 @@ func (s *Server) runTrackedMaintenancePass(ctx context.Context, trigger string, 
 		"purge_sshdbot.purges", res.PurgeSSHDBot.Purges,
 		"purge_sshdbot.owners_banned", res.PurgeSSHDBot.OwnersBanned,
 		"purge_sshdbot.blacklist_updates", res.PurgeSSHDBot.BlacklistUpdates,
+		"geoip.checked", res.GeoIP.Checked,
+		"geoip.updated", res.GeoIP.Updated,
+		"geoip.errors", len(res.GeoIP.Errors),
 		"purge_blacklisted_files.matches", res.PurgeBlacklistedFiles.Matches,
 		"purge_blacklisted_files.purges", res.PurgeBlacklistedFiles.Purges,
 		"purge_blacklisted_files.blacklist_updates", res.PurgeBlacklistedFiles.BlacklistUpdates,

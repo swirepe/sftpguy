@@ -72,6 +72,8 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		Banned:           d.srv.handleAdminBanned,
 		BanIP:            d.srv.handleAdminBanIP,
 		UnbanIP:          d.srv.handleAdminUnbanIP,
+		GeoIP:            d.srv.handleAdminGeoIP,
+		GeoIPLookup:      d.srv.handleAdminGeoIPLookup,
 		Maintenance:      d.srv.handleAdminMaintenance,
 		MaintenanceRun:   d.srv.handleAdminMaintenanceRun,
 		MaintenanceLogs:  d.srv.handleAdminMaintenanceLogs,

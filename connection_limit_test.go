@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
@@ -82,6 +83,17 @@ func TestServerMaxConnectionsPerIPRejectsExcessAndReleases(t *testing.T) {
 	}
 	assertConnectionClosedSoon(t, second, "second connection")
 
+	thirdRejected, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial third rejected connection: %v", err)
+	}
+	assertConnectionClosedSoon(t, thirdRejected, "third rejected connection")
+	assertConnectionLimitAudit(t, srv.store.db, "127.0.0.1", 1, 1, 1)
+	if err := srv.store.FlushConnectionLimitAggregates(); err != nil {
+		t.Fatalf("flush connection limit audit: %v", err)
+	}
+	assertConnectionLimitAudit(t, srv.store.db, "127.0.0.1", 2, 1, 1)
+
 	if err := first.Close(); err != nil {
 		t.Fatalf("close first connection: %v", err)
 	}
@@ -93,6 +105,27 @@ func TestServerMaxConnectionsPerIPRejectsExcessAndReleases(t *testing.T) {
 	}
 	defer third.Close()
 	waitForActiveIPCount(t, srv, "127.0.0.1", 1, 3*time.Second)
+}
+
+func TestConnectionLimitAuditFlushesOnShutdown(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	dbPath := srv.cfg.DBPath
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.45"), Port: 55223}
+
+	srv.store.LogConnectionLimitExceeded(addr, 4, 4)
+	srv.store.LogConnectionLimitExceeded(addr, 4, 4)
+	assertConnectionLimitAudit(t, srv.store.db, "203.0.113.45", 1, 4, 4)
+
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("shutdown server: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open db after shutdown: %v", err)
+	}
+	defer db.Close()
+	assertConnectionLimitAudit(t, db, "203.0.113.45", 2, 4, 4)
 }
 
 func dialTCPWithRetry(t *testing.T, addr string, timeout time.Duration) net.Conn {
@@ -131,6 +164,62 @@ func activeIPCount(srv *Server, ip string) int {
 	srv.activeConnMu.Lock()
 	defer srv.activeConnMu.Unlock()
 	return srv.activeConnByIP[ip]
+}
+
+func assertConnectionLimitAudit(t *testing.T, db *sql.DB, ip string, wantHits, wantActive, wantLimit int64) {
+	t.Helper()
+
+	var rows int64
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM log
+		WHERE event = ? AND ip_address = ?`, string(EventDeniedConnectionLimit), ip).Scan(&rows); err != nil {
+		t.Fatalf("count connection limit audit rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("connection limit audit rows for %s = %d, want 1", ip, rows)
+	}
+
+	var timestamp int64
+	var port int
+	var rawMeta string
+	if err := db.QueryRow(`
+		SELECT timestamp, port, IFNULL(meta, '')
+		FROM log
+		WHERE event = ? AND ip_address = ?
+		ORDER BY id DESC
+		LIMIT 1`, string(EventDeniedConnectionLimit), ip).Scan(&timestamp, &port, &rawMeta); err != nil {
+		t.Fatalf("query connection limit audit row: %v", err)
+	}
+	if timestamp <= 0 {
+		t.Fatalf("connection limit audit timestamp = %d, want positive", timestamp)
+	}
+	if port <= 0 {
+		t.Fatalf("connection limit audit port = %d, want remote port", port)
+	}
+
+	meta := parseJSONMap(rawMeta)
+	if meta == nil {
+		t.Fatalf("connection limit audit meta was not JSON: %q", rawMeta)
+	}
+	if got := int64FromAny(meta["hits"]); got != wantHits {
+		t.Fatalf("connection limit hits = %d, want %d; meta=%s", got, wantHits, rawMeta)
+	}
+	if got := int64FromAny(meta["active_connections"]); got != wantActive {
+		t.Fatalf("connection limit active_connections = %d, want %d; meta=%s", got, wantActive, rawMeta)
+	}
+	if got := int64FromAny(meta["max_connections"]); got != wantLimit {
+		t.Fatalf("connection limit max_connections = %d, want %d; meta=%s", got, wantLimit, rawMeta)
+	}
+	if got := int64FromAny(meta["first_timestamp"]); got != timestamp {
+		t.Fatalf("connection limit first_timestamp = %d, want row timestamp %d; meta=%s", got, timestamp, rawMeta)
+	}
+	if got := int64FromAny(meta["window_seconds"]); got != int64(connectionLimitWindow/time.Second) {
+		t.Fatalf("connection limit window_seconds = %d, want %d; meta=%s", got, int64(connectionLimitWindow/time.Second), rawMeta)
+	}
+	if meta["first_time"] == "" || meta["last_time"] == "" || meta["window_end_time"] == "" {
+		t.Fatalf("connection limit audit meta missing formatted times: %s", rawMeta)
+	}
 }
 
 func assertConnectionClosedSoon(t *testing.T, conn net.Conn, label string) {

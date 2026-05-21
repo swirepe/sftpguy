@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"sftpguy/internal/geoip"
 )
 
 var (
@@ -55,6 +57,7 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.flushConnectionLimitAggregatesForAdmin()
 
 	window := parseTimeWindow(r, "24h")
 	since := window.SinceUnix
@@ -69,9 +72,10 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		Count int64  `json:"count"`
 	}
 	type namedPair struct {
-		Name   string `json:"name"`
-		Count  int64  `json:"count"`
-		Denied int64  `json:"denied"`
+		Name   string          `json:"name"`
+		Count  int64           `json:"count"`
+		Denied int64           `json:"denied"`
+		Geo    *geoip.Location `json:"geo,omitempty"`
 	}
 
 	topEvents := make([]namedCount, 0, 12)
@@ -123,6 +127,9 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var item namedPair
 			if err := rows.Scan(&item.Name, &item.Count, &item.Denied); err == nil {
+				if loc, ok := s.geoLocation(item.Name); ok {
+					item.Geo = loc
+				}
 				topIPs = append(topIPs, item)
 				if item.Denied >= 3 || item.Count >= 100 {
 					suspiciousIPs = append(suspiciousIPs, item)
@@ -157,6 +164,27 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userAgents, deviceTypes := s.adminUserAgentInsights(since)
+	geoCountryCount := map[string]int{}
+	geoCityCount := map[string]int{}
+	for _, item := range topIPs {
+		if item.Geo == nil {
+			continue
+		}
+		country := firstNonEmpty(item.Geo.Country, item.Geo.CountryCode)
+		if country != "" {
+			geoCountryCount[country] += int(item.Count)
+		}
+		city := item.Geo.City
+		if city != "" && item.Geo.CountryCode != "" {
+			city += ", " + item.Geo.CountryCode
+		}
+		if city != "" {
+			geoCityCount[city] += int(item.Count)
+		}
+	}
+	geoCountries := mapCountPairs(geoCountryCount, 12)
+	geoCities := mapCountPairs(geoCityCount, 12)
+	connectionLimitHits := s.adminConnectionLimitHits(since)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"window": map[string]any{
@@ -172,6 +200,8 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 			"uploads":        scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'upload'`, since),
 			"downloads":      scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'download'`, since),
 			"denied":         scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'denied%'`, since),
+			"conn_max_hits":  connectionLimitHits,
+			"conn_max_rows":  scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = ?`, since, string(EventDeniedConnectionLimit)),
 			"admin_actions":  scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'admin/%'`, since),
 			"session_starts": scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'session/start'`, since),
 			"session_ends":   scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'session/end'`, since),
@@ -180,6 +210,9 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		"top_users":               topUsers,
 		"top_ips":                 topIPs,
 		"suspicious_ips":          suspiciousIPs,
+		"geo_countries":           geoCountries,
+		"geo_cities":              geoCities,
+		"geoip":                   s.geoStatus(),
 		"parsed_levels":           mapCountPairs(levelCount, 6),
 		"parsed_users_recent":     mapCountPairs(userCount, 12),
 		"parsed_ips_recent":       mapCountPairs(ipCount, 12),
@@ -189,6 +222,31 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 		"user_agents":             userAgents,
 		"device_types":            deviceTypes,
 	})
+}
+
+func (s *Server) adminConnectionLimitHits(since int64) int64 {
+	rows, err := s.store.db.Query(`
+		SELECT IFNULL(meta, '')
+		FROM log
+		WHERE timestamp >= ? AND event = ?`, since, string(EventDeniedConnectionLimit))
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+
+	var total int64
+	for rows.Next() {
+		var rawMeta string
+		if err := rows.Scan(&rawMeta); err != nil {
+			continue
+		}
+		hits := int64FromAny(parseJSONMap(rawMeta)["hits"])
+		if hits < 1 {
+			hits = 1
+		}
+		total += hits
+	}
+	return total
 }
 
 func (s *Server) adminUserAgentInsights(since int64) ([]adminUserAgentStat, []adminDeviceStat) {

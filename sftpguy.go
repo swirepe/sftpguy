@@ -65,6 +65,7 @@ import (
 	"sftpguy/caid"
 	"sftpguy/internal/adminpreview"
 	"sftpguy/internal/explorerevents"
+	"sftpguy/internal/geoip"
 	"sftpguy/internal/logutil"
 	"sftpguy/internal/socketactivation"
 
@@ -133,6 +134,8 @@ const (
 	defaultUID            = 1000
 	defaultGID            = 1000
 	defaultMaxConnsPerIP  = 50
+	connectionLimitWindow = 24 * time.Hour
+	connectionLimitFlush  = 30 * time.Second
 	unrestrictedUID       = 1337
 	unrestrictedGID       = 1337
 	badFileCheckQueueSize = 256
@@ -199,6 +202,7 @@ const (
 	CREATE INDEX IF NOT EXISTS log_ip_address_idx ON log (ip_address);
 	CREATE INDEX IF NOT EXISTS log_user_idx      ON log (user_id, timestamp);
 	CREATE INDEX IF NOT EXISTS log_event_idx     ON log (event);
+	CREATE INDEX IF NOT EXISTS log_event_ip_timestamp_idx ON log (event, ip_address, timestamp);
 	CREATE INDEX IF NOT EXISTS log_session_idx   ON log (user_session);
 `
 )
@@ -241,6 +245,7 @@ const (
 	EventDelete                EventKind = "delete"
 	EventRename                EventKind = "rename"
 	EventDenied                EventKind = "denied"
+	EventDeniedConnectionLimit EventKind = "denied/connection-limit"
 	EventDeniedSymlink         EventKind = "denied/symlink"
 	EventDeniedContributorLock EventKind = "denied/contributor-lock"
 	EventDeniedSystemFile      EventKind = "denied/system-file"
@@ -404,17 +409,33 @@ func (m RawSQL) Apply(db *sql.DB, logger *slog.Logger) error {
 }
 
 type Store struct {
-	db            *sql.DB
-	logger        *slog.Logger
-	blacklist     *IPList
-	whitelist     *IPList
-	badFileList   *HashList
-	caidMatcher   *caid.Matcher
-	adminKeys     *AdminKeyList
-	blacklistPath string
-	whitelistPath string
-	adminKeysPath string
-	badFilesPath  string
+	db                  *sql.DB
+	logger              *slog.Logger
+	blacklist           *IPList
+	whitelist           *IPList
+	badFileList         *HashList
+	caidMatcher         *caid.Matcher
+	adminKeys           *AdminKeyList
+	blacklistPath       string
+	whitelistPath       string
+	adminKeysPath       string
+	badFilesPath        string
+	connectionLimitMu   sync.Mutex
+	connectionLimitByIP map[string]*connectionLimitAggregate
+}
+
+type connectionLimitAggregate struct {
+	IP             string
+	RowID          int64
+	FirstTimestamp int64
+	LastTimestamp  int64
+	WindowEnd      int64
+	WindowSeconds  int64
+	Hits           int64
+	Active         int
+	Limit          int
+	RemoteAddr     string
+	Dirty          bool
 }
 
 func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
@@ -579,6 +600,10 @@ func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
 }
 
 func (s *Store) Close() error {
+	if err := s.FlushConnectionLimitAggregates(); err != nil {
+		s.logger.Warn("failed to flush connection limit aggregates during store close", "err", err)
+	}
+
 	if s.blacklist != nil {
 		s.blacklist.Stop()
 	}
@@ -915,15 +940,7 @@ func (s *Store) OwnedFilesSummary(pubHash string, limit int) (OwnedFilesSummary,
 }
 
 func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr net.Addr, args ...any) {
-	ip := ""
-	port := 0
-	if remoteAddr != nil {
-		host, portStr, err := net.SplitHostPort(remoteAddr.String())
-		if err == nil {
-			ip = host
-			port, _ = strconv.Atoi(portStr)
-		}
-	}
+	ip, port := remoteAddrIPPort(remoteAddr)
 
 	// Pull path and meta out of the variadic key-value args
 	path := ""
@@ -954,6 +971,250 @@ func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr n
 	if err != nil {
 		s.logger.Warn("failed to log event", "kind", kind, "err", err)
 	}
+}
+
+func (s *Store) LogConnectionLimitExceeded(remoteAddr net.Addr, active, limit int) {
+	if s == nil {
+		return
+	}
+	ip, port := remoteAddrIPPort(remoteAddr)
+	if ip == "" {
+		return
+	}
+
+	nowTime := time.Now()
+	now := nowTime.Unix()
+	since := nowTime.Add(-connectionLimitWindow).Unix()
+	windowSeconds := int64(connectionLimitWindow / time.Second)
+	remoteAddrText := ""
+	if remoteAddr != nil {
+		remoteAddrText = remoteAddr.String()
+	}
+
+	s.connectionLimitMu.Lock()
+	err := s.logConnectionLimitExceededLocked(ip, port, now, since, windowSeconds, active, limit, remoteAddrText)
+	s.connectionLimitMu.Unlock()
+	if err != nil {
+		s.logger.Warn("failed to log connection limit event", "err", err, "ip", ip, "active", active, "limit", limit)
+	}
+}
+
+func (s *Store) logConnectionLimitExceededLocked(ip string, port int, now, since, windowSeconds int64, active, limit int, remoteAddr string) error {
+	if s.connectionLimitByIP == nil {
+		s.connectionLimitByIP = make(map[string]*connectionLimitAggregate)
+	}
+	if agg := s.connectionLimitByIP[ip]; agg != nil {
+		if now < agg.WindowEnd {
+			agg.Hits++
+			agg.LastTimestamp = now
+			agg.Active = active
+			agg.Limit = limit
+			agg.RemoteAddr = remoteAddr
+			agg.Dirty = true
+			return nil
+		}
+		if agg.Dirty {
+			if err := s.writeConnectionLimitAggregate(agg); err != nil {
+				return err
+			}
+		}
+		delete(s.connectionLimitByIP, ip)
+	}
+
+	agg, err := s.ensureConnectionLimitAggregate(ip, port, now, since, windowSeconds, active, limit, remoteAddr)
+	if err != nil {
+		return err
+	}
+	s.connectionLimitByIP[ip] = agg
+	return nil
+}
+
+func (s *Store) ensureConnectionLimitAggregate(ip string, port int, now, since, windowSeconds int64, active, limit int, remoteAddr string) (*connectionLimitAggregate, error) {
+	var id int64
+	var firstTimestamp int64
+	var rawMeta string
+	err := s.db.QueryRow(`
+		SELECT id, timestamp, IFNULL(meta, '')
+		FROM log
+		WHERE event = ? AND ip_address = ? AND timestamp > ?
+		ORDER BY timestamp DESC
+		LIMIT 1`, string(EventDeniedConnectionLimit), ip, since).Scan(&id, &firstTimestamp, &rawMeta)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	hits := int64(1)
+	if err == nil && firstTimestamp+windowSeconds > now {
+		meta := parseJSONMap(rawMeta)
+		hits = int64FromAny(meta["hits"])
+		if hits < 1 {
+			hits = 1
+		}
+		hits++
+		if firstTimestamp <= 0 {
+			firstTimestamp = now
+		}
+		metaJSON := connectionLimitMetaJSON(firstTimestamp, now, windowSeconds, hits, active, limit, remoteAddr)
+		if _, err := s.exec(`UPDATE log SET meta = ? WHERE id = ?`, metaJSON, id); err != nil {
+			return nil, err
+		}
+		return &connectionLimitAggregate{
+			IP:             ip,
+			RowID:          id,
+			FirstTimestamp: firstTimestamp,
+			LastTimestamp:  now,
+			WindowEnd:      firstTimestamp + windowSeconds,
+			WindowSeconds:  windowSeconds,
+			Hits:           hits,
+			Active:         active,
+			Limit:          limit,
+			RemoteAddr:     remoteAddr,
+			Dirty:          false,
+		}, nil
+	}
+
+	metaJSON := connectionLimitMetaJSON(now, now, windowSeconds, hits, active, limit, remoteAddr)
+	res, err := s.exec(`
+		INSERT INTO log (timestamp, ip_address, port, user_id, user_session, event, path, meta)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		now, ip, port, "", "", string(EventDeniedConnectionLimit), "", metaJSON)
+	if err != nil {
+		return nil, err
+	}
+	id, _ = res.LastInsertId()
+	return &connectionLimitAggregate{
+		IP:             ip,
+		RowID:          id,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		WindowEnd:      now + windowSeconds,
+		WindowSeconds:  windowSeconds,
+		Hits:           hits,
+		Active:         active,
+		Limit:          limit,
+		RemoteAddr:     remoteAddr,
+		Dirty:          false,
+	}, nil
+}
+
+func (s *Store) FlushConnectionLimitAggregates() error {
+	if s == nil {
+		return nil
+	}
+	s.connectionLimitMu.Lock()
+	updates := make([]connectionLimitAggregate, 0, len(s.connectionLimitByIP))
+	for _, agg := range s.connectionLimitByIP {
+		if agg != nil && agg.RowID > 0 && agg.Dirty {
+			updates = append(updates, *agg)
+		}
+	}
+	s.connectionLimitMu.Unlock()
+	if len(updates) == 0 {
+		s.pruneConnectionLimitAggregates()
+		return nil
+	}
+
+	err := s.transact(func(tx *sql.Tx) error {
+		for _, agg := range updates {
+			if err := writeConnectionLimitAggregateTx(tx, &agg); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().Unix()
+	s.connectionLimitMu.Lock()
+	for _, flushed := range updates {
+		current := s.connectionLimitByIP[flushed.IP]
+		if current == nil || current.RowID != flushed.RowID {
+			continue
+		}
+		if current.Hits == flushed.Hits && current.LastTimestamp == flushed.LastTimestamp {
+			current.Dirty = false
+		}
+		if !current.Dirty && now >= current.WindowEnd {
+			delete(s.connectionLimitByIP, flushed.IP)
+		}
+	}
+	s.connectionLimitMu.Unlock()
+
+	return nil
+}
+
+func (s *Store) pruneConnectionLimitAggregates() {
+	now := time.Now().Unix()
+	s.connectionLimitMu.Lock()
+	defer s.connectionLimitMu.Unlock()
+	for ip, agg := range s.connectionLimitByIP {
+		if agg != nil && !agg.Dirty && now >= agg.WindowEnd {
+			delete(s.connectionLimitByIP, ip)
+		}
+	}
+}
+
+func (s *Store) writeConnectionLimitAggregate(agg *connectionLimitAggregate) error {
+	if agg == nil {
+		return nil
+	}
+	metaJSON := connectionLimitMetaJSON(agg.FirstTimestamp, agg.LastTimestamp, agg.WindowSeconds, agg.Hits, agg.Active, agg.Limit, agg.RemoteAddr)
+	_, err := s.exec(`UPDATE log SET meta = ? WHERE id = ?`, metaJSON, agg.RowID)
+	return err
+}
+
+func writeConnectionLimitAggregateTx(tx *sql.Tx, agg *connectionLimitAggregate) error {
+	if agg == nil {
+		return nil
+	}
+	metaJSON := connectionLimitMetaJSON(agg.FirstTimestamp, agg.LastTimestamp, agg.WindowSeconds, agg.Hits, agg.Active, agg.Limit, agg.RemoteAddr)
+	_, err := tx.Exec(`UPDATE log SET meta = ? WHERE id = ?`, metaJSON, agg.RowID)
+	return err
+}
+
+func connectionLimitMetaJSON(firstTimestamp, lastTimestamp, windowSeconds, hits int64, active, limit int, remoteAddr string) string {
+	meta := map[string]any{
+		"source":             "sftp",
+		"reason":             "connection maximum reached",
+		"hits":               hits,
+		"first_timestamp":    firstTimestamp,
+		"first_time":         formatUnix(firstTimestamp),
+		"last_timestamp":     lastTimestamp,
+		"last_time":          formatUnix(lastTimestamp),
+		"window_seconds":     windowSeconds,
+		"window_start":       firstTimestamp,
+		"window_end":         firstTimestamp + windowSeconds,
+		"window_end_time":    formatUnix(firstTimestamp + windowSeconds),
+		"active_connections": active,
+		"max_connections":    limit,
+		"remote_addr":        remoteAddr,
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func remoteAddrIPPort(remoteAddr net.Addr) (string, int) {
+	if remoteAddr == nil {
+		return "", 0
+	}
+	host, portStr, err := net.SplitHostPort(remoteAddr.String())
+	if err == nil {
+		port, _ := strconv.Atoi(portStr)
+		return host, port
+	}
+	if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok {
+		ip := ""
+		if tcpAddr.IP != nil {
+			ip = tcpAddr.IP.String()
+		}
+		return ip, tcpAddr.Port
+	}
+	return strings.TrimSpace(remoteAddr.String()), 0
 }
 
 // ============================================================================
@@ -998,6 +1259,10 @@ type Config struct {
 	AdminKeysPath           string
 	BadFilesPath            string
 	CAIDDBPath              string
+	GeoIPEnabled            bool
+	GeoIPAutoUpdate         bool
+	GeoIPDataDir            string
+	GeoIPProvider           string
 	EnablePrometheus        bool
 	PrometheusRoot          string
 }
@@ -1043,6 +1308,10 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
 	EnvFlag(&cfg.BadFilesPath, "bad", "BAD_FILE", "bad_files.txt", "Text file of sha256 hashes and filenames that will trigger an automatic ban and purge.")
 	EnvFlag(&cfg.CAIDDBPath, "caid.db", "CAID_DB", "", "Optional CAID SQLite database used for size-first MD5/SHA1 bad-file matching.")
+	EnvFlag(&cfg.GeoIPEnabled, "geoip.enable", "GEOIP_ENABLE", true, "Enable GeoIP lookups in the admin UI")
+	EnvFlag(&cfg.GeoIPAutoUpdate, "geoip.update", "GEOIP_UPDATE", true, "Allow maintenance to download and refresh GeoIP databases")
+	EnvFlag(&cfg.GeoIPDataDir, "geoip.dir", "GEOIP_DIR", "geoip", "Directory for GeoIP MMDB databases")
+	EnvFlag(&cfg.GeoIPProvider, "geoip.provider", "GEOIP_PROVIDER", "dbip", "Preferred GeoIP provider: dbip or geolite2")
 
 	EnvFlag(&cfg.EnablePrometheus, "prometheus.enable", "ENABLE_PROMETHEUS", true, "Enable metric endpoint using promethus", "prom")
 	EnvFlag(&cfg.PrometheusRoot, "prometheus.root", "PROMETHEUS_ROOT", "/metrics", "Root path for the metrics endpoint", "prom.root")
@@ -1232,6 +1501,7 @@ type Server struct {
 	store                 *Store
 	logger                *slog.Logger
 	metrics               *serverMetrics
+	geo                   *geoip.Manager
 	live                  *liveTracker
 	mkdirLimiter          *rate.Limiter
 	fortuneGenerator      *FortuneGenerator
@@ -1286,6 +1556,15 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to init store: %w", err)
 	}
+	geoManager, err := geoip.NewManager(geoip.Config{
+		Enabled:    cfg.GeoIPEnabled,
+		AutoUpdate: cfg.GeoIPAutoUpdate,
+		DataDir:    cfg.GeoIPDataDir,
+		Provider:   cfg.GeoIPProvider,
+	}, logger)
+	if err != nil {
+		logger.Warn("failed to init geoip manager; continuing without GeoIP", "err", err)
+	}
 
 	absDir, err := filepath.Abs(cfg.UploadDir)
 	if err != nil {
@@ -1297,6 +1576,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	srv := &Server{
 		store:            store,
 		logger:           logger,
+		geo:              geoManager,
 		mkdirLimiter:     rate.NewLimiter(rate.Limit(cfg.MkdirRate), 1000),
 		live:             newLiveTracker(),
 		fortuneGenerator: &FortuneGenerator{},
@@ -1316,6 +1596,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 	}
 	srv.metrics = newServerMetrics(srv)
 	srv.startBadUploadChecks()
+	srv.startConnectionLimitFlushLoop(connectionLimitFlush)
 
 	if cfg.SelfTest || cfg.SelfTestContinue {
 		srv.shadowMutateMin = shadowMutateMinSelfTest
@@ -1423,7 +1704,11 @@ func (s *Server) Shutdown() error {
 		}
 	}
 	s.wg.Wait()
-	return s.store.Close()
+	var geoErr error
+	if s.geo != nil {
+		geoErr = s.geo.Close()
+	}
+	return errors.Join(s.store.Close(), geoErr)
 }
 
 func (s *Server) startMaintenanceLoop(interval time.Duration) {
@@ -1437,6 +1722,34 @@ func (s *Server) startMaintenanceLoop(interval time.Duration) {
 			return
 		}
 		s.cleanAndReconcile(s.ctx, interval)
+	}()
+}
+
+func (s *Server) startConnectionLimitFlushLoop(interval time.Duration) {
+	if s == nil || s.store == nil || interval <= 0 {
+		return
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer recoverAndLogPanic(s.logger, "connection limit flush loop")
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				if err := s.store.FlushConnectionLimitAggregates(); err != nil {
+					s.logger.Warn("failed to flush connection limit aggregates", "err", err)
+				}
+				return
+			case <-ticker.C:
+				if err := s.store.FlushConnectionLimitAggregates(); err != nil {
+					s.logger.Warn("failed to flush connection limit aggregates", "err", err)
+				}
+			}
+		}
 	}()
 }
 
@@ -1652,6 +1965,7 @@ func (s *Server) Listen() error {
 		log.Info("new connection", "remote_addr", addr)
 		ip, active, ok := s.acquireIPConnection(addr)
 		if !ok {
+			s.store.LogConnectionLimitExceeded(addr, active, s.cfg.MaxConnectionsPerIP)
 			s.logger.Warn("connection limit exceeded",
 				"remote_addr", addr,
 				"ip", ip,
@@ -4073,6 +4387,10 @@ func setupLogger(cfg Config) (*slog.Logger, *logutil.FileWriter, error) {
 		"noauth", cfg.SshNoAuth,
 		"key", cfg.HostKeyFile,
 		"caid_db", cfg.CAIDDBPath,
+		"geoip.enable", cfg.GeoIPEnabled,
+		"geoip.update", cfg.GeoIPAutoUpdate,
+		"geoip.dir", cfg.GeoIPDataDir,
+		"geoip.provider", cfg.GeoIPProvider,
 		"upload_path", cfg.UploadDir,
 		"lock_dirs_to_owners", cfg.LockDirectoriesToOwners,
 		"max_dirs", cfg.MaxDirs,

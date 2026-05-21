@@ -174,6 +174,15 @@ func formatUnix(ts int64) string {
 	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
 }
 
+func (s *Server) flushConnectionLimitAggregatesForAdmin() {
+	if s == nil || s.store == nil {
+		return
+	}
+	if err := s.store.FlushConnectionLimitAggregates(); err != nil {
+		s.logger.Warn("failed to flush connection limit aggregates before admin query", "err", err)
+	}
+}
+
 var kvPattern = regexp.MustCompile(`([A-Za-z0-9_.-]+)=("([^"\\]|\\.)*"|[^\s]+)`)
 
 type parsedSystemLogEntry struct {

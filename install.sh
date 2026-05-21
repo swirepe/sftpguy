@@ -11,6 +11,7 @@ service_name=sftpguy
 	-caid.db /volume1/caid/caid.db \
 	-dir.max 1000000 \
 	-noauth \
+	-geoip.dir /volume1/caid/geoip \
     -port 2222 -admin.sftp -admin.http :9911 \
 	-install \
 	-install.explorer ./explorerv2_amd64 \

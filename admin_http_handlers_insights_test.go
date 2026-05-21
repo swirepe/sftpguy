@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,35 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHandleAdminInsightsIncludesConnectionLimitHits(t *testing.T) {
+	srv := newMaintenanceTestServer(t)
+	defer srv.Shutdown()
+
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.44"), Port: 55222}
+	srv.store.LogConnectionLimitExceeded(addr, 3, 3)
+	srv.store.LogConnectionLimitExceeded(addr, 3, 3)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/insights?range=24h", nil)
+	w := httptest.NewRecorder()
+	srv.handleAdminInsights(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/insights status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	var payload struct {
+		KPI map[string]any `json:"kpi"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode insights payload: %v", err)
+	}
+	if got := int64FromAny(payload.KPI["conn_max_hits"]); got != 2 {
+		t.Fatalf("conn_max_hits = %d, want 2; kpi=%#v", got, payload.KPI)
+	}
+	if got := int64FromAny(payload.KPI["conn_max_rows"]); got != 1 {
+		t.Fatalf("conn_max_rows = %d, want 1; kpi=%#v", got, payload.KPI)
+	}
+}
 
 func TestHandleAdminBanIPUsesBlacklistWithTimestamp(t *testing.T) {
 	srv := newMaintenanceTestServer(t)
