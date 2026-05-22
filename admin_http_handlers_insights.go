@@ -611,9 +611,10 @@ func (s *Server) handleAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type bannedIP struct {
-		IP       string `json:"ip"`
-		BannedAt string `json:"banned_at"`
-		Comment  string `json:"comment,omitempty"`
+		IP       string          `json:"ip"`
+		BannedAt string          `json:"banned_at"`
+		Comment  string          `json:"comment,omitempty"`
+		Geo      *geoip.Location `json:"geo,omitempty"`
 	}
 	ips := make([]bannedIP, 0)
 	if s.store.blacklist != nil {
@@ -628,6 +629,7 @@ func (s *Server) handleAdminBanned(w http.ResponseWriter, r *http.Request) {
 				IP:       entry.ExactIP,
 				BannedAt: extractIPBanTimestamp(entry.Comment),
 				Comment:  entry.Comment,
+				Geo:      geoLocationOrNil(s, entry.ExactIP),
 			})
 		}
 	}

@@ -1421,6 +1421,7 @@ type Config struct {
 	AdminHTTPToken          string
 	AdminHTTPTokenFile      string
 	AdminExplorerWarmMax    int
+	AdminDemoSeed           bool
 	HostKeyFile             string
 	DBPath                  string
 	LogFile                 string
@@ -1471,6 +1472,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.AdminHTTPToken, "admin.http.token", "ADMIN_HTTP_TOKEN", "", "Optional bearer token required by the web admin console")
 	EnvFlag(&cfg.AdminHTTPTokenFile, "admin.http.token.file", "ADMIN_HTTP_TOKEN_FILE", "", "Optional file to load admin bearer token from; generates one when file is missing or empty")
 	EnvFlag(&cfg.AdminExplorerWarmMax, "admin.explorer.warm.max", "ADMIN_EXPLORER_WARM_CACHE_MAX", 0, "Number of files to warm into admin explorer caches on first use (0 disables)")
+	EnvFlag(&cfg.AdminDemoSeed, "admin.demo.seed", "ADMIN_DEMO_SEED", false, "Seed admin demo files and activity into the configured database, then exit")
 	EnvFlag(&cfg.HostKeyFile, "hostkey", "HOST_KEY", "id_ed25519", "SSH host key")
 	EnvFlag(&cfg.DBPath, "db.path", "DB_PATH", "sftp.db", "SQLite path")
 	EnvFlag(&cfg.LogFile, "logfile", "LOG_FILE", "sftp.log", "Log file path")
@@ -4721,6 +4723,20 @@ func main() {
 		logger.Info("execution complete", "uptime", time.Since(start))
 		_ = logFile.Close()
 	}()
+
+	if cfg.AdminDemoSeed {
+		stats, err := SeedAdminDemoData(cfg, logger)
+		if err != nil {
+			logger.Error("failed to seed admin demo data", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("seeded admin demo data",
+			"users", stats.Users,
+			"files", stats.Files,
+			"events", stats.Events,
+			"banned_ips", stats.BannedIPs)
+		return
+	}
 
 	srv, err := NewServer(cfg, logger)
 	if err != nil {

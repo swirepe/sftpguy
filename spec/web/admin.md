@@ -65,6 +65,12 @@ The main code paths behind this surface are:
 - `/admin/v2/assets/...`
 - `/admin/v2/maps/...`
 
+### Admin v2 development data
+
+- `-admin.demo.seed` opens the configured store, writes a small `demo/` file set, adds recent connection, transfer, exec, auth, denied, local-coverage, and ban activity, then exits.
+- Demo rows carry hostname metadata so admin v2 event inspection can show hostname examples without relying on reverse-DNS timing.
+- The admin v2 Vite server proxies `/admin/api` and `/admin/explorer` to `http://127.0.0.1:9977` by default. Set `SFTPGUY_ADMIN_BACKEND` before `npm run dev` when the local admin HTTP backend uses another origin.
+
 ## Access And Authentication
 
 ### Enablement
@@ -204,8 +210,11 @@ Overview and Security include compact GeoIP activity maps. The Map view expands 
 - Files, from live transfer rows plus resolved upload/download events
 - Exec, from resolved event rows classified as exec activity
 - Denied, from resolved denied event rows
+- Auth Attempts, from resolved authentication-attempt rows
+- Flagged IPs, from suspicious-IP insight aggregates with resolved GeoIP locations
+- Banned IPs, from exact banned IP entries with resolved GeoIP locations
 
-The Map view uses the selected global range, search text, and source filter. It loads a larger recent event sample than the other v2 event views while selected, aggregates markers by overlay and IP location at low zoom, and sends marker/list selections into the v2 inspector as event or live-row selections.
+The Map view uses the selected global range, search text, and source filter. It loads a larger recent event sample than the other v2 event views while selected, follows incremental events until paused, aggregates markers by overlay and IP location, and sends marker/list selections into the v2 inspector as event, live-row, or IP-actor selections. The map controls expose Live Ops, Security, Exec Watch, and All overlay presets, dot and density rendering, GeoIP coverage counts for mapped/unresolved/local/missing-IP activity, and a selected-marker detail surface.
 
 The basemap is a self-hosted Protomaps PMTiles extract bundled under `/admin/v2/maps/`. The shipped archive contains whole-world vector tiles for zoom levels 0 through 4. MapLibre reads that archive with HTTP range requests, the map keeps Protomaps/OpenStreetMap attribution visible, and the UI has an inline geographic fallback if the vector map cannot initialize.
 

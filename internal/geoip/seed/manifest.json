@@ -1,0 +1,21 @@
+{
+  "generated_at": "2026-05-20T19:57:39Z",
+  "databases": [
+    {
+      "id": "dbip-city-lite",
+      "name": "DB-IP City Lite",
+      "file_name": "dbip-city-lite.mmdb.gz",
+      "url": "https://cdn.jsdelivr.net/npm/dbip-city-lite/dbip-city-lite.mmdb.gz",
+      "sha256": "9520cc8c65dc04cafc88682ac89dba2cfbbcb5f686e9094ab021fcf2ae2c02f0",
+      "size_bytes": 62178573
+    },
+    {
+      "id": "geolite2-city",
+      "name": "GeoLite2 City",
+      "file_name": "GeoLite2-City.mmdb.gz",
+      "url": "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz",
+      "sha256": "1f6ce60a2a2781860bdb2f79b58e9c4942c8a698f718966c4ed41c5cb3f8ae49",
+      "size_bytes": 31938026
+    }
+  ]
+}

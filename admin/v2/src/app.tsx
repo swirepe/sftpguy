@@ -50,6 +50,11 @@ type EventsPayload = {
   window?: { label?: string };
 };
 
+type EventStreamPayload = {
+  events?: EventRow[];
+  last_id?: number;
+};
+
 type UploadsPayload = {
   uploads?: UploadRow[];
 };
@@ -83,7 +88,8 @@ type GeoMapPoint = {
   y: number;
 };
 
-type GeoActivityOverlay = "connections" | "files" | "exec" | "denied";
+type GeoActivityOverlay = "connections" | "files" | "exec" | "denied" | "auth" | "flagged" | "banned";
+type GeoActivityMapMode = "dots" | "density";
 
 type GeoActivityPoint = {
   id: string;
@@ -97,6 +103,19 @@ type GeoActivityPoint = {
   longitude: number;
   event?: EventRow;
   live?: { type: LiveTargetKind; row: Record<string, unknown> };
+  actor?: { type: ActorType; value: string };
+};
+
+type GeoActivityCoverage = {
+  mapped: number;
+  unresolved: number;
+  local: number;
+  missing: number;
+};
+
+type GeoActivityModel = {
+  coverage: GeoActivityCoverage;
+  points: GeoActivityPoint[];
 };
 
 type GeoDatabaseStatus = {
@@ -296,7 +315,7 @@ type ActorDetailPayload = {
 
 type BannedPayload = {
   hashes?: Array<{ hash: string; banned_at?: string }>;
-  ips?: Array<{ ip: string; banned_at?: string; comment?: string }>;
+  ips?: Array<{ ip: string; banned_at?: string; comment?: string; geo?: GeoLocation }>;
 };
 
 type AuthAttemptRow = {
@@ -343,13 +362,23 @@ const geoMapPointSourceID = "geoip-points";
 const geoMapPointRingLayerID = "geoip-point-rings";
 const geoMapPointLayerID = "geoip-point-dots";
 const geoActivitySourceID = "geo-activity-points";
+const geoActivityHeatLayerID = "geo-activity-heat";
 const geoActivityRingLayerID = "geo-activity-point-rings";
 const geoActivityPointLayerID = "geo-activity-point-dots";
 const geoActivityOverlays: Array<{ value: GeoActivityOverlay; label: string }> = [
   { value: "connections", label: "Connections" },
   { value: "files", label: "Files" },
   { value: "exec", label: "Exec" },
-  { value: "denied", label: "Denied" }
+  { value: "denied", label: "Denied" },
+  { value: "auth", label: "Auth Attempts" },
+  { value: "flagged", label: "Flagged IPs" },
+  { value: "banned", label: "Banned IPs" }
+];
+const geoActivityMapPresets: Array<{ label: string; overlays: GeoActivityOverlay[] }> = [
+  { label: "Live Ops", overlays: ["connections", "files", "exec"] },
+  { label: "Security", overlays: ["denied", "auth", "flagged", "banned"] },
+  { label: "Exec Watch", overlays: ["exec", "denied", "auth"] },
+  { label: "All", overlays: geoActivityOverlays.map((overlay) => overlay.value) }
 ];
 const worldLandPaths = [
   "M70 21c15-7 35-5 49 3 5 8-7 15-22 14-12-1-27 1-36 9-11 10-23 6-24-5-1-9 12-16 33-21z",
@@ -400,7 +429,7 @@ export function App() {
   const live = useQuery({
     queryKey: ["live"],
     queryFn: () => api<LivePayload>("/admin/api/live"),
-    refetchInterval: 10_000
+    refetchInterval: view === "map" ? 3_000 : 10_000
   });
   const insights = useQuery({
     queryKey: ["insights", range],
@@ -411,7 +440,7 @@ export function App() {
   const events = useQuery({
     queryKey: ["events", range, query, eventLimit],
     queryFn: () => api<EventsPayload>(adminPath("/admin/api/events", { limit: eventLimit, range, q: query })),
-    refetchInterval: 20_000
+    refetchInterval: view === "map" ? 10_000 : 20_000
   });
   const uploads = useQuery({
     queryKey: ["uploads", range, query],
@@ -474,6 +503,33 @@ export function App() {
   });
 
   const eventRows = events.data?.events ?? [];
+  const latestEventID = newestEventID(eventRows);
+  const eventStream = useQuery({
+    queryKey: ["event-stream", range, query, latestEventID],
+    queryFn: () =>
+      api<EventStreamPayload>(
+        adminPath("/admin/api/events/stream", {
+          limit: 240,
+          range,
+          q: query,
+          since_id: latestEventID
+        })
+      ),
+    enabled: view === "map" && latestEventID > 0,
+    refetchInterval: view === "map" ? 2_500 : false
+  });
+
+  useEffect(() => {
+    const rows = eventStream.data?.events ?? [];
+    if (view !== "map" || rows.length === 0) {
+      return;
+    }
+    queryClient.setQueryData<EventsPayload>(["events", range, query, eventLimit], (current) => ({
+      ...current,
+      events: mergeNewestEvents(current?.events ?? [], rows, eventLimit)
+    }));
+  }, [eventLimit, eventStream.data, query, queryClient, range, view]);
+
   const filteredEventRows = useMemo(
     () => eventRows.filter((row) => sourceFilter === "all" || sourceFor(row) === sourceFilter),
     [eventRows, sourceFilter]
@@ -622,10 +678,16 @@ export function App() {
             <GeoActivityMapView
               rows={filteredEventRows}
               live={live.data}
+              authAttempts={authAttempts.data?.attempts ?? []}
+              flaggedIPs={insights.data?.suspicious_ips ?? []}
+              bannedIPs={banned.data?.ips ?? []}
               sourceFilter={sourceFilter}
-              loading={events.isLoading || live.isLoading}
+              loading={events.isLoading || live.isLoading || authAttempts.isLoading || insights.isLoading || banned.isLoading}
+              banIPPending={banIP.isPending}
               onInspectEvent={inspectEvent}
               onInspectLive={inspectLive}
+              onInspectActor={inspectActor}
+              onBanIP={confirmedBanIP}
             />
           ) : view === "thumbnails" ? (
             <ThumbnailView
@@ -1014,21 +1076,43 @@ function Activity(props: {
 function GeoActivityMapView(props: {
   rows: EventRow[];
   live?: LivePayload;
+  authAttempts: AuthAttemptRow[];
+  flaggedIPs: NamedPair[];
+  bannedIPs: NonNullable<BannedPayload["ips"]>;
   sourceFilter: SourceFilter;
   loading: boolean;
+  banIPPending: boolean;
   onInspectEvent: (event: EventRow) => void;
   onInspectLive: (liveType: LiveTargetKind, row: Record<string, unknown>) => void;
+  onInspectActor: (actorType: ActorType, value: string) => void;
+  onBanIP: (ip: string) => void;
 }) {
   const [overlays, setOverlays] = useState<Record<GeoActivityOverlay, boolean>>({
     connections: true,
     files: true,
     exec: true,
-    denied: false
+    denied: false,
+    auth: false,
+    flagged: false,
+    banned: false
   });
+  const [controlsOpen, setControlsOpen] = useState(true);
+  const [followLive, setFollowLive] = useState(true);
+  const [mapMode, setMapMode] = useState<GeoActivityMapMode>("dots");
+  const [pausedModel, setPausedModel] = useState<GeoActivityModel>();
+  const [pausedAtEventID, setPausedAtEventID] = useState(0);
+  const [selectedPointID, setSelectedPointID] = useState("");
   const [fitRequest, setFitRequest] = useState(0);
-  const allPoints = useMemo(() => geoActivityPoints(props.rows, props.live, props.sourceFilter), [props.live, props.rows, props.sourceFilter]);
+  const liveModel = useMemo(
+    () => geoActivityModel(props.rows, props.live, props.authAttempts, props.flaggedIPs, props.bannedIPs, props.sourceFilter),
+    [props.authAttempts, props.bannedIPs, props.flaggedIPs, props.live, props.rows, props.sourceFilter]
+  );
+  const model = followLive || !pausedModel ? liveModel : pausedModel;
+  const allPoints = model.points;
   const points = useMemo(() => allPoints.filter((point) => overlays[point.overlay]), [allPoints, overlays]);
   const counts = useMemo(() => geoActivityCounts(allPoints), [allPoints]);
+  const selectedPoint = points.find((point) => point.id === selectedPointID);
+  const pendingEvents = followLive ? 0 : props.rows.filter((row) => Number(row.id || 0) > pausedAtEventID).length;
 
   function inspectPoint(point: GeoActivityPoint) {
     if (point.event) {
@@ -1037,43 +1121,189 @@ function GeoActivityMapView(props: {
     }
     if (point.live) {
       props.onInspectLive(point.live.type, point.live.row);
+      return;
+    }
+    if (point.actor) {
+      props.onInspectActor(point.actor.type, point.actor.value);
+    }
+  }
+
+  function selectPoint(point: GeoActivityPoint) {
+    setSelectedPointID(point.id);
+    inspectPoint(point);
+  }
+
+  function pauseLiveMap() {
+    setPausedModel(liveModel);
+    setPausedAtEventID(newestEventID(props.rows));
+    setFollowLive(false);
+  }
+
+  function resumeLiveMap() {
+    setFollowLive(true);
+    setPausedModel(undefined);
+  }
+
+  function applyMapPreset(preset: GeoActivityOverlay[]) {
+    setOverlays(geoActivityOverlayState(preset));
+    setSelectedPointID("");
+  }
+
+  async function copyPointIP() {
+    if (!selectedPoint?.ip || !navigator.clipboard) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(selectedPoint.ip);
+    } catch {
+      return;
     }
   }
 
   return (
     <section class="geo-activity-view" aria-label="Geo activity map">
       <div class="geo-activity-stage">
-        <GeoActivityMapSurface points={points} fitRequest={fitRequest} onInspectPoint={inspectPoint} />
+        <GeoActivityMapSurface
+          points={points}
+          fitRequest={fitRequest}
+          mode={mapMode}
+          selectedPointID={selectedPoint?.id}
+          onInspectPoint={selectPoint}
+        />
 
-        <div class="geo-activity-controls">
+        <div class={`geo-activity-controls ${controlsOpen ? "" : "collapsed"}`}>
           <div class="map-dock-heading">
-            <h2>Activity Map</h2>
-            <span>{props.loading ? "Refreshing" : `${formatNumber(points.reduce((count, point) => count + point.count, 0))} mapped`}</span>
+            <div>
+              <h2>Activity Map</h2>
+              <span>
+                {props.loading
+                  ? "Refreshing"
+                  : followLive
+                    ? `${formatNumber(points.reduce((count, point) => count + point.count, 0))} mapped live`
+                    : `${formatNumber(points.reduce((count, point) => count + point.count, 0))} mapped paused`}
+              </span>
+            </div>
+            <button
+              type="button"
+              class="map-controls-toggle"
+              aria-expanded={controlsOpen}
+              aria-controls="geo-activity-overlays"
+              onClick={() => setControlsOpen((value) => !value)}
+            >
+              {controlsOpen ? "Hide" : "Controls"}
+            </button>
           </div>
-          <div class="geo-overlay-controls" aria-label="Map overlays">
-            {geoActivityOverlays.map((overlay) => (
-              <label class={`geo-overlay-toggle ${overlays[overlay.value] ? "active" : ""}`} key={overlay.value}>
-                <input
-                  type="checkbox"
-                  checked={overlays[overlay.value]}
-                  onInput={(event) =>
-                    setOverlays((value) => ({ ...value, [overlay.value]: (event.currentTarget as HTMLInputElement).checked }))
-                  }
-                />
-                <span>{overlay.label}</span>
-                <em>{formatNumber(counts[overlay.value])}</em>
-              </label>
-            ))}
-          </div>
-          <button type="button" class="map-fit-button" onClick={() => setFitRequest((value) => value + 1)}>
-            Fit
-          </button>
+          {controlsOpen ? (
+            <div class="map-control-body" id="geo-activity-overlays">
+              <div class="geo-map-control-row" aria-label="Live map controls">
+                {followLive ? (
+                  <button type="button" class="map-live-button active" onClick={pauseLiveMap}>
+                    Pause
+                  </button>
+                ) : (
+                  <button type="button" class="map-live-button" onClick={resumeLiveMap}>
+                    Follow Live
+                  </button>
+                )}
+                {followLive ? (
+                  <span>Following new activity</span>
+                ) : pendingEvents > 0 ? (
+                  <button type="button" class="map-new-button" onClick={resumeLiveMap}>
+                    {formatNumber(pendingEvents)} new
+                  </button>
+                ) : (
+                  <span>Paused</span>
+                )}
+              </div>
+              <div class="geo-map-mode-tabs" role="group" aria-label="Map rendering mode">
+                <button type="button" class={mapMode === "dots" ? "active" : ""} onClick={() => setMapMode("dots")}>
+                  Dots
+                </button>
+                <button type="button" class={mapMode === "density" ? "active" : ""} onClick={() => setMapMode("density")}>
+                  Density
+                </button>
+              </div>
+              <div class="geo-map-presets" role="group" aria-label="Map overlay presets">
+                {geoActivityMapPresets.map((preset) => (
+                  <button
+                    type="button"
+                    class={geoActivityPresetSelected(overlays, preset.overlays) ? "active" : ""}
+                    key={preset.label}
+                    onClick={() => applyMapPreset(preset.overlays)}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div class="geo-overlay-controls" aria-label="Map overlays">
+                {geoActivityOverlays.map((overlay) => (
+                  <label class={`geo-overlay-toggle ${overlay.value} ${overlays[overlay.value] ? "active" : ""}`} key={overlay.value}>
+                    <input
+                      type="checkbox"
+                      checked={overlays[overlay.value]}
+                      onInput={(event) =>
+                        setOverlays((value) => ({ ...value, [overlay.value]: (event.currentTarget as HTMLInputElement).checked }))
+                      }
+                    />
+                    <span>{overlay.label}</span>
+                    <em>{formatNumber(counts[overlay.value])}</em>
+                  </label>
+                ))}
+              </div>
+              <div class="geo-map-coverage" aria-label="GeoIP map coverage">
+                <span>
+                  <strong>{formatNumber(model.coverage.mapped)}</strong> mapped
+                </span>
+                <span>{formatNumber(model.coverage.unresolved)} unresolved</span>
+                <span>{formatNumber(model.coverage.local)} local</span>
+                <span>{formatNumber(model.coverage.missing)} no IP</span>
+              </div>
+              <button type="button" class="map-fit-button" onClick={() => setFitRequest((value) => value + 1)}>
+                Fit
+              </button>
+            </div>
+          ) : null}
         </div>
 
-        <div class="geo-activity-list" aria-label="Mapped activity">
+        {selectedPoint ? (
+          <div class={`geo-activity-selection ${selectedPoint.overlay}`} aria-label="Selected mapped activity">
+            <div class="geo-selection-heading">
+              <span>{geoActivityOverlayLabel(selectedPoint.overlay)}</span>
+              <button type="button" aria-label="Clear map selection" onClick={() => setSelectedPointID("")}>
+                Close
+              </button>
+            </div>
+            <strong>{selectedPoint.title}</strong>
+            <small>{selectedPoint.detail}</small>
+            <div class="geo-selection-meta">
+              <span>{formatNumber(selectedPoint.count)} hits</span>
+              {selectedPoint.event?.time ? <span>{selectedPoint.event.time}</span> : null}
+              {selectedPoint.live ? <span>live {selectedPoint.live.type}</span> : null}
+            </div>
+            <div class="geo-selection-actions">
+              <button type="button" onClick={() => inspectPoint(selectedPoint)}>
+                Inspect
+              </button>
+              <button type="button" onClick={copyPointIP}>
+                Copy IP
+              </button>
+              <button type="button" onClick={() => props.onBanIP(selectedPoint.ip)} disabled={props.banIPPending}>
+                Ban IP
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        <div class={`geo-activity-list ${selectedPoint ? "has-selection" : ""}`} aria-label="Mapped activity">
           {points.length > 0 ? (
             points.slice(0, 12).map((point) => (
-              <button class={`geo-activity-row ${point.overlay}`} type="button" key={point.id} onClick={() => inspectPoint(point)}>
+              <button
+                class={`geo-activity-row ${point.overlay} ${point.id === selectedPointID ? "selected" : ""}`}
+                type="button"
+                key={point.id}
+                aria-pressed={point.id === selectedPointID}
+                onClick={() => selectPoint(point)}
+              >
                 <strong>{point.title}</strong>
                 <small>{point.detail}</small>
                 <em>{formatNumber(point.count)}</em>
@@ -1834,10 +2064,14 @@ function GeoMapPanel({
 function GeoActivityMapSurface({
   points,
   fitRequest,
+  mode,
+  selectedPointID,
   onInspectPoint
 }: {
   points: GeoActivityPoint[];
   fitRequest: number;
+  mode: GeoActivityMapMode;
+  selectedPointID?: string;
   onInspectPoint: (point: GeoActivityPoint) => void;
 }) {
   const mapNode = useRef<HTMLDivElement>(null);
@@ -1884,7 +2118,33 @@ function GeoActivityMapSurface({
     map.on("load", () => {
       map.addSource(geoActivitySourceID, {
         type: "geojson",
-        data: geoActivityFeatures(points)
+        data: geoActivityFeatures(points, selectedPointID)
+      });
+      map.addLayer({
+        id: geoActivityHeatLayerID,
+        type: "heatmap",
+        source: geoActivitySourceID,
+        paint: {
+          "heatmap-color": [
+            "interpolate",
+            ["linear"],
+            ["heatmap-density"],
+            0,
+            "rgba(7, 16, 22, 0)",
+            0.2,
+            "rgba(74, 222, 128, 0.34)",
+            0.52,
+            "rgba(103, 232, 249, 0.58)",
+            0.78,
+            "rgba(242, 184, 75, 0.76)",
+            1,
+            "rgba(251, 113, 133, 0.92)"
+          ],
+          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], -1, 0.7, 4, 1.8],
+          "heatmap-opacity": 0,
+          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], -1, 18, 4, 46],
+          "heatmap-weight": ["interpolate", ["linear"], ["get", "count"], 1, 0.25, 12, 0.72, 50, 1]
+        }
       });
       map.addLayer({
         id: geoActivityRingLayerID,
@@ -1893,9 +2153,9 @@ function GeoActivityMapSurface({
         paint: {
           "circle-color": ["get", "wash"],
           "circle-radius": ["+", ["get", "radius"], 5],
-          "circle-stroke-color": ["get", "color"],
+          "circle-stroke-color": ["case", ["get", "selected"], "#edf4f4", ["get", "color"]],
           "circle-stroke-opacity": 0.82,
-          "circle-stroke-width": 1.4
+          "circle-stroke-width": ["case", ["get", "selected"], 2.6, 1.4]
         }
       });
       map.addLayer({
@@ -1904,9 +2164,9 @@ function GeoActivityMapSurface({
         source: geoActivitySourceID,
         paint: {
           "circle-color": ["get", "color"],
-          "circle-radius": ["get", "radius"],
-          "circle-stroke-color": "#061014",
-          "circle-stroke-width": 1.2
+          "circle-radius": ["+", ["get", "radius"], ["case", ["get", "selected"], 2.6, 0]],
+          "circle-stroke-color": ["case", ["get", "selected"], "#edf4f4", "#061014"],
+          "circle-stroke-width": ["case", ["get", "selected"], 2, 1.2]
         }
       });
       map.on("click", geoActivityPointLayerID, (event) => {
@@ -1922,6 +2182,7 @@ function GeoActivityMapSurface({
       map.on("mouseleave", geoActivityPointLayerID, () => {
         map.getCanvas().style.cursor = "";
       });
+      setGeoActivityMapMode(map, mode);
       fitGeoActivityMap(map, points);
     });
     map.on("error", () => {
@@ -1937,8 +2198,24 @@ function GeoActivityMapSurface({
   useEffect(() => {
     const map = mapRef.current;
     const source = map?.getSource(geoActivitySourceID) as GeoJSONSource | undefined;
-    source?.setData(geoActivityFeatures(points));
-  }, [points]);
+    source?.setData(geoActivityFeatures(points, selectedPointID));
+  }, [points, selectedPointID]);
+
+  useEffect(() => {
+    if (mapRef.current) {
+      setGeoActivityMapMode(mapRef.current, mode);
+    }
+  }, [mode]);
+
+  useEffect(() => {
+    if (!selectedPointID || !mapRef.current) {
+      return;
+    }
+    const point = points.find((candidate) => candidate.id === selectedPointID);
+    if (point) {
+      mapRef.current.easeTo({ center: geoActivityCoordinate(point), duration: 260 });
+    }
+  }, [selectedPointID]);
 
   useEffect(() => {
     if (fitRequest > 0 && mapRef.current) {
@@ -1947,12 +2224,20 @@ function GeoActivityMapSurface({
   }, [fitRequest, points]);
 
   if (failed) {
-    return <GeoActivityFallback points={points} onInspectPoint={onInspectPoint} />;
+    return <GeoActivityFallback points={points} selectedPointID={selectedPointID} onInspectPoint={onInspectPoint} />;
   }
   return <div class="geo-activity-map" ref={mapNode} role="img" aria-label="Mapped admin activity" />;
 }
 
-function GeoActivityFallback({ points, onInspectPoint }: { points: GeoActivityPoint[]; onInspectPoint: (point: GeoActivityPoint) => void }) {
+function GeoActivityFallback({
+  points,
+  selectedPointID,
+  onInspectPoint
+}: {
+  points: GeoActivityPoint[];
+  selectedPointID?: string;
+  onInspectPoint: (point: GeoActivityPoint) => void;
+}) {
   const max = Math.max(...points.map((point) => point.count), 1);
   return (
     <svg class="geo-activity-map geo-map" viewBox="0 0 360 180" role="img" aria-label="Mapped admin activity fallback">
@@ -1967,7 +2252,7 @@ function GeoActivityFallback({ points, onInspectPoint }: { points: GeoActivityPo
         const radius = geoActivityMarkerRadius(point.count, max);
         return (
           <g
-            class="geo-marker"
+            class={`geo-marker ${point.id === selectedPointID ? "selected" : ""}`}
             style={{ color: color.color }}
             transform={`translate(${position.x.toFixed(2)} ${position.y.toFixed(2)})`}
             key={point.id}
@@ -3146,6 +3431,7 @@ function EventSummary({ event }: { event: EventRow }) {
         <Meta label="Command" value={command} />
         <Meta label="User" value={user} />
         <Meta label="IP" value={event.ip} />
+        <Meta label="Hosts" value={metaString(event, ["hosts", "hostnames", "hostname"])} />
         <Meta label="Geo" value={geoLabel(event.geo)} />
         <Meta label="Session" value={session} />
         <Meta label="Error" value={error} />
@@ -4913,24 +5199,86 @@ function geoMapFeatures(points: GeoMapPoint[]) {
 }
 
 function geoActivityCounts(points: GeoActivityPoint[]): Record<GeoActivityOverlay, number> {
-  const counts: Record<GeoActivityOverlay, number> = { connections: 0, files: 0, exec: 0, denied: 0 };
+  const counts: Record<GeoActivityOverlay, number> = { connections: 0, files: 0, exec: 0, denied: 0, auth: 0, flagged: 0, banned: 0 };
   for (const point of points) {
     counts[point.overlay] += point.count;
   }
   return counts;
 }
 
-function geoActivityPoints(rows: EventRow[], live: LivePayload | undefined, sourceFilter: SourceFilter): GeoActivityPoint[] {
+function geoActivityOverlayState(active: GeoActivityOverlay[]): Record<GeoActivityOverlay, boolean> {
+  const selected = new Set(active);
+  return {
+    connections: selected.has("connections"),
+    files: selected.has("files"),
+    exec: selected.has("exec"),
+    denied: selected.has("denied"),
+    auth: selected.has("auth"),
+    flagged: selected.has("flagged"),
+    banned: selected.has("banned")
+  };
+}
+
+function geoActivityPresetSelected(overlays: Record<GeoActivityOverlay, boolean>, active: GeoActivityOverlay[]): boolean {
+  const selected = new Set(active);
+  return geoActivityOverlays.every((overlay) => overlays[overlay.value] === selected.has(overlay.value));
+}
+
+function newestEventID(rows: EventRow[]): number {
+  return rows.reduce((latest, row) => Math.max(latest, Number(row.id || 0)), 0);
+}
+
+function mergeNewestEvents(current: EventRow[], incoming: EventRow[], limit: number): EventRow[] {
+  const rows = new Map<number, EventRow>();
+  for (const row of current) {
+    rows.set(row.id, row);
+  }
+  for (const row of incoming) {
+    rows.set(row.id, row);
+  }
+  return [...rows.values()].sort((a, b) => b.id - a.id).slice(0, limit);
+}
+
+function geoActivityModel(
+  rows: EventRow[],
+  live: LivePayload | undefined,
+  authAttempts: AuthAttemptRow[],
+  flaggedIPs: NamedPair[],
+  bannedIPs: NonNullable<BannedPayload["ips"]>,
+  sourceFilter: SourceFilter
+): GeoActivityModel {
   const points = new Map<string, GeoActivityPoint>();
+  const coverage: GeoActivityCoverage = { mapped: 0, unresolved: 0, local: 0, missing: 0 };
+  const knownGeoByIP = new Map<string, GeoLocation>();
+
+  function rememberGeo(ip: string | undefined, geo: GeoLocation | undefined) {
+    if (ip && hasGeoCoordinate(geo) && !knownGeoByIP.has(ip)) {
+      knownGeoByIP.set(ip, geo);
+    }
+  }
+
+  for (const row of rows) {
+    rememberGeo(row.ip || row.geo?.ip, row.geo);
+  }
+  for (const attempt of authAttempts) {
+    rememberGeo(attempt.ip || attempt.geo?.ip, attempt.geo);
+  }
+  for (const row of flaggedIPs) {
+    rememberGeo(row.name || row.geo?.ip, row.geo);
+  }
 
   function addEvent(overlay: GeoActivityOverlay, event: EventRow) {
+    const ip = event.ip || event.geo?.ip || "";
+    if (!countGeoActivityCoverage(coverage, ip, event.geo)) {
+      return;
+    }
     if (!hasGeoCoordinate(event.geo)) {
       return;
     }
-    const ip = event.ip || event.geo.ip || "unknown IP";
-    const key = `${overlay}:event:${ip}:${event.geo.latitude}:${event.geo.longitude}`;
+    const pointIP = ip || "unknown IP";
+    const key = `${overlay}:event:${pointIP}:${event.geo.latitude}:${event.geo.longitude}`;
     const existing = points.get(key);
-    const next = geoActivityEventPoint(key, overlay, ip, event);
+    const next = geoActivityEventPoint(key, overlay, pointIP, event);
     if (!existing) {
       points.set(key, next);
       return;
@@ -4947,13 +5295,17 @@ function geoActivityPoints(rows: EventRow[], live: LivePayload | undefined, sour
       return;
     }
     const geo = geoFromUnknown(row["geo"]);
+    const ip = liveIP(row) || geo?.ip || "";
+    if (!countGeoActivityCoverage(coverage, ip, geo)) {
+      return;
+    }
     if (!hasGeoCoordinate(geo)) {
       return;
     }
-    const ip = liveIP(row) || geo.ip || "unknown IP";
-    const key = `${overlay}:live:${type}:${ip}:${geo.latitude}:${geo.longitude}`;
+    const pointIP = ip || "unknown IP";
+    const key = `${overlay}:live:${type}:${pointIP}:${geo.latitude}:${geo.longitude}`;
     const existing = points.get(key);
-    const next = geoActivityLivePoint(key, overlay, type, row, geo, ip);
+    const next = geoActivityLivePoint(key, overlay, type, row, geo, pointIP);
     if (!existing) {
       points.set(key, next);
       return;
@@ -4961,6 +5313,25 @@ function geoActivityPoints(rows: EventRow[], live: LivePayload | undefined, sour
     existing.count++;
     existing.live = next.live;
     existing.detail = next.detail;
+  }
+
+  function addActor(overlay: GeoActivityOverlay, ip: string, geo: GeoLocation | undefined, count: number, detail: string) {
+    if (!hasGeoCoordinate(geo) || !ip) {
+      return;
+    }
+    const key = `${overlay}:actor:${ip}:${geo.latitude}:${geo.longitude}`;
+    points.set(key, {
+      id: key,
+      overlay,
+      title: ip,
+      detail,
+      count: Math.max(1, count),
+      ip,
+      geo,
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      actor: { type: "ip", value: ip }
+    });
   }
 
   for (const row of rows) {
@@ -4983,8 +5354,39 @@ function geoActivityPoints(rows: EventRow[], live: LivePayload | undefined, sour
   for (const row of recordArray(live?.transfers)) {
     addLive("files", "transfer", row);
   }
+  if (sourceFilter === "all" || sourceFilter === "sftp") {
+    for (const attempt of authAttempts) {
+      addEvent("auth", eventFromAuthAttempt(attempt));
+    }
+  }
+  for (const row of flaggedIPs) {
+    addActor(
+      "flagged",
+      row.name,
+      row.geo,
+      row.count,
+      [geoActivityOverlayLabel("flagged"), geoLabel(row.geo), `${formatNumber(row.count)} events`, row.denied ? `${formatNumber(row.denied)} denied` : ""]
+        .filter(Boolean)
+        .join(" / ")
+    );
+  }
+  for (const row of bannedIPs) {
+    const geo = row.geo || knownGeoByIP.get(row.ip);
+    addActor(
+      "banned",
+      row.ip,
+      geo,
+      1,
+      [geoActivityOverlayLabel("banned"), geoLabel(geo), row.banned_at || "", row.comment || ""].filter(Boolean).join(" / ")
+    );
+  }
 
-  return [...points.values()].sort((a, b) => b.count - a.count || geoActivityOverlayRank(a.overlay) - geoActivityOverlayRank(b.overlay) || a.title.localeCompare(b.title));
+  return {
+    coverage,
+    points: [...points.values()].sort(
+      (a, b) => b.count - a.count || geoActivityOverlayRank(a.overlay) - geoActivityOverlayRank(b.overlay) || a.title.localeCompare(b.title)
+    )
+  };
 }
 
 function geoActivityEventPoint(id: string, overlay: GeoActivityOverlay, ip: string, event: EventRow): GeoActivityPoint {
@@ -5040,7 +5442,23 @@ function matchesLiveSource(row: Record<string, unknown>, sourceFilter: SourceFil
   return sourceFilter === "sftp";
 }
 
-function geoActivityFeatures(points: GeoActivityPoint[]) {
+function countGeoActivityCoverage(coverage: GeoActivityCoverage, ip: string, geo: GeoLocation | undefined): boolean {
+  if (hasGeoCoordinate(geo)) {
+    coverage.mapped++;
+    return true;
+  }
+  const host = hostFromAddress(ip).trim().toLowerCase();
+  if (!host || host === "unknown ip") {
+    coverage.missing++;
+  } else if (isLocalIP(host)) {
+    coverage.local++;
+  } else {
+    coverage.unresolved++;
+  }
+  return false;
+}
+
+function geoActivityFeatures(points: GeoActivityPoint[], selectedPointID?: string) {
   const max = Math.max(...points.map((point) => point.count), 1);
   return {
     type: "FeatureCollection" as const,
@@ -5058,6 +5476,7 @@ function geoActivityFeatures(points: GeoActivityPoint[]) {
           count: point.count,
           id: point.id,
           radius: geoActivityMarkerRadius(point.count, max),
+          selected: point.id === selectedPointID,
           wash: color.wash
         }
       };
@@ -5070,7 +5489,10 @@ function geoActivityCoordinate(point: GeoActivityPoint): [number, number] {
     connections: [0, 0],
     files: [1.3, 0.7],
     exec: [-1.3, -0.7],
-    denied: [0.8, -1.1]
+    denied: [0.8, -1.1],
+    auth: [-0.85, 1.2],
+    flagged: [1.55, -0.1],
+    banned: [-1.55, 0.1]
   };
   const [lon, lat] = offsets[point.overlay];
   return [Math.max(-180, Math.min(180, point.longitude + lon)), Math.max(-85, Math.min(85, point.latitude + lat))];
@@ -5084,6 +5506,12 @@ function geoActivityColor(overlay: GeoActivityOverlay): { color: string; wash: s
       return { color: "#f2b84b", wash: "rgba(242, 184, 75, 0.18)" };
     case "denied":
       return { color: "#fb7185", wash: "rgba(251, 113, 133, 0.18)" };
+    case "auth":
+      return { color: "#c4b5fd", wash: "rgba(196, 181, 253, 0.18)" };
+    case "flagged":
+      return { color: "#f97316", wash: "rgba(249, 115, 22, 0.18)" };
+    case "banned":
+      return { color: "#f43f5e", wash: "rgba(244, 63, 94, 0.2)" };
     case "connections":
     default:
       return { color: "#4ade80", wash: "rgba(74, 222, 128, 0.18)" };
@@ -5100,6 +5528,16 @@ function geoActivityOverlayLabel(overlay: GeoActivityOverlay): string {
 
 function geoActivityOverlayRank(overlay: GeoActivityOverlay): number {
   return geoActivityOverlays.findIndex((option) => option.value === overlay);
+}
+
+function setGeoActivityMapMode(map: MapLibreMap, mode: GeoActivityMapMode) {
+  if (!map.getLayer(geoActivityHeatLayerID) || !map.getLayer(geoActivityPointLayerID) || !map.getLayer(geoActivityRingLayerID)) {
+    return;
+  }
+  const density = mode === "density";
+  map.setPaintProperty(geoActivityHeatLayerID, "heatmap-opacity", density ? 0.92 : 0);
+  map.setPaintProperty(geoActivityRingLayerID, "circle-opacity", density ? 0.18 : 1);
+  map.setPaintProperty(geoActivityPointLayerID, "circle-opacity", density ? 0.38 : 1);
 }
 
 function fitGeoActivityMap(map: MapLibreMap, points: GeoActivityPoint[]) {
@@ -5550,6 +5988,26 @@ function hostFromAddress(value: string): string {
     return parts[0];
   }
   return value;
+}
+
+function isLocalIP(value: string): boolean {
+  const host = hostFromAddress(value).replace(/^::ffff:/, "").toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "::1" ||
+    host === "0.0.0.0" ||
+    host.startsWith("127.") ||
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    host.startsWith("169.254.") ||
+    host.startsWith("fc") ||
+    host.startsWith("fd") ||
+    host.startsWith("fe80:")
+  ) {
+    return true;
+  }
+  const private172 = host.match(/^172\.(\d+)\./);
+  return Boolean(private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31);
 }
 
 function titleCase(value: string): string {

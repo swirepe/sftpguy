@@ -269,7 +269,8 @@ select {
 }
 
 .geo-activity-controls,
-.geo-activity-list {
+.geo-activity-list,
+.geo-activity-selection {
   position: absolute;
   z-index: 2;
   border: 1px solid rgba(148, 165, 174, 0.28);
@@ -282,17 +283,30 @@ select {
   top: 14px;
   left: 14px;
   width: min(294px, calc(100% - 28px));
+  max-height: calc(100% - 220px);
   display: grid;
   gap: 10px;
+  overflow: auto;
   padding: 12px;
+}
+
+.geo-activity-controls.collapsed {
+  width: min(284px, calc(100% - 28px));
+  padding-block: 10px;
 }
 
 .map-dock-heading {
   min-width: 0;
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
+}
+
+.map-dock-heading > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
 }
 
 .map-dock-heading h2 {
@@ -300,6 +314,95 @@ select {
   font-size: 17px;
   line-height: 1.2;
   letter-spacing: 0;
+}
+
+.map-dock-heading span {
+  font-size: 12px;
+}
+
+.map-controls-toggle {
+  min-height: 32px;
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.map-control-body {
+  display: grid;
+  gap: 10px;
+}
+
+.geo-map-control-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.geo-map-control-row span,
+.geo-map-coverage {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.map-live-button,
+.map-new-button {
+  min-height: 32px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.map-live-button.active {
+  border-color: rgba(74, 222, 128, 0.52);
+  color: #4ade80;
+}
+
+.map-new-button {
+  border-color: var(--accent-line);
+  color: var(--accent-strong);
+}
+
+.geo-map-mode-tabs,
+.geo-map-presets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.geo-map-mode-tabs button,
+.geo-map-presets button {
+  min-height: 32px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.geo-map-mode-tabs button.active,
+.geo-map-presets button.active {
+  border-color: var(--accent-line);
+  background: color-mix(in srgb, rgba(13, 20, 26, 0.96), var(--accent-soft) 40%);
+  color: var(--accent-strong);
+}
+
+.geo-map-coverage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.geo-map-coverage span {
+  padding: 4px 6px;
+  border: 1px solid rgba(148, 165, 174, 0.18);
+  border-radius: 5px;
+  background: rgba(13, 20, 26, 0.76);
+}
+
+.geo-map-coverage strong {
+  color: var(--ink);
 }
 
 .map-dock-heading span,
@@ -314,14 +417,15 @@ select {
 
 .geo-overlay-controls {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
 }
 
 .geo-overlay-toggle {
   min-height: 34px;
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 1px 8px;
   align-items: center;
   padding: 6px 8px;
   border: 1px solid rgba(148, 165, 174, 0.22);
@@ -330,9 +434,26 @@ select {
   cursor: pointer;
 }
 
+.geo-overlay-toggle span,
+.geo-overlay-toggle em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.geo-overlay-toggle em {
+  grid-column: 2;
+  line-height: 1.1;
+}
+
 .geo-overlay-toggle.active {
-  border-color: var(--accent-line);
-  background: color-mix(in srgb, rgba(13, 20, 26, 0.96), var(--accent-soft) 34%);
+  border-color: var(--geo-overlay-line, var(--accent-line));
+  background: color-mix(in srgb, rgba(13, 20, 26, 0.96), var(--geo-overlay-color, var(--accent)) 16%);
+}
+
+.geo-overlay-toggle.active span {
+  color: var(--geo-overlay-color, var(--accent-strong));
 }
 
 .geo-overlay-toggle input {
@@ -340,7 +461,42 @@ select {
   min-height: 16px;
   height: 16px;
   margin: 0;
-  accent-color: var(--accent);
+  accent-color: var(--geo-overlay-color, var(--accent));
+}
+
+.geo-overlay-toggle.connections {
+  --geo-overlay-color: #4ade80;
+  --geo-overlay-line: rgba(74, 222, 128, 0.58);
+}
+
+.geo-overlay-toggle.files {
+  --geo-overlay-color: #67e8f9;
+  --geo-overlay-line: rgba(103, 232, 249, 0.58);
+}
+
+.geo-overlay-toggle.exec {
+  --geo-overlay-color: #f2b84b;
+  --geo-overlay-line: rgba(242, 184, 75, 0.58);
+}
+
+.geo-overlay-toggle.denied {
+  --geo-overlay-color: #fb7185;
+  --geo-overlay-line: rgba(251, 113, 133, 0.58);
+}
+
+.geo-overlay-toggle.auth {
+  --geo-overlay-color: #c4b5fd;
+  --geo-overlay-line: rgba(196, 181, 253, 0.58);
+}
+
+.geo-overlay-toggle.flagged {
+  --geo-overlay-color: #f97316;
+  --geo-overlay-line: rgba(249, 115, 22, 0.58);
+}
+
+.geo-overlay-toggle.banned {
+  --geo-overlay-color: #f43f5e;
+  --geo-overlay-line: rgba(244, 63, 94, 0.62);
 }
 
 .map-fit-button {
@@ -349,10 +505,10 @@ select {
 }
 
 .geo-activity-list {
-  left: 14px;
+  right: 14px;
   bottom: 14px;
   width: min(510px, calc(100% - 28px));
-  max-height: min(248px, calc(100% - 244px));
+  max-height: min(174px, calc(100% - 410px));
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
@@ -404,6 +560,122 @@ select {
 
 .geo-activity-row.denied {
   border-color: rgba(251, 113, 133, 0.44);
+}
+
+.geo-activity-row.auth {
+  border-color: rgba(196, 181, 253, 0.44);
+}
+
+.geo-activity-row.flagged {
+  border-color: rgba(249, 115, 22, 0.46);
+}
+
+.geo-activity-row.banned {
+  border-color: rgba(244, 63, 94, 0.48);
+}
+
+.geo-activity-row.selected {
+  border-color: var(--ink);
+  box-shadow: inset 0 0 0 1px rgba(237, 244, 244, 0.5);
+}
+
+.geo-activity-selection {
+  top: 14px;
+  right: 56px;
+  width: min(320px, calc(100% - 380px));
+  display: grid;
+  gap: 7px;
+  padding: 11px;
+  min-width: 240px;
+}
+
+.geo-activity-selection > strong,
+.geo-activity-selection > small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.geo-activity-selection > strong {
+  font-size: 16px;
+}
+
+.geo-activity-selection > small,
+.geo-selection-meta {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.geo-selection-heading,
+.geo-selection-meta,
+.geo-selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.geo-selection-heading {
+  justify-content: space-between;
+}
+
+.geo-selection-heading span,
+.geo-selection-meta span {
+  padding: 3px 6px;
+  border: 1px solid rgba(148, 165, 174, 0.2);
+  border-radius: 5px;
+  background: rgba(13, 20, 26, 0.76);
+}
+
+.geo-selection-heading span {
+  border-color: var(--geo-overlay-line, rgba(148, 165, 174, 0.28));
+  color: var(--geo-overlay-color, var(--ink));
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.geo-selection-heading button,
+.geo-selection-actions button {
+  min-height: 30px;
+  padding: 5px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.geo-activity-selection.connections {
+  --geo-overlay-color: #4ade80;
+  --geo-overlay-line: rgba(74, 222, 128, 0.58);
+}
+
+.geo-activity-selection.files {
+  --geo-overlay-color: #67e8f9;
+  --geo-overlay-line: rgba(103, 232, 249, 0.58);
+}
+
+.geo-activity-selection.exec {
+  --geo-overlay-color: #f2b84b;
+  --geo-overlay-line: rgba(242, 184, 75, 0.58);
+}
+
+.geo-activity-selection.denied {
+  --geo-overlay-color: #fb7185;
+  --geo-overlay-line: rgba(251, 113, 133, 0.58);
+}
+
+.geo-activity-selection.auth {
+  --geo-overlay-color: #c4b5fd;
+  --geo-overlay-line: rgba(196, 181, 253, 0.58);
+}
+
+.geo-activity-selection.flagged {
+  --geo-overlay-color: #f97316;
+  --geo-overlay-line: rgba(249, 115, 22, 0.58);
+}
+
+.geo-activity-selection.banned {
+  --geo-overlay-color: #f43f5e;
+  --geo-overlay-line: rgba(244, 63, 94, 0.62);
 }
 
 .geo-activity-empty {
@@ -976,6 +1248,11 @@ button.bar-row.clickable:hover {
 
 .geo-marker:focus-visible .geo-marker-ring {
   stroke: var(--gold);
+  stroke-width: 2.4;
+}
+
+.geo-marker.selected .geo-activity-fallback-ring {
+  stroke: var(--ink);
   stroke-width: 2.4;
 }
 
@@ -2347,8 +2624,18 @@ button.dense-row {
   .geo-activity-list {
     inset: auto 10px 10px;
     width: auto;
-    max-height: min(255px, calc(100% - 300px));
+    max-height: min(190px, calc(100% - 410px));
     grid-template-columns: 1fr;
+  }
+
+  .geo-activity-list.has-selection {
+    display: none;
+  }
+
+  .geo-activity-selection {
+    inset: auto 10px 10px;
+    width: auto;
+    min-width: 0;
   }
 
   .geo-map-frame,
