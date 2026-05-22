@@ -1,6 +1,7 @@
 import { render } from "preact";
 import { QueryClient, QueryClientProvider } from "@tanstack/preact-query";
 import { App } from "./app";
+import "maplibre-gl/dist/maplibre-gl.css";
 import "./style.css";
 
 const queryClient = new QueryClient({

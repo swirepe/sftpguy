@@ -136,6 +136,8 @@ const (
 	defaultMaxConnsPerIP  = 50
 	connectionLimitWindow = 24 * time.Hour
 	connectionLimitFlush  = 30 * time.Second
+	eventHostnameCacheTTL = 10 * time.Minute
+	eventHostnameTimeout  = 750 * time.Millisecond
 	unrestrictedUID       = 1337
 	unrestrictedGID       = 1337
 	badFileCheckQueueSize = 256
@@ -422,6 +424,14 @@ type Store struct {
 	badFilesPath        string
 	connectionLimitMu   sync.Mutex
 	connectionLimitByIP map[string]*connectionLimitAggregate
+	eventHostnameMu     sync.Mutex
+	eventHostnameCtx    context.Context
+	eventHostnameCancel context.CancelFunc
+	eventHostnameLookup func(context.Context, string) ([]string, error)
+	eventHostnameCache  map[string]eventHostnameCacheEntry
+	eventHostnameRows   map[string][]int64
+	eventHostnameWG     sync.WaitGroup
+	eventHostnameClosed bool
 }
 
 type connectionLimitAggregate struct {
@@ -436,6 +446,11 @@ type connectionLimitAggregate struct {
 	Limit          int
 	RemoteAddr     string
 	Dirty          bool
+}
+
+type eventHostnameCacheEntry struct {
+	hosts     []string
+	expiresAt time.Time
 }
 
 func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
@@ -527,6 +542,10 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		whitelistPath: whitePath,
 		adminKeysPath: adminKeysPath,
 		badFilesPath:  badFilesPath}
+	store.eventHostnameCtx, store.eventHostnameCancel = context.WithCancel(context.Background())
+	store.eventHostnameLookup = net.DefaultResolver.LookupAddr
+	store.eventHostnameCache = make(map[string]eventHostnameCacheEntry)
+	store.eventHostnameRows = make(map[string][]int64)
 
 	if migrated, err := store.migrateLegacyIPBans(); err != nil {
 		logger.Warn("failed to migrate legacy ip bans", "err", err)
@@ -600,6 +619,8 @@ func (s *Store) RegisterSystemFiles(absBase string, paths []string) {
 }
 
 func (s *Store) Close() error {
+	s.closeEventHostnameLookups()
+
 	if err := s.FlushConnectionLimitAggregates(); err != nil {
 		s.logger.Warn("failed to flush connection limit aggregates during store close", "err", err)
 	}
@@ -621,6 +642,22 @@ func (s *Store) Close() error {
 	}
 
 	return errors.Join(closeDB(s.db), s.caidMatcher.Close())
+}
+
+func (s *Store) closeEventHostnameLookups() {
+	s.eventHostnameMu.Lock()
+	if s.eventHostnameClosed {
+		s.eventHostnameMu.Unlock()
+		return
+	}
+	s.eventHostnameClosed = true
+	cancel := s.eventHostnameCancel
+	s.eventHostnameMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	s.eventHostnameWG.Wait()
 }
 
 func (s *Store) GetUserStats(hash string) (userStats, error) {
@@ -940,9 +977,9 @@ func (s *Store) OwnedFilesSummary(pubHash string, limit int) (OwnedFilesSummary,
 }
 
 func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr net.Addr, args ...any) {
-	ip, port := remoteAddrIPPort(remoteAddr)
+	ip, port, isLocal := remoteAddrIPPort(remoteAddr)
 
-	// Pull path and meta out of the variadic key-value args
+	// Pull path and meta out of the variadic key-value args.
 	path := ""
 	meta := map[string]any{}
 	for i := 0; i+1 < len(args); i += 2 {
@@ -963,13 +1000,17 @@ func (s *Store) LogEvent(kind EventKind, pubHash, sessionID string, remoteAddr n
 		}
 	}
 
-	_, err := s.exec(`
+	res, err := s.exec(`
 		INSERT INTO log (timestamp, ip_address, port, user_id, user_session, event, path, meta)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().Unix(), ip, port, pubHash, sessionID, string(kind), path, metaJSON,
 	)
 	if err != nil {
 		s.logger.Warn("failed to log event", "kind", kind, "err", err)
+		return
+	}
+	if id, err := res.LastInsertId(); err == nil {
+		s.enqueueEventHostnameLookup(id, ip, isLocal)
 	}
 }
 
@@ -977,7 +1018,7 @@ func (s *Store) LogConnectionLimitExceeded(remoteAddr net.Addr, active, limit in
 	if s == nil {
 		return
 	}
-	ip, port := remoteAddrIPPort(remoteAddr)
+	ip, port, _ := remoteAddrIPPort(remoteAddr)
 	if ip == "" {
 		return
 	}
@@ -1198,23 +1239,174 @@ func connectionLimitMetaJSON(firstTimestamp, lastTimestamp, windowSeconds, hits 
 	return string(b)
 }
 
-func remoteAddrIPPort(remoteAddr net.Addr) (string, int) {
+func (s *Store) enqueueEventHostnameLookup(rowID int64, rawIP string, isLocal bool) {
+	if rowID <= 0 || isLocal {
+		return
+	}
+	ip, ok := remoteHostnameLookupIP(rawIP)
+	if !ok {
+		return
+	}
+
+	s.eventHostnameMu.Lock()
+	if s.eventHostnameClosed {
+		s.eventHostnameMu.Unlock()
+		return
+	}
+	if s.eventHostnameCache == nil {
+		s.eventHostnameCache = make(map[string]eventHostnameCacheEntry)
+	}
+	if s.eventHostnameRows == nil {
+		s.eventHostnameRows = make(map[string][]int64)
+	}
+	if cached, ok := s.eventHostnameCache[ip]; ok && time.Now().Before(cached.expiresAt) {
+		hosts := cloneHostnames(cached.hosts)
+		if len(hosts) == 0 {
+			s.eventHostnameMu.Unlock()
+			return
+		}
+		s.eventHostnameWG.Add(1)
+		s.eventHostnameMu.Unlock()
+		go func() {
+			defer s.eventHostnameWG.Done()
+			s.setEventHosts(rowID, hosts)
+		}()
+		return
+	}
+	if _, pending := s.eventHostnameRows[ip]; pending {
+		s.eventHostnameRows[ip] = append(s.eventHostnameRows[ip], rowID)
+		s.eventHostnameMu.Unlock()
+		return
+	}
+
+	s.eventHostnameRows[ip] = []int64{rowID}
+	lookup := s.eventHostnameLookup
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupAddr
+	}
+	s.eventHostnameWG.Add(1)
+	s.eventHostnameMu.Unlock()
+
+	go s.lookupEventHostnames(ip, lookup)
+}
+
+func (s *Store) lookupEventHostnames(ip string, lookup func(context.Context, string) ([]string, error)) {
+	defer s.eventHostnameWG.Done()
+
+	parent := s.eventHostnameCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, eventHostnameTimeout)
+	defer cancel()
+
+	hosts, err := lookup(ctx, ip)
+	if err != nil {
+		hosts = nil
+	} else {
+		hosts = cleanHostnames(hosts)
+	}
+
+	s.eventHostnameMu.Lock()
+	rowIDs := s.eventHostnameRows[ip]
+	delete(s.eventHostnameRows, ip)
+	s.eventHostnameCache[ip] = eventHostnameCacheEntry{
+		hosts:     cloneHostnames(hosts),
+		expiresAt: time.Now().Add(eventHostnameCacheTTL),
+	}
+	s.eventHostnameMu.Unlock()
+
+	if len(hosts) == 0 || ctx.Err() != nil {
+		return
+	}
+	for _, rowID := range rowIDs {
+		s.setEventHosts(rowID, hosts)
+	}
+}
+
+func (s *Store) setEventHosts(rowID int64, hosts []string) {
+	if rowID <= 0 || len(hosts) == 0 {
+		return
+	}
+
+	var rawMeta string
+	if err := s.db.QueryRow(`SELECT IFNULL(meta, '') FROM log WHERE id = ?`, rowID).Scan(&rawMeta); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			s.logger.Debug("failed to read event for hostname enrichment", "id", rowID, "err", err)
+		}
+		return
+	}
+
+	meta := parseJSONMap(rawMeta)
+	if meta == nil {
+		meta = make(map[string]any)
+	}
+	meta["hosts"] = cloneHostnames(hosts)
+	b, err := json.Marshal(meta)
+	if err != nil {
+		s.logger.Debug("failed to encode event hostname metadata", "id", rowID, "err", err)
+		return
+	}
+	if _, err := s.exec(`UPDATE log SET meta = ? WHERE id = ?`, string(b), rowID); err != nil {
+		s.logger.Debug("failed to add event hostname metadata", "id", rowID, "err", err)
+	}
+}
+
+func remoteAddrIPPort(remoteAddr net.Addr) (string, int, bool) {
 	if remoteAddr == nil {
-		return "", 0
+		return "", 0, false
 	}
 	host, portStr, err := net.SplitHostPort(remoteAddr.String())
 	if err == nil {
 		port, _ := strconv.Atoi(portStr)
-		return host, port
+		return host, port, isLocalIP(host)
 	}
 	if tcpAddr, ok := remoteAddr.(*net.TCPAddr); ok {
 		ip := ""
 		if tcpAddr.IP != nil {
 			ip = tcpAddr.IP.String()
 		}
-		return ip, tcpAddr.Port
+		return ip, tcpAddr.Port, isLocalIP(ip)
 	}
-	return strings.TrimSpace(remoteAddr.String()), 0
+	addr := strings.TrimSpace(remoteAddr.String())
+	return addr, 0, isLocalIP(addr)
+}
+
+func remoteHostnameLookupIP(raw string) (string, bool) {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil || isLocalIP(ip.String()) || ip.IsUnspecified() || ip.IsMulticast() {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+func isLocalIP(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast())
+}
+
+func cleanHostnames(hosts []string) []string {
+	clean := make([]string, 0, len(hosts))
+	seen := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		clean = append(clean, host)
+	}
+	return clean
+}
+
+func cloneHostnames(hosts []string) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	return append([]string(nil), hosts...)
 }
 
 // ============================================================================

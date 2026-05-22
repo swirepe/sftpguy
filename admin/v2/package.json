@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@tanstack/preact-query": "^5.76.1",
+    "maplibre-gl": "^5.24.0",
+    "pmtiles": "^4.4.1",
     "preact": "^10.26.9"
   },
   "devDependencies": {

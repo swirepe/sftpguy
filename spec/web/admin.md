@@ -38,9 +38,12 @@ The main code paths behind this surface are:
 - `admin_http_handlers_login.go`
 - `admin_http_handlers_selftest.go`
 - `admin_http_handlers_explorer.go`
+- `admin_http_v2_ui.go`
 - `admin_ui/index.html`
 - `admin_ui/admin.js`
 - `admin_ui/admin.css`
+- `admin/v2/src`
+- `admin/v2/dist`
 - `internal/adminexplorer/explorer.go`
 
 ## Entry Points
@@ -49,6 +52,7 @@ The main code paths behind this surface are:
 
 - `/` redirects to `/admin`.
 - `/admin` serves the main admin shell UI.
+- `/admin/v2/` serves the Preact admin v2 shell UI and its embedded built assets.
 - `/admin/explorer/` serves the dedicated admin explorer.
 - `/admin/stats/` serves a statsviz dashboard.
 - `/admin/one-time-login?token=...` exchanges a single-use token for an auth cookie and redirects to `/admin`.
@@ -58,6 +62,8 @@ The main code paths behind this surface are:
 
 - `/admin/static/admin.css`
 - `/admin/static/admin.js`
+- `/admin/v2/assets/...`
+- `/admin/v2/maps/...`
 
 ## Access And Authentication
 
@@ -175,6 +181,34 @@ Boot query params currently supported by the shell:
 
 `?owner=...` deep-links into the Files tab and runs an owner-specific file search.
 
+## Admin V2 Shell
+
+`/admin/v2/` is a second admin web shell backed by the same authenticated admin APIs. It keeps a global range, search, source filter, hue control, and right-side inspector around these views:
+
+- Overview
+- Activity
+- Map
+- Thumbnails
+- Users
+- Security
+
+### Admin v2 inspector
+
+The v2 inspector can show selected file previews, event detail, live-runtime rows, actor detail, user detail, session context, and metric detail. On compact viewports it opens as a bottom sheet after a selection.
+
+### Admin v2 maps
+
+Overview and Security include compact GeoIP activity maps. The Map view expands that surface into a full-height map with overlay controls and a mapped-activity list. Current overlays are:
+
+- Connections, from live connection rows plus resolved session events
+- Files, from live transfer rows plus resolved upload/download events
+- Exec, from resolved event rows classified as exec activity
+- Denied, from resolved denied event rows
+
+The Map view uses the selected global range, search text, and source filter. It loads a larger recent event sample than the other v2 event views while selected, aggregates markers by overlay and IP location at low zoom, and sends marker/list selections into the v2 inspector as event or live-row selections.
+
+The basemap is a self-hosted Protomaps PMTiles extract bundled under `/admin/v2/maps/`. The shipped archive contains whole-world vector tiles for zoom levels 0 through 4. MapLibre reads that archive with HTTP range requests, the map keeps Protomaps/OpenStreetMap attribution visible, and the UI has an inline geographic fallback if the vector map cannot initialize.
+
 ## Main Shell Capabilities By Tab
 
 ### Summary
@@ -189,7 +223,7 @@ It shows:
 
 - archive identity and uptime
 - total users, contributors, files, directories, stored bytes
-- free, used, and total filesystem space for the upload directory, configured log file, main SQLite database, and optional CAID database
+- free, used, and total filesystem space for the upload directory, configured log file, main SQLite database, optional CAID database, and present GeoIP MMDB files
 - contributor threshold
 - recent activity KPIs
 - top events
@@ -606,6 +640,7 @@ When Prometheus is enabled, the configured metrics route is mounted on the same 
 | `/admin` | `GET` | Main admin shell HTML. |
 | `/admin/static/admin.css` | `GET` | Main shell stylesheet. |
 | `/admin/static/admin.js` | `GET` | Main shell JS. |
+| `/admin/v2/` and descendants | `GET` | Admin v2 shell HTML plus embedded hashed assets and PMTiles map data. |
 | `/admin/explorer` | `GET` | Redirects to slash form. |
 | `/admin/explorer/` and descendants | `GET`, `POST` | Admin explorer browsing, previews, downloads, uploads, and static asset/thumbnail sub-modes. |
 | `/admin/stats` | `GET` | Redirects to slash form. |

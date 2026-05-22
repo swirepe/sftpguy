@@ -182,6 +182,21 @@ func (d *adminHTTPDeps) StorageVolumes() []adminhttp.StorageVolume {
 		})
 	}
 
+	if geoStatus := d.srv.geoStatus(); geoStatus.Enabled {
+		for _, database := range geoStatus.Databases {
+			if !database.Present || strings.TrimSpace(database.Path) == "" {
+				continue
+			}
+			targets = append(targets, storageTarget{
+				ID:        "geoip_" + database.ID,
+				Kind:      "geoip",
+				Label:     "GeoIP " + database.Name,
+				Path:      database.Path,
+				UseParent: true,
+			})
+		}
+	}
+
 	out := make([]adminhttp.StorageVolume, 0, len(targets))
 	for _, target := range targets {
 		out = append(out, storageVolumeForTarget(target, d.FormatBytes))
