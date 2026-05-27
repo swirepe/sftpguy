@@ -13,7 +13,7 @@ export default defineConfig({
     }
   },
   build: {
-    sourcemap: true,
+    sourcemap: false,
     manifest: true,
     rollupOptions: {
       output: {

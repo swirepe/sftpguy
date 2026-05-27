@@ -2569,6 +2569,33 @@
       renderSessionTimeline();
     }
 
+    const adminTabs = ["summary","live","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"];
+
+    function isAdminTab(name) {
+      return adminTabs.includes(name);
+    }
+
+    function loaderForTab(name) {
+      return name === "summary" ? loadSummary :
+        name === "live" ? loadLive :
+        name === "users" ? loadUsers :
+        name === "files" ? loadFiles :
+        name === "audit" ? loadAudit :
+        name === "logs" ? loadLogs :
+        name === "auth" ? loadAuthAttempts :
+        name === "sessions" ? loadSessions :
+        name === "uploads" ? loadUploads :
+        name === "downloads" ? loadDownloads :
+        name === "banned" ? loadBanned :
+        name === "selftest" ? loadSelfTest :
+        name === "logins" ? loadOneTimeLogins :
+        name === "maintenance" ? loadMaintenance : loadIPLists;
+    }
+
+    function loadTab(name) {
+      return loaderForTab(name)().catch(function(err) { setStatus("error: " + err.message); });
+    }
+
     async function refreshAll() {
       try {
         await Promise.all([loadSummary(), loadLive(), loadUsers(), loadFiles(), loadAudit(), loadLogs(), loadAuthAttempts(), loadSessions(), loadUploads(), loadDownloads(), loadBanned(), loadSelfTest()]);
@@ -2630,27 +2657,13 @@
       document.querySelectorAll(".tab").forEach(function(btn) {
         btn.classList.toggle("active", btn.dataset.tab === name);
       });
-      ["summary","live","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].forEach(function(p) {
+      adminTabs.forEach(function(p) {
         document.getElementById("tab-" + p).classList.toggle("hidden", p !== name);
       });
       if (name !== "selftest") {
         clearSelfTestPoll();
       }
-      const fn = name === "summary" ? loadSummary :
-        name === "live" ? loadLive :
-        name === "users" ? loadUsers :
-        name === "files" ? loadFiles :
-        name === "audit" ? loadAudit :
-        name === "logs" ? loadLogs :
-        name === "auth" ? loadAuthAttempts :
-        name === "sessions" ? loadSessions :
-        name === "uploads" ? loadUploads :
-        name === "downloads" ? loadDownloads :
-        name === "banned" ? loadBanned :
-        name === "selftest" ? loadSelfTest :
-        name === "logins" ? loadOneTimeLogins :
-        name === "maintenance" ? loadMaintenance : loadIPLists;
-      fn().catch(function(err) { setStatus("error: " + err.message); });
+      return loadTab(name);
     }
 
     document.getElementById("tabs").addEventListener("click", function(e) {
@@ -2682,18 +2695,16 @@
       document.getElementById("time-range").value = state.timeRange;
       document.getElementById("table-page-size").value = String(state.pageSize);
       try {
-        await refreshAll();
         if (startup.owner) {
-          switchTab("files");
+          await switchTab("files");
           await searchFilesByOwner(startup.owner);
           return;
         }
-        if (startup.tab && ["summary","live","users","files","audit","logs","auth","sessions","uploads","downloads","banned","selftest","logins","iplists","maintenance"].includes(startup.tab)) {
-          switchTab(startup.tab);
-          if (startup.tab === "files" && startup.q) {
-            document.getElementById("files-q").value = startup.q;
-            await searchFiles();
-          }
+        const startupTab = isAdminTab(startup.tab) ? startup.tab : "summary";
+        await switchTab(startupTab);
+        if (startupTab === "files" && startup.q) {
+          document.getElementById("files-q").value = startup.q;
+          await searchFiles();
         }
       } catch (err) {
         setStatus("error: " + err.message);

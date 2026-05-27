@@ -1,0 +1,24 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"net"
+)
+
+func GetOutboundIP() net.IP {
+	// The destination address doesn't need to exist,
+	// but it must be an external IP.
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP
+}
+
+func main() {
+	fmt.Println("Local Outbound IP:", GetOutboundIP())
+}

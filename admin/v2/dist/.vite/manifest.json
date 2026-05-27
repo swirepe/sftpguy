@@ -1,11 +1,30 @@
 {
+  "_maplibre-gl-xnoNZPIh.js": {
+    "file": "assets/maplibre-gl-xnoNZPIh.js",
+    "name": "maplibre-gl",
+    "isDynamicEntry": true
+  },
   "index.html": {
-    "file": "assets/index-CnHuiB-y.js",
+    "file": "assets/index-BBwyT8yq.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
+    "dynamicImports": [
+      "_maplibre-gl-xnoNZPIh.js",
+      "node_modules/pmtiles/dist/esm/index.js"
+    ],
     "css": [
-      "assets/index-pwAKk1v_.css"
+      "assets/index-C8QfZBVo.css"
     ]
+  },
+  "node_modules/maplibre-gl/dist/maplibre-gl.css": {
+    "file": "assets/maplibre-gl-B-YMMjus.css",
+    "src": "node_modules/maplibre-gl/dist/maplibre-gl.css"
+  },
+  "node_modules/pmtiles/dist/esm/index.js": {
+    "file": "assets/index-CCMQV6yV.js",
+    "name": "index",
+    "src": "node_modules/pmtiles/dist/esm/index.js",
+    "isDynamicEntry": true
   }
 }

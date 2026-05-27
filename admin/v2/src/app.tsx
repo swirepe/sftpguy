@@ -1,8 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/preact-query";
-import maplibregl, { type GeoJSONSource, type Map as MapLibreMap, type StyleSpecification } from "maplibre-gl";
-import { Protocol } from "pmtiles";
+import type { GeoJSONSource, Map as MapLibreMap, StyleSpecification } from "maplibre-gl";
 import {
   api,
   fetchBlobURL,
@@ -406,7 +405,14 @@ const worldLandPaths = [
   "M270 124c21-8 43-4 57 13-13 13-40 17-60 7-8-4-7-15 3-20z",
   "M300 154c8-4 18-3 24 3-5 8-20 9-28 4 0-3 1-5 4-7z"
 ];
-const geoPMTilesProtocol = new Protocol();
+
+type MapLibreModule = typeof import("maplibre-gl");
+type PMTilesModule = typeof import("pmtiles");
+type GeoMapDeps = {
+  maplibregl: MapLibreModule;
+  protocol: InstanceType<PMTilesModule["Protocol"]>;
+};
+let geoMapDepsPromise: Promise<GeoMapDeps> | undefined;
 let geoPMTilesRegistered = false;
 
 export function App() {
@@ -422,6 +428,7 @@ export function App() {
   const [userSort, setUserSort] = useState<UserSort>("activity");
   const [hue, setHue] = useState(parseHueParam());
   const [hueInURL, setHueInURL] = useState(initialHueParam);
+  const [warmOverviewDetails, setWarmOverviewDetails] = useState(false);
 
   useEffect(() => {
     document.documentElement.style.setProperty("--hue", String(hue));
@@ -438,6 +445,45 @@ export function App() {
     }
   }, [hue, hueInURL, query, range, sourceFilter, view]);
 
+  useEffect(() => {
+    if (warmOverviewDetails) {
+      return;
+    }
+    const load = () => setWarmOverviewDetails(true);
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    let timer = 0;
+    let idleID = 0;
+    if (idleWindow.requestIdleCallback) {
+      idleID = idleWindow.requestIdleCallback(load, { timeout: 1_500 });
+    } else {
+      timer = globalThis.setTimeout(load, 700);
+    }
+    return () => {
+      if (idleID) {
+        idleWindow.cancelIdleCallback?.(idleID);
+      }
+      if (timer) {
+        globalThis.clearTimeout(timer);
+      }
+    };
+  }, [warmOverviewDetails]);
+
+  const overviewActive = view === "overview";
+  const overviewDetailsEnabled = overviewActive && warmOverviewDetails;
+  const liveEnabled = overviewActive || view === "map";
+  const insightsEnabled = overviewActive || view === "map" || view === "security";
+  const eventsEnabled = overviewActive || view === "activity" || view === "map" || view === "thumbnails";
+  const uploadsEnabled = overviewDetailsEnabled || view === "thumbnails";
+  const downloadsEnabled = overviewDetailsEnabled || view === "thumbnails";
+  const usersEnabled = overviewDetailsEnabled || view === "users";
+  const sessionsEnabled = overviewDetailsEnabled;
+  const bannedEnabled = overviewDetailsEnabled || view === "map" || view === "security";
+  const authAttemptsEnabled = view === "map" || view === "security";
+  const maintenanceEnabled = overviewDetailsEnabled;
+
   const summary = useQuery({
     queryKey: ["summary"],
     queryFn: () => api<SummaryPayload>("/admin/api/summary"),
@@ -446,23 +492,27 @@ export function App() {
   const live = useQuery({
     queryKey: ["live"],
     queryFn: () => api<LivePayload>("/admin/api/live"),
-    refetchInterval: view === "map" ? 3_000 : 10_000
+    enabled: liveEnabled,
+    refetchInterval: liveEnabled ? (view === "map" ? 3_000 : 10_000) : false
   });
   const insights = useQuery({
     queryKey: ["insights", range],
     queryFn: () => api<InsightsPayload>(adminPath("/admin/api/insights", { range })),
-    refetchInterval: 30_000
+    enabled: insightsEnabled,
+    refetchInterval: insightsEnabled ? 30_000 : false
   });
   const eventLimit = view === "map" ? 800 : 160;
   const events = useQuery({
     queryKey: ["events", range, query, eventLimit],
     queryFn: () => api<EventsPayload>(adminPath("/admin/api/events", { limit: eventLimit, range, q: query })),
-    refetchInterval: view === "map" ? 10_000 : 20_000
+    enabled: eventsEnabled,
+    refetchInterval: eventsEnabled ? (view === "map" ? 10_000 : 20_000) : false
   });
   const uploads = useQuery({
     queryKey: ["uploads", range, query],
     queryFn: () => api<UploadsPayload>(adminPath("/admin/api/uploads/recent", { limit: 10, range, q: query })),
-    refetchInterval: 20_000
+    enabled: uploadsEnabled,
+    refetchInterval: uploadsEnabled ? 20_000 : false
   });
   const downloads = useQuery({
     queryKey: ["downloads", range, query],
@@ -476,32 +526,38 @@ export function App() {
           q: query
         })
       ),
-    refetchInterval: 30_000
+    enabled: downloadsEnabled,
+    refetchInterval: downloadsEnabled ? 30_000 : false
   });
   const users = useQuery({
     queryKey: ["users", query],
     queryFn: () => api<UsersPayload>(adminPath("/admin/api/users", { limit: 120, q: query })),
-    refetchInterval: 45_000
+    enabled: usersEnabled,
+    refetchInterval: usersEnabled ? 45_000 : false
   });
   const sessions = useQuery({
     queryKey: ["sessions", range, query],
     queryFn: () => api<SessionsPayload>(adminPath("/admin/api/sessions", { limit: 12, range, q: query })),
-    refetchInterval: 30_000
+    enabled: sessionsEnabled,
+    refetchInterval: sessionsEnabled ? 30_000 : false
   });
   const banned = useQuery({
     queryKey: ["banned"],
     queryFn: () => api<BannedPayload>("/admin/api/banned"),
-    refetchInterval: 60_000
+    enabled: bannedEnabled,
+    refetchInterval: bannedEnabled ? 60_000 : false
   });
   const authAttempts = useQuery({
     queryKey: ["auth-attempts", range, query],
     queryFn: () => api<AuthAttemptsPayload>(adminPath("/admin/api/auth-attempts", { limit: 600, combo_limit: 180, range, q: query })),
-    refetchInterval: 30_000
+    enabled: authAttemptsEnabled,
+    refetchInterval: authAttemptsEnabled ? 30_000 : false
   });
   const maintenance = useQuery({
     queryKey: ["maintenance"],
     queryFn: () => api<Record<string, unknown>>("/admin/api/maintenance"),
-    refetchInterval: 30_000
+    enabled: maintenanceEnabled,
+    refetchInterval: maintenanceEnabled ? 30_000 : false
   });
 
   const runMaintenance = useMutation({
@@ -532,8 +588,8 @@ export function App() {
           since_id: latestEventID
         })
       ),
-    enabled: view === "map" && latestEventID > 0,
-    refetchInterval: view === "map" ? 2_500 : false
+    enabled: eventsEnabled && view === "map" && latestEventID > 0,
+    refetchInterval: eventsEnabled && view === "map" ? 2_500 : false
   });
 
   useEffect(() => {
@@ -2063,7 +2119,7 @@ function GeoMapPanel({
         <div class="geo-map-layout">
           <div class="geo-map-frame">
             <GeoMapSurface title={title} points={points} onInspectActor={onInspectActor} />
-            <span class="geo-map-caption">Embedded basemap z0-z4</span>
+            <span class="geo-map-caption">Resolved public IP locations</span>
           </div>
           <div class="geo-map-list">
             {points.slice(0, 8).map((point) => (
@@ -2099,6 +2155,7 @@ function GeoActivityMapSurface({
   const mapRef = useRef<MapLibreMap | null>(null);
   const pointsRef = useRef(new Map<string, GeoActivityPoint>());
   const inspectPointRef = useRef(onInspectPoint);
+  const [deps, setDeps] = useState<GeoMapDeps | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
@@ -2110,13 +2167,34 @@ function GeoActivityMapSurface({
   }, [points]);
 
   useEffect(() => {
-    if (failed || !mapNode.current) {
+    if (failed || deps) {
+      return;
+    }
+    let cancelled = false;
+    loadGeoMapDeps()
+      .then((loaded) => {
+        if (!cancelled) {
+          setDeps(loaded);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deps, failed]);
+
+  useEffect(() => {
+    if (failed || !deps || !mapNode.current) {
       return;
     }
     let map: MapLibreMap;
     try {
-      ensureGeoMapProtocol();
-      map = new maplibregl.Map({
+      ensureGeoMapProtocol(deps);
+      map = new deps.maplibregl.Map({
         attributionControl: false,
         center: [0, 16],
         container: mapNode.current,
@@ -2134,8 +2212,8 @@ function GeoActivityMapSurface({
     mapRef.current = map;
     map.dragRotate.disable();
     map.touchZoomRotate.disableRotation();
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
+    map.addControl(new deps.maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(new deps.maplibregl.AttributionControl({ compact: true }), "bottom-right");
     map.on("load", () => {
       map.addSource(geoActivitySourceID, {
         type: "geojson",
@@ -2204,7 +2282,7 @@ function GeoActivityMapSurface({
         map.getCanvas().style.cursor = "";
       });
       setGeoActivityMapMode(map, mode);
-      fitGeoActivityMap(map, points);
+      fitGeoActivityMap(map, points, deps.maplibregl);
     });
     map.on("error", () => {
       setFailed(true);
@@ -2214,7 +2292,7 @@ function GeoActivityMapSurface({
       mapRef.current = null;
       map.remove();
     };
-  }, [failed]);
+  }, [deps, failed]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -2240,11 +2318,13 @@ function GeoActivityMapSurface({
 
   useEffect(() => {
     if (fitRequest > 0 && mapRef.current) {
-      fitGeoActivityMap(mapRef.current, points);
+      if (deps) {
+        fitGeoActivityMap(mapRef.current, points, deps.maplibregl);
+      }
     }
-  }, [fitRequest, points]);
+  }, [deps, fitRequest, points]);
 
-  if (failed) {
+  if (failed || !deps) {
     return <GeoActivityFallback points={points} selectedPointID={selectedPointID} onInspectPoint={onInspectPoint} />;
   }
   return <div class="geo-activity-map" ref={mapNode} role="img" aria-label="Mapped admin activity" />;
@@ -2308,102 +2388,7 @@ function GeoMapSurface({
   points: GeoMapPoint[];
   onInspectActor?: (actorType: ActorType, value: string) => void;
 }) {
-  const mapNode = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<MapLibreMap | null>(null);
-  const inspectActorRef = useRef(onInspectActor);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    inspectActorRef.current = onInspectActor;
-  }, [onInspectActor]);
-
-  useEffect(() => {
-    if (failed || !mapNode.current) {
-      return;
-    }
-    let map: MapLibreMap;
-    try {
-      ensureGeoMapProtocol();
-      map = new maplibregl.Map({
-        attributionControl: false,
-        center: [0, 16],
-        container: mapNode.current,
-        maxZoom: 4,
-        minZoom: -1,
-        renderWorldCopies: false,
-        style: geoMapStyle(),
-        zoom: -0.35
-      });
-    } catch {
-      setFailed(true);
-      return;
-    }
-
-    mapRef.current = map;
-    map.dragRotate.disable();
-    map.scrollZoom.disable();
-    map.touchZoomRotate.disableRotation();
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
-    map.on("load", () => {
-      map.addSource(geoMapPointSourceID, {
-        type: "geojson",
-        data: geoMapFeatures(points)
-      });
-      map.addLayer({
-        id: geoMapPointRingLayerID,
-        type: "circle",
-        source: geoMapPointSourceID,
-        paint: {
-          "circle-color": ["case", ["boolean", ["get", "hot"], false], "rgba(251, 113, 133, 0.18)", "rgba(34, 211, 238, 0.16)"],
-          "circle-radius": ["+", ["get", "radius"], 4],
-          "circle-stroke-color": ["case", ["boolean", ["get", "hot"], false], "rgba(251, 113, 133, 0.82)", "rgba(103, 232, 249, 0.72)"],
-          "circle-stroke-width": 1.2
-        }
-      });
-      map.addLayer({
-        id: geoMapPointLayerID,
-        type: "circle",
-        source: geoMapPointSourceID,
-        paint: {
-          "circle-color": ["case", ["boolean", ["get", "hot"], false], "#fb7185", "#22d3ee"],
-          "circle-radius": ["get", "radius"],
-          "circle-stroke-color": "#061014",
-          "circle-stroke-width": 1.1
-        }
-      });
-      map.on("click", geoMapPointLayerID, (event) => {
-        const name = event.features?.[0]?.properties?.name;
-        if (typeof name === "string") {
-          inspectActorRef.current?.("ip", name);
-        }
-      });
-      map.on("mouseenter", geoMapPointLayerID, () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", geoMapPointLayerID, () => {
-        map.getCanvas().style.cursor = "";
-      });
-    });
-    map.on("error", () => {
-      setFailed(true);
-    });
-
-    return () => {
-      mapRef.current = null;
-      map.remove();
-    };
-  }, [failed]);
-
-  useEffect(() => {
-    const source = mapRef.current?.getSource(geoMapPointSourceID) as GeoJSONSource | undefined;
-    source?.setData(geoMapFeatures(points));
-  }, [points]);
-
-  if (failed) {
-    return <GeoMapFallback title={title} points={points} onInspectActor={onInspectActor} />;
-  }
-  return <div class="geo-vector-map" ref={mapNode} role="img" aria-label={title} />;
+  return <GeoMapFallback title={title} points={points} onInspectActor={onInspectActor} />;
 }
 
 function GeoMapFallback({
@@ -5110,11 +5095,21 @@ function geoLabel(geo?: GeoLocation): string {
   return place || geo.country || geo.continent || "";
 }
 
-function ensureGeoMapProtocol() {
+function loadGeoMapDeps(): Promise<GeoMapDeps> {
+  if (!geoMapDepsPromise) {
+    geoMapDepsPromise = Promise.all([import("maplibre-gl"), import("pmtiles"), import("maplibre-gl/dist/maplibre-gl.css")]).then(([maplibregl, pmtiles]) => ({
+      maplibregl,
+      protocol: new pmtiles.Protocol()
+    }));
+  }
+  return geoMapDepsPromise;
+}
+
+function ensureGeoMapProtocol(deps: GeoMapDeps) {
   if (geoPMTilesRegistered) {
     return;
   }
-  maplibregl.addProtocol("pmtiles", geoPMTilesProtocol.tile);
+  deps.maplibregl.addProtocol("pmtiles", deps.protocol.tile);
   geoPMTilesRegistered = true;
 }
 
@@ -5621,7 +5616,7 @@ function setGeoActivityMapMode(map: MapLibreMap, mode: GeoActivityMapMode) {
   map.setPaintProperty(geoActivityPointLayerID, "circle-opacity", density ? 0.38 : 1);
 }
 
-function fitGeoActivityMap(map: MapLibreMap, points: GeoActivityPoint[]) {
+function fitGeoActivityMap(map: MapLibreMap, points: GeoActivityPoint[], maplibregl: MapLibreModule) {
   if (points.length === 0) {
     map.easeTo({ center: [0, 16], zoom: -0.35, duration: 260 });
     return;
