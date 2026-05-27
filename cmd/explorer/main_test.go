@@ -905,6 +905,12 @@ func TestHandleDirectoryListingIncludesUploadFailureScript(t *testing.T) {
 	if !strings.Contains(body, "function retryWithStandardSubmit(source) {") {
 		t.Fatalf("expected standard submit fallback helper in script, body=%s", body)
 	}
+	if !strings.Contains(body, "navigator.wakeLock.request('screen')") {
+		t.Fatalf("expected upload wake lock request in script, body=%s", body)
+	}
+	if !strings.Contains(body, "releaseUploadWakeLock();") {
+		t.Fatalf("expected upload wake lock release in script, body=%s", body)
+	}
 	if !strings.Contains(body, "HTMLFormElement.prototype.submit.call(form);") {
 		t.Fatalf("expected standard submit fallback call in script, body=%s", body)
 	}

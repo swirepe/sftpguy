@@ -208,13 +208,17 @@ Overview and Security include compact GeoIP activity maps. The Map view expands 
 
 - Connections, from live connection rows plus resolved session events
 - Files, from live transfer rows plus resolved upload/download events
+- Uploads, from live upload rows plus resolved upload events
+- Downloads, from live download rows plus resolved download events
 - Exec, from resolved event rows classified as exec activity
+- Mutations, from delete, rename, ban, mark-bad, move, and write-like events
+- Admin Actions, from admin-sourced events
 - Denied, from resolved denied event rows
 - Auth Attempts, from resolved authentication-attempt rows
 - Flagged IPs, from suspicious-IP insight aggregates with resolved GeoIP locations
 - Banned IPs, from exact banned IP entries with resolved GeoIP locations
 
-The Map view uses the selected global range, search text, and source filter. It loads a larger recent event sample than the other v2 event views while selected, follows incremental events until paused, aggregates markers by overlay and IP location, and sends marker/list selections into the v2 inspector as event, live-row, or IP-actor selections. The map controls expose Live Ops, Security, Exec Watch, and All overlay presets, dot and density rendering, GeoIP coverage counts for mapped/unresolved/local/missing-IP activity, and a selected-marker detail surface.
+The Map view uses the selected global range, search text, and source filter. It loads a larger recent event sample than the other v2 event views while selected, follows incremental events until paused, aggregates markers by overlay and IP location, and sends marker/list selections into the v2 inspector as event, live-row, or IP-actor selections. The map controls expose Live Ops, File Flow, Changes, Security, Exec Watch, and All overlay presets, dot and density rendering, GeoIP coverage counts for mapped/unresolved/local/missing-IP activity, and a selected-marker detail surface.
 
 The basemap is a self-hosted Protomaps PMTiles extract bundled under `/admin/v2/maps/`. The shipped archive contains whole-world vector tiles for zoom levels 0 through 4. MapLibre reads that archive with HTTP range requests, the map keeps Protomaps/OpenStreetMap attribution visible, and the UI has an inline geographic fallback if the vector map cannot initialize.
 

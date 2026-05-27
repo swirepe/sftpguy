@@ -1878,9 +1878,47 @@ const folderBtn = document.getElementById('btn-folder');
 const progressWrapper = document.getElementById('progress-wrapper');
 const progressBar = document.getElementById('progress-bar');
 const progressText = document.getElementById('progress-text');
+let uploadWakeLock = null;
+let uploadWakeLockWanted = false;
+let uploadWakeLockPending = false;
 
 // Fixed: Externalized onclick handler to satisfy CSP
 folderBtn.addEventListener('click', () => folderInput.click());
+
+async function requestUploadWakeLock() {
+  if (!('wakeLock' in navigator) || !navigator.wakeLock || document.visibilityState !== 'visible' || uploadWakeLock || uploadWakeLockPending) {
+    return;
+  }
+  uploadWakeLockPending = true;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    uploadWakeLock = lock;
+    lock.addEventListener('release', () => {
+      if (uploadWakeLock === lock) uploadWakeLock = null;
+      if (uploadWakeLockWanted && document.visibilityState === 'visible') requestUploadWakeLock();
+    }, { once: true });
+  } catch (_err) {
+    uploadWakeLock = null;
+  } finally {
+    uploadWakeLockPending = false;
+  }
+}
+
+function keepScreenAwakeForUpload() {
+  uploadWakeLockWanted = true;
+  requestUploadWakeLock();
+}
+
+function releaseUploadWakeLock() {
+  uploadWakeLockWanted = false;
+  const lock = uploadWakeLock;
+  uploadWakeLock = null;
+  if (lock) lock.release().catch(() => {});
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (uploadWakeLockWanted && document.visibilityState === 'visible') requestUploadWakeLock();
+});
 
 function setUploadControlsDisabled(disabled) {
   submitBtn.disabled = disabled;
@@ -1897,6 +1935,7 @@ function resetUploadProgress() {
 }
 
 function showUploadError(message) {
+  releaseUploadWakeLock();
   setUploadControlsDisabled(false);
   progressWrapper.style.display = 'block';
   progressBar.classList.add('upload-error');
@@ -1922,6 +1961,7 @@ function getUploadErrorMessage(xhr) {
 async function performUpload(files, paths = []) {
   if (!files || files.length === 0) return;
   setUploadControlsDisabled(true);
+  keepScreenAwakeForUpload();
   resetUploadProgress();
   progressWrapper.style.display = 'block';
 
@@ -1945,6 +1985,7 @@ async function performUpload(files, paths = []) {
   };
   xhr.onload = () => {
     if (xhr.status >= 200 && xhr.status < 300) {
+      releaseUploadWakeLock();
       window.location.reload();
       return;
     }

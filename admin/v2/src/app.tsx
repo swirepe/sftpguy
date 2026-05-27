@@ -88,7 +88,18 @@ type GeoMapPoint = {
   y: number;
 };
 
-type GeoActivityOverlay = "connections" | "files" | "exec" | "denied" | "auth" | "flagged" | "banned";
+type GeoActivityOverlay =
+  | "connections"
+  | "files"
+  | "uploads"
+  | "downloads"
+  | "exec"
+  | "mutations"
+  | "admin"
+  | "denied"
+  | "auth"
+  | "flagged"
+  | "banned";
 type GeoActivityMapMode = "dots" | "density";
 
 type GeoActivityPoint = {
@@ -355,7 +366,7 @@ type InspectorAction =
 
 type UserInspectorAction = { type: "ban" | "unban"; hash: string };
 
-const defaultHue = 174;
+const defaultHue = defaultHueForToday();
 const rangeOptions = ["15m", "1h", "6h", "24h", "48h", "7d", "30d", "all"];
 const geoMapTilesURL = "/admin/v2/maps/protomaps-world-z4.pmtiles";
 const geoMapPointSourceID = "geoip-points";
@@ -368,14 +379,20 @@ const geoActivityPointLayerID = "geo-activity-point-dots";
 const geoActivityOverlays: Array<{ value: GeoActivityOverlay; label: string }> = [
   { value: "connections", label: "Connections" },
   { value: "files", label: "Files" },
+  { value: "uploads", label: "Uploads" },
+  { value: "downloads", label: "Downloads" },
   { value: "exec", label: "Exec" },
+  { value: "mutations", label: "Mutations" },
+  { value: "admin", label: "Admin Actions" },
   { value: "denied", label: "Denied" },
   { value: "auth", label: "Auth Attempts" },
   { value: "flagged", label: "Flagged IPs" },
   { value: "banned", label: "Banned IPs" }
 ];
 const geoActivityMapPresets: Array<{ label: string; overlays: GeoActivityOverlay[] }> = [
-  { label: "Live Ops", overlays: ["connections", "files", "exec"] },
+  { label: "Live Ops", overlays: ["connections", "uploads", "downloads", "exec"] },
+  { label: "File Flow", overlays: ["uploads", "downloads", "files"] },
+  { label: "Changes", overlays: ["mutations", "admin", "exec", "denied"] },
   { label: "Security", overlays: ["denied", "auth", "flagged", "banned"] },
   { label: "Exec Watch", overlays: ["exec", "denied", "auth"] },
   { label: "All", overlays: geoActivityOverlays.map((overlay) => overlay.value) }
@@ -1089,8 +1106,12 @@ function GeoActivityMapView(props: {
 }) {
   const [overlays, setOverlays] = useState<Record<GeoActivityOverlay, boolean>>({
     connections: true,
-    files: true,
+    files: false,
+    uploads: true,
+    downloads: true,
     exec: true,
+    mutations: false,
+    admin: false,
     denied: false,
     auth: false,
     flagged: false,
@@ -4458,8 +4479,17 @@ function isDeniedEvent(row: EventRow): boolean {
 }
 
 function isTransferEvent(row: EventRow): boolean {
+  return isUploadEvent(row) || isDownloadEvent(row);
+}
+
+function isUploadEvent(row: EventRow): boolean {
   const name = (row.event || "").toLowerCase();
-  return name === "upload" || name === "download" || name.includes("upload") || name.includes("download");
+  return name === "upload" || name.includes("upload");
+}
+
+function isDownloadEvent(row: EventRow): boolean {
+  const name = (row.event || "").toLowerCase();
+  return name === "download" || name.includes("download");
 }
 
 function isMutatingEvent(row: EventRow): boolean {
@@ -4475,6 +4505,11 @@ function isSessionEvent(row: EventRow): boolean {
 function isExecEvent(row: EventRow): boolean {
   const text = eventText(row);
   return text.includes("exec") || text.includes("command") || eventCommand(row) !== "";
+}
+
+function isAdminEvent(row: EventRow): boolean {
+  const name = (row.event || "").toLowerCase();
+  return name.startsWith("admin/") || sourceFor(row) === "admin";
 }
 
 function sessionNodeClass(row: EventRow): string {
@@ -5199,7 +5234,19 @@ function geoMapFeatures(points: GeoMapPoint[]) {
 }
 
 function geoActivityCounts(points: GeoActivityPoint[]): Record<GeoActivityOverlay, number> {
-  const counts: Record<GeoActivityOverlay, number> = { connections: 0, files: 0, exec: 0, denied: 0, auth: 0, flagged: 0, banned: 0 };
+  const counts: Record<GeoActivityOverlay, number> = {
+    connections: 0,
+    files: 0,
+    uploads: 0,
+    downloads: 0,
+    exec: 0,
+    mutations: 0,
+    admin: 0,
+    denied: 0,
+    auth: 0,
+    flagged: 0,
+    banned: 0
+  };
   for (const point of points) {
     counts[point.overlay] += point.count;
   }
@@ -5211,7 +5258,11 @@ function geoActivityOverlayState(active: GeoActivityOverlay[]): Record<GeoActivi
   return {
     connections: selected.has("connections"),
     files: selected.has("files"),
+    uploads: selected.has("uploads"),
+    downloads: selected.has("downloads"),
     exec: selected.has("exec"),
+    mutations: selected.has("mutations"),
+    admin: selected.has("admin"),
     denied: selected.has("denied"),
     auth: selected.has("auth"),
     flagged: selected.has("flagged"),
@@ -5341,8 +5392,20 @@ function geoActivityModel(
     if (isTransferEvent(row)) {
       addEvent("files", row);
     }
+    if (isUploadEvent(row)) {
+      addEvent("uploads", row);
+    }
+    if (isDownloadEvent(row)) {
+      addEvent("downloads", row);
+    }
     if (isExecEvent(row)) {
       addEvent("exec", row);
+    }
+    if (isMutatingEvent(row)) {
+      addEvent("mutations", row);
+    }
+    if (isAdminEvent(row)) {
+      addEvent("admin", row);
     }
     if (isDeniedEvent(row)) {
       addEvent("denied", row);
@@ -5353,6 +5416,12 @@ function geoActivityModel(
   }
   for (const row of recordArray(live?.transfers)) {
     addLive("files", "transfer", row);
+    const direction = liveTransferDirection(row);
+    if (direction === "upload") {
+      addLive("uploads", "transfer", row);
+    } else if (direction === "download") {
+      addLive("downloads", "transfer", row);
+    }
   }
   if (sourceFilter === "all" || sourceFilter === "sftp") {
     for (const attempt of authAttempts) {
@@ -5488,7 +5557,11 @@ function geoActivityCoordinate(point: GeoActivityPoint): [number, number] {
   const offsets: Record<GeoActivityOverlay, [number, number]> = {
     connections: [0, 0],
     files: [1.3, 0.7],
+    uploads: [1.05, 1.15],
+    downloads: [-1.05, 1.15],
     exec: [-1.3, -0.7],
+    mutations: [1.35, -1.05],
+    admin: [-1.35, -1.05],
     denied: [0.8, -1.1],
     auth: [-0.85, 1.2],
     flagged: [1.55, -0.1],
@@ -5502,8 +5575,16 @@ function geoActivityColor(overlay: GeoActivityOverlay): { color: string; wash: s
   switch (overlay) {
     case "files":
       return { color: "#67e8f9", wash: "rgba(103, 232, 249, 0.18)" };
+    case "uploads":
+      return { color: "#38bdf8", wash: "rgba(56, 189, 248, 0.18)" };
+    case "downloads":
+      return { color: "#2dd4bf", wash: "rgba(45, 212, 191, 0.18)" };
     case "exec":
       return { color: "#f2b84b", wash: "rgba(242, 184, 75, 0.18)" };
+    case "mutations":
+      return { color: "#fb923c", wash: "rgba(251, 146, 60, 0.18)" };
+    case "admin":
+      return { color: "#e879f9", wash: "rgba(232, 121, 249, 0.18)" };
     case "denied":
       return { color: "#fb7185", wash: "rgba(251, 113, 133, 0.18)" };
     case "auth":
@@ -5756,6 +5837,25 @@ function liveStatusLabel(kind: LiveTargetKind, row: Record<string, unknown>): st
     return stringFromRecord(row, ["direction"]) || "transfer";
   }
   return stringFromRecord(row, ["state", "direction"]) || kind;
+}
+
+function liveTransferDirection(row: Record<string, unknown>): "upload" | "download" | "" {
+  const direction = stringFromRecord(row, ["direction", "operation", "type", "kind"]).toLowerCase();
+  if (direction.includes("upload") || direction === "up") {
+    return "upload";
+  }
+  if (direction.includes("download") || direction === "down") {
+    return "download";
+  }
+  const upload = numberFromUnknown(row.upload_bytes) + numberFromUnknown(row.upload_rate_bps);
+  const download = numberFromUnknown(row.download_bytes) + numberFromUnknown(row.download_rate_bps);
+  if (upload > 0 && download === 0) {
+    return "upload";
+  }
+  if (download > 0 && upload === 0) {
+    return "download";
+  }
+  return "";
 }
 
 function liveStatusClass(row: Record<string, unknown>): string {
@@ -6106,8 +6206,19 @@ function hasHueParam(): boolean {
   return new URLSearchParams(window.location.search).has("hue");
 }
 
+function defaultHueForToday(): number {
+  return new Date().getDay() === 3 ? 302 : 169;
+}
+
 function parseHueParam(): number {
-  const raw = Number(readURLParam("hue"));
+  if (!hasHueParam()) {
+    return defaultHue;
+  }
+  const value = readURLParam("hue");
+  if (value === "") {
+    return defaultHue;
+  }
+  const raw = Number(value);
   if (!Number.isFinite(raw)) {
     return defaultHue;
   }

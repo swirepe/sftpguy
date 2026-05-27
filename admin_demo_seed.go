@@ -173,6 +173,18 @@ func seedAdminDemoData(store *Store, absUploadDir string, now time.Time) (AdminD
 		"path", "RULES.txt",
 		"source", "sftp",
 		"reason", "protected system file")
+	logEvent(EventRename, operator,
+		"path", "demo/notes/admin-map-observations.txt",
+		"new_path", "demo/notes/admin-map-field-notes.txt",
+		"source", "sftp",
+		"operation", "rename")
+	logEvent(EventDelete, downloader,
+		"path", "demo/tmp/stale-report.tmp",
+		"source", "sftp",
+		"operation", "delete")
+	logEvent(EventAdminConfig, operator,
+		"source", "admin",
+		"action", "rotate demo admin key")
 
 	logEvent(EventConnect, scanner, "source", "sftp")
 	for _, deniedPath := range []string{"../private/keys.txt", "../../etc/shadow", ".ssh/authorized_keys"} {

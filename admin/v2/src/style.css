@@ -4,7 +4,7 @@
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: #070a0d;
   color: #edf4f4;
-  --hue: 174;
+  --hue: 169;
   --bg: #070a0d;
   --topbar: #0b1014;
   --panel: #10171d;
@@ -474,9 +474,29 @@ select {
   --geo-overlay-line: rgba(103, 232, 249, 0.58);
 }
 
+.geo-overlay-toggle.uploads {
+  --geo-overlay-color: #38bdf8;
+  --geo-overlay-line: rgba(56, 189, 248, 0.58);
+}
+
+.geo-overlay-toggle.downloads {
+  --geo-overlay-color: #2dd4bf;
+  --geo-overlay-line: rgba(45, 212, 191, 0.58);
+}
+
 .geo-overlay-toggle.exec {
   --geo-overlay-color: #f2b84b;
   --geo-overlay-line: rgba(242, 184, 75, 0.58);
+}
+
+.geo-overlay-toggle.mutations {
+  --geo-overlay-color: #fb923c;
+  --geo-overlay-line: rgba(251, 146, 60, 0.58);
+}
+
+.geo-overlay-toggle.admin {
+  --geo-overlay-color: #e879f9;
+  --geo-overlay-line: rgba(232, 121, 249, 0.58);
 }
 
 .geo-overlay-toggle.denied {
@@ -554,8 +574,24 @@ select {
   border-color: rgba(103, 232, 249, 0.44);
 }
 
+.geo-activity-row.uploads {
+  border-color: rgba(56, 189, 248, 0.44);
+}
+
+.geo-activity-row.downloads {
+  border-color: rgba(45, 212, 191, 0.44);
+}
+
 .geo-activity-row.exec {
   border-color: rgba(242, 184, 75, 0.44);
+}
+
+.geo-activity-row.mutations {
+  border-color: rgba(251, 146, 60, 0.44);
+}
+
+.geo-activity-row.admin {
+  border-color: rgba(232, 121, 249, 0.44);
 }
 
 .geo-activity-row.denied {
@@ -653,9 +689,29 @@ select {
   --geo-overlay-line: rgba(103, 232, 249, 0.58);
 }
 
+.geo-activity-selection.uploads {
+  --geo-overlay-color: #38bdf8;
+  --geo-overlay-line: rgba(56, 189, 248, 0.58);
+}
+
+.geo-activity-selection.downloads {
+  --geo-overlay-color: #2dd4bf;
+  --geo-overlay-line: rgba(45, 212, 191, 0.58);
+}
+
 .geo-activity-selection.exec {
   --geo-overlay-color: #f2b84b;
   --geo-overlay-line: rgba(242, 184, 75, 0.58);
+}
+
+.geo-activity-selection.mutations {
+  --geo-overlay-color: #fb923c;
+  --geo-overlay-line: rgba(251, 146, 60, 0.58);
+}
+
+.geo-activity-selection.admin {
+  --geo-overlay-color: #e879f9;
+  --geo-overlay-line: rgba(232, 121, 249, 0.58);
 }
 
 .geo-activity-selection.denied {

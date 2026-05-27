@@ -54,6 +54,22 @@ func TestSeedAdminDemoDataAddsFilesHostnamesAndSecurityActivity(t *testing.T) {
 		t.Fatalf("expected denied scanner activity, got %d rows", denied)
 	}
 
+	var mutations int
+	if err := srv.store.db.QueryRow(`SELECT COUNT(*) FROM log WHERE event IN (?, ?)`, string(EventRename), string(EventDelete)).Scan(&mutations); err != nil {
+		t.Fatalf("count seeded mutation activity: %v", err)
+	}
+	if mutations < 2 {
+		t.Fatalf("expected seeded mutation activity, got %d rows", mutations)
+	}
+
+	var adminActions int
+	if err := srv.store.db.QueryRow(`SELECT COUNT(*) FROM log WHERE event = ?`, string(EventAdminConfig)).Scan(&adminActions); err != nil {
+		t.Fatalf("count seeded admin activity: %v", err)
+	}
+	if adminActions < 1 {
+		t.Fatalf("expected seeded admin activity, got %d rows", adminActions)
+	}
+
 	entries, err := srv.store.blacklist.ExactEntries()
 	if err != nil {
 		t.Fatalf("read seeded blacklist entries: %v", err)
