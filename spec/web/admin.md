@@ -16,7 +16,7 @@ The admin web surface gives operators a browser-based control plane for:
 - user-hash and IP banning
 - maintenance and bad-file workflows
 - self-test execution
-- support-file editing (`whitelist.txt`, `blacklist.txt`, `admin_keys.txt`, `bad_files.txt`)
+- support-file editing (`whitelist.txt`, `blacklist.txt`, `admin_keys.txt`, `maintainers.txt`, `bad_files.txt`)
 - one-time login URL generation
 - a richer browser-style admin explorer
 - live runtime charts and optional Prometheus metrics
@@ -417,12 +417,15 @@ IP Lists combines:
 - `POST /admin/api/ip-lists/test`
 - `GET /admin/api/admin-keys`
 - `POST /admin/api/admin-keys`
+- `GET /admin/api/maintainers`
+- `POST /admin/api/maintainers`
 
 Capabilities include:
 
 - edit `whitelist.txt`
 - edit `blacklist.txt`
 - edit `admin_keys.txt`
+- edit `maintainers.txt`
 - view path, entry count, and invalid-line count for each
 - test an IP against current whitelist/blacklist state
 
@@ -689,6 +692,7 @@ When Prometheus is enabled, the configured metrics route is mounted on the same 
 | `/admin/api/ip-lists/{whitelist|blacklist}` | `POST` | Overwrite one IP list file and reload it. |
 | `/admin/api/ip-lists/test` | `POST` | Test effective allow/ban behavior for an IP. |
 | `/admin/api/admin-keys` | `GET`, `POST` | Read or overwrite `admin_keys.txt` and reload it. |
+| `/admin/api/maintainers` | `GET`, `POST` | Read or overwrite `maintainers.txt` and reload scoped maintainer grants. |
 | `/admin/api/self-test` | `GET` | Current self-test state. |
 | `/admin/api/self-test/run` | `POST` | Start a self-test run. |
 | `/admin/api/explorer/delete` | `POST` | Delete a file or directory from the explorer. |
@@ -718,6 +722,7 @@ Operator-editable files currently surfaced by the admin web:
 - `whitelist.txt`
 - `blacklist.txt`
 - `admin_keys.txt`
+- `maintainers.txt`
 - `bad_files.txt`
 
 HTTP save endpoints overwrite the whole file and immediately reload the corresponding in-memory structure when available.

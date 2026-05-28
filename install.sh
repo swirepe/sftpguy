@@ -4,6 +4,7 @@ set -euxo pipefail
 service_name=sftpguy
 
 ./sftpguy_amd64 \
+	-maintainers /volume1/caid/maintainers.txt \
 	-maxsize 69793218560 \
     -debug -logfile /volume1/caid/sftpguy.log \
 	-dir /volume1/public \

@@ -408,7 +408,7 @@ func (r *selfTestRunner) runSystemFile(auth ssh.AuthMethod) *stSuite {
 	}
 
 	r.srv.cfg.unrestrictedMap[sysName] = true
-	r.srv.store.ClaimFile(systemOwner, sysName)
+	r.srv.store.ClaimFile(systemOwner, sysName, false)
 	defer func() {
 		r.srv.store.DeletePath(sysName)
 		delete(r.srv.cfg.unrestrictedMap, sysName)

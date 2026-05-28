@@ -312,6 +312,7 @@ var (
 		EN: "You do not own the source file or directory. (UID [owner] %d != [you] %d)",
 		ZH: "您不是源文件或目录的所有者。(UID [所有者] %d != [你] %d)"}
 	errMsgRenameFailed     = UserPermissionError{Kind: EventDenied, EN: "Rename failed.", ZH: "重命名失败。"}
+	errMsgMaintainerScope  = UserPermissionError{Kind: EventDenied, EN: "This maintainer grant does not cover %s.", ZH: "此维护者授权不涵盖 %s。"}
 	errMsgMkdirRateLimit   = UserPermissionError{Kind: EventDeniedRateLimit, EN: "Mkdir rate limit reached.", ZH: "已达到创建目录的频率限制。"}
 	errMsgMaxDirsReached   = UserPermissionError{Kind: EventDeniedQuota, EN: "Maximum directory limit reached for this archive.", ZH: "已达到此归档的最大目录限制。"}
 	errMsgFileSizeExceeded = UserPermissionError{Kind: EventDeniedQuota, EN: "File size limit exceeded. Maximum allowed: %d bytes", ZH: "超过文件大小限制。最大允许：%d 字节"}
@@ -418,9 +419,11 @@ type Store struct {
 	badFileList         *HashList
 	caidMatcher         *caid.Matcher
 	adminKeys           *AdminKeyList
+	scopedMaintainers   *ScopedMaintainerList
 	blacklistPath       string
 	whitelistPath       string
 	adminKeysPath       string
+	maintainersPath     string
 	badFilesPath        string
 	connectionLimitMu   sync.Mutex
 	connectionLimitByIP map[string]*connectionLimitAggregate
@@ -488,6 +491,10 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	if adminKeysPath == "" {
 		adminKeysPath = "admin_keys.txt"
 	}
+	maintainersPath := strings.TrimSpace(cfg.MaintainersPath)
+	if maintainersPath == "" {
+		maintainersPath = "maintainers.txt"
+	}
 	badFilesPath := strings.TrimSpace(cfg.BadFilesPath)
 	if badFilesPath == "" {
 		badFilesPath = "bad_files.txt"
@@ -502,6 +509,7 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 		logger.Info("seeded default whitelist ranges", "entries", added)
 	}
 	adminKeys := NewAdminKeyList(ctx, adminKeysPath, logger)
+	scopedMaintainers := NewScopedMaintainerList(ctx, maintainersPath, logger)
 
 	seedDefaultBadFiles := true
 	if fi, err := os.Stat(badFilesPath); err == nil && !fi.IsDir() {
@@ -532,16 +540,18 @@ func NewStore(cfg Config, logger *slog.Logger) (*Store, error) {
 	}
 
 	store := &Store{db: db,
-		logger:        logger,
-		blacklist:     black,
-		whitelist:     white,
-		badFileList:   badFiles,
-		caidMatcher:   caidMatcher,
-		adminKeys:     adminKeys,
-		blacklistPath: blackPath,
-		whitelistPath: whitePath,
-		adminKeysPath: adminKeysPath,
-		badFilesPath:  badFilesPath}
+		logger:            logger,
+		blacklist:         black,
+		whitelist:         white,
+		badFileList:       badFiles,
+		caidMatcher:       caidMatcher,
+		adminKeys:         adminKeys,
+		scopedMaintainers: scopedMaintainers,
+		blacklistPath:     blackPath,
+		whitelistPath:     whitePath,
+		adminKeysPath:     adminKeysPath,
+		maintainersPath:   maintainersPath,
+		badFilesPath:      badFilesPath}
 	store.eventHostnameCtx, store.eventHostnameCancel = context.WithCancel(context.Background())
 	store.eventHostnameLookup = net.DefaultResolver.LookupAddr
 	store.eventHostnameCache = make(map[string]eventHostnameCacheEntry)
@@ -635,6 +645,10 @@ func (s *Store) Close() error {
 
 	if s.adminKeys != nil {
 		s.adminKeys.Stop()
+	}
+
+	if s.scopedMaintainers != nil {
+		s.scopedMaintainers.Stop()
 	}
 
 	if s.badFileList != nil {
@@ -735,7 +749,7 @@ func (s *Store) GetFileAdminMeta(relPath string) (FileAdminMeta, error) {
 	return meta, err
 }
 
-func (s *Store) ClaimFile(hash, relPath string) error {
+func (s *Store) ClaimFile(hash, relPath string, allowExisting bool) error {
 	return s.transact(func(tx *sql.Tx) error {
 		var owner string
 		err := tx.QueryRow("SELECT owner_hash FROM files WHERE path = ?", relPath).Scan(&owner)
@@ -751,7 +765,7 @@ func (s *Store) ClaimFile(hash, relPath string) error {
 
 		// Admin sessions authenticate as systemOwner and may overwrite any existing file
 		// without taking ownership of it.
-		if owner != hash && hash != systemOwner {
+		if owner != hash && hash != systemOwner && !allowExisting {
 			return fmt.Errorf("claimed")
 		}
 
@@ -1450,6 +1464,7 @@ type Config struct {
 	BlacklistPath           string
 	WhitelistPath           string
 	AdminKeysPath           string
+	MaintainersPath         string
 	BadFilesPath            string
 	CAIDDBPath              string
 	GeoIPEnabled            bool
@@ -1489,7 +1504,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.PrettyLog, "verbose", "VERBOSE", false, "Enable highlighted and formatted logging for developers.", "v")
 	EnvFlag(&cfg.Debug, "debug", "DEBUG", false, "Sets log level to DEVUG")
 	EnvFlag(&cfg.QuietConsole, "quiet", "DEBUG", false, "Sets log level to WARN only on the console", "q")
-	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.")
+	EnvFlag(&cfg.SshNoAuth, "noauth", "NOAUTH", false, "Offer the NoClientAuth login option over ssh.  User IDs will be generated from ip addresses.  Note: when this is enabled, it wins out over all other authentication methods.")
 	EnvFlag(&cfg.AdminSFTP, "admin.sftp", "ADMIN_SFTP", false, "Enable system-owner SFTP login when client key matches server host key")
 	EnvSizeFlag(&cfg.MaxFileSize, "maxsize", "MAX_FILE_SIZE", "8gb", "Max file size (e.g. 500mb, 2gb, 0=unlimited)")
 	EnvSizeFlag(&cfg.ContributorThreshold, "contrib", "CONTRIBUTOR_THRESHOLD", "1mb", "Bytes a user must upload to unlock downloads")
@@ -1500,6 +1515,7 @@ func LoadConfig() (Config, error) {
 	EnvFlag(&cfg.BlacklistPath, "blacklist", "BLACKLIST", "blacklist.txt", "Text file of IP addresses to blacklist, one per line")
 	EnvFlag(&cfg.WhitelistPath, "whitelist", "WHITELIST", "whitelist.txt", "Text file of IP addresses to whitelist, one per line")
 	EnvFlag(&cfg.AdminKeysPath, "admin.keys", "ADMIN_KEYS", "admin_keys.txt", "Text file of admin public keys or hashes, one per line")
+	EnvFlag(&cfg.MaintainersPath, "maintainers", "MAINTAINERS", "maintainers.txt", "Text file of scoped folder maintainer grants: <path> <public key or hash>")
 	EnvFlag(&cfg.BadFilesPath, "bad", "BAD_FILE", "bad_files.txt", "Text file of sha256 hashes and filenames that will trigger an automatic ban and purge.")
 	EnvFlag(&cfg.CAIDDBPath, "caid.db", "CAID_DB", "", "Optional CAID SQLite database used for size-first MD5/SHA1 bad-file matching.")
 	EnvFlag(&cfg.GeoIPEnabled, "geoip.enable", "GEOIP_ENABLE", true, "Enable GeoIP lookups in the admin UI")
@@ -1673,6 +1689,10 @@ func (s *Server) UserStatus(pubHashash string) (userStatus UserStatus, err error
 		return UserStatus{}, err
 	}
 	isContributor, remaining := stats.IsContributor(s.cfg.ContributorThreshold)
+	if !isContributor && s.isScopedMaintainer(pubHashash) {
+		isContributor = true
+		remaining = 0
+	}
 	userStatus.IsContributor = isContributor
 	userStatus.BytesNeeded = remaining
 	userStatus.Stats = stats
@@ -2919,7 +2939,7 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig, connID stri
 	defer func() {
 		duration := time.Since(sessionStarted)
 		observeSession(duration)
-		s.store.LogEvent(EventSessionEnd, effectivePubHash, sessionID, sConn.RemoteAddr(),
+		args := []any{
 			"duration_ms", durationMillis(duration),
 			"login_type", loginType,
 			"admin_sftp", isAdminSFTP,
@@ -2929,7 +2949,11 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig, connID stri
 			"downloads", sessionCounts.downloads.Load(),
 			"downloads_bytes", sessionCounts.downloadsBytes.Load(),
 			"denied", sessionCounts.denied.Load(),
-		)
+		}
+		if !isAdminSFTP {
+			args = append(args, s.maintainerLogArgs(effectivePubHash, "")...)
+		}
+		s.store.LogEvent(EventSessionEnd, effectivePubHash, sessionID, sConn.RemoteAddr(), args...)
 		s.finishLiveSession(sessionID)
 	}()
 
@@ -2937,11 +2961,15 @@ func (s *Server) handleSSH(nConn net.Conn, config *ssh.ServerConfig, connID stri
 
 	stats, _ := s.store.UpsertUserSession(effectivePubHash, nConn.RemoteAddr())
 
-	s.store.LogEvent(EventSessionStart, effectivePubHash, sessionID, sConn.RemoteAddr(),
+	sessionStartArgs := []any{
 		"login_type", loginType,
 		"banned", isBanned,
 		"admin_sftp", isAdminSFTP,
-	)
+	}
+	if !isAdminSFTP {
+		sessionStartArgs = append(sessionStartArgs, s.maintainerLogArgs(effectivePubHash, "")...)
+	}
+	s.store.LogEvent(EventSessionStart, effectivePubHash, sessionID, sConn.RemoteAddr(), sessionStartArgs...)
 
 	logger.Info("login", "banned", isBanned)
 	go func() {
@@ -3164,12 +3192,49 @@ func (s *Server) logExec(pubHash, sessionID string, remoteAddr net.Addr, payload
 	var cmd struct{ Value string }
 	ssh.Unmarshal(payload, &cmd)
 	s.logger.Warn("exec", "cmd", cmd.Value, s.userGroup(pubHash, sessionID, remoteAddr))
-	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr, "path", cmd.Value)
+	args := []any{"path", cmd.Value}
+	args = append(args, s.maintainerLogArgs(pubHash, "")...)
+	s.store.LogEvent(EventExec, pubHash, sessionID, remoteAddr, args...)
 }
 
 func (s *Server) logShell(pubHash, sessionID string, remoteAddr net.Addr) {
 	s.logger.Info("shell", s.userGroup(pubHash, sessionID, remoteAddr))
-	s.store.LogEvent(EventShell, pubHash, sessionID, remoteAddr)
+	args := s.maintainerLogArgs(pubHash, "")
+	s.store.LogEvent(EventShell, pubHash, sessionID, remoteAddr, args...)
+}
+
+func (s *Server) maintainerLogArgs(pubHash, rel string) []any {
+	if !s.isScopedMaintainer(pubHash) {
+		return nil
+	}
+	args := []any{"actor_role", "maintainer", "maintainer", true}
+	if rel == "" {
+		if scopes := s.maintainerScopes(pubHash); len(scopes) > 0 {
+			args = append(args, "maintainer_scopes", scopes)
+		}
+		return args
+	}
+	if scope := s.maintainerScopeForPath(pubHash, rel); scope != "" {
+		args = append(args, "maintainer_scope", scope)
+	}
+	return args
+}
+
+func (s *Server) maintainerScopeForPath(pubHash, rel string) string {
+	scopes := s.maintainerScopes(pubHash)
+	if len(scopes) == 0 {
+		return ""
+	}
+	cleanRel, ok := normalizeMaintainerScope(rel)
+	if !ok {
+		return ""
+	}
+	for _, scope := range scopes {
+		if cleanRel == scope || strings.HasPrefix(cleanRel, scope+"/") {
+			return scope
+		}
+	}
+	return ""
 }
 
 func (s *Server) getRandomFortune() string {
@@ -3202,10 +3267,13 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	uid := hashToUid(hash)
 	userLabel := fmt.Sprintf("anonymous-%d", uid)
 	isContributor, needed := stats.IsContributor(s.cfg.ContributorThreshold)
+	scopes := s.maintainerScopes(hash)
+	isScopedMaintainer := len(scopes) > 0
+	downloadsUnlocked := isContributor || isScopedMaintainer
 	color := blue
 
 	welcomeMsg := ""
-	if stats.FirstTimer {
+	if stats.FirstTimer && !downloadsUnlocked {
 		color = magenta
 		welcomeMsg = fmt.Sprintf(firstTimeMessage, color.Bold(firstTimeBanner), color.Fmt(userLabel), yellow.Bold(formatBytes(s.cfg.ContributorThreshold)))
 	} else if isContributor {
@@ -3218,6 +3286,12 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 	fmt.Fprintf(w, "%s", welcomeMsg)
 	fmt.Fprintf(w, "* Files and directories you create will have %s\r\n", color.Bold(fmt.Sprintf("UID=%d", uid)))
 	fmt.Fprintf(w, "* You may always modify or delete files or directories you have created.\r\n")
+	if len(scopes) > 0 {
+		fmt.Fprintf(w, "* You may maintain these folders:\r\n")
+		for _, scope := range scopes {
+			fmt.Fprintf(w, "  %s\r\n", bold.Fmt(scope+"/"))
+		}
+	}
 
 	if maxSize := s.cfg.MaxFileSize; maxSize > 0 {
 		fmt.Fprintf(w, "* The maximum permitted file size is %s\r\n", bold.Fmt(formatBytes(maxSize)))
@@ -3238,8 +3312,12 @@ func (s *Server) Welcome(wUnbuf io.Writer, hash string, stats userStats) {
 		}
 	}
 
-	if isContributor {
-		fmt.Fprintln(w, color.Bold("* Thank you for contributing."))
+	if downloadsUnlocked {
+		if isContributor {
+			fmt.Fprintln(w, color.Bold("* Thank you for contributing."))
+		} else if isScopedMaintainer {
+			fmt.Fprintln(w, cyan.Bold("* Maintainer download access is active."))
+		}
 		fmt.Fprint(w, green.Bold("* Downloads are unrestricted.\r\n"))
 	} else {
 		fmt.Fprint(w, red.Bold("* Downloads are restricted.\r\n"))
@@ -3489,7 +3567,7 @@ func (h *fsHandler) prepareDirectory(rel string) error {
 	}
 
 	// 1. Ownership Check (Can I create things inside the parent?)
-	if h.srv.cfg.LockDirectoriesToOwners {
+	if h.srv.cfg.LockDirectoriesToOwners && !h.canMaintain(rel) {
 		parentRel := path.Dir(rel)
 		if parentRel != "." {
 			owner, _ := h.srv.store.GetFileOwner(parentRel)
@@ -3525,9 +3603,34 @@ func (h *fsHandler) deny(err UserPermissionError, args ...any) error {
 	h.observeDenied(err.Kind)
 	h.logger.Info("permission denied", append([]any{"reason", err.LogString()}, args...)...)
 
+	args = normalizeLogArgs(args)
+	args = append(args, h.maintainerLogArgs(logArgsPath(args))...)
 	h.srv.store.LogEvent(err.Kind, h.pubHash, h.sessionID, h.remoteAddr, args...)
 	fmt.Fprintln(h.stderr, err.Error())
 	return sftp.ErrSSHFxPermissionDenied
+}
+
+func normalizeLogArgs(args []any) []any {
+	if len(args)%2 == 0 {
+		return args
+	}
+	out := make([]any, 0, len(args)+1)
+	for i := 0; i+1 < len(args); i += 2 {
+		out = append(out, args[i], args[i+1])
+	}
+	out = append(out, "detail", args[len(args)-1])
+	return out
+}
+
+func logArgsPath(args []any) string {
+	for i := 0; i+1 < len(args); i += 2 {
+		key, _ := args[i].(string)
+		if key == "path" {
+			path, _ := args[i+1].(string)
+			return path
+		}
+	}
+	return ""
 }
 
 func loginTypeFromHash(pubHash string) string {
@@ -3580,11 +3683,13 @@ func (h *fsHandler) bumpDownload(size int64) {
 func (h *fsHandler) logLogin(stats userStats) {
 	loginType := loginTypeFromHash(h.pubHash)
 
-	h.srv.store.LogEvent(EventLogin, h.pubHash, h.sessionID, h.remoteAddr,
+	args := []any{
 		"first_timer", stats.FirstTimer,
 		"upload_bytes", stats.UploadBytes,
 		"login_type", loginType,
-	)
+	}
+	args = append(args, h.maintainerLogArgs("")...)
+	h.srv.store.LogEvent(EventLogin, h.pubHash, h.sessionID, h.remoteAddr, args...)
 }
 
 func (h *fsHandler) logDownload(rel string, transferred int64, duration time.Duration) {
@@ -3595,12 +3700,14 @@ func (h *fsHandler) logDownload(rel string, transferred int64, duration time.Dur
 		"duration", duration,
 		"avg", formatTransferRate(transferred, duration),
 	)
-	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr,
+	args := []any{
 		"path", rel,
 		"size", transferred,
 		"duration_ms", durationMillis(duration),
 		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
-	)
+	}
+	args = append(args, h.maintainerLogArgs(rel)...)
+	h.srv.store.LogEvent(EventDownload, h.pubHash, h.sessionID, h.remoteAddr, args...)
 	_ = h.srv.store.RecordDownload(h.pubHash, rel, transferred)
 }
 
@@ -3614,32 +3721,55 @@ func (h *fsHandler) logUpload(rel string, size, delta, transferred int64, durati
 		"duration", duration,
 		"avg", formatTransferRate(transferred, duration),
 	)
-	h.srv.store.LogEvent(EventUpload, h.pubHash, h.sessionID, h.remoteAddr,
+	args := []any{
 		"path", rel,
 		"size", size,
 		"delta", delta,
 		"transferred", transferred,
 		"duration_ms", durationMillis(duration),
 		"avg_bytes_per_sec", averageBytesPerSecond(transferred, duration),
-	)
+	}
+	args = append(args, h.maintainerLogArgs(rel)...)
+	h.srv.store.LogEvent(EventUpload, h.pubHash, h.sessionID, h.remoteAddr, args...)
 }
 
 func (h *fsHandler) logDelete(meta *pathMeta) {
 	h.bumpOps()
 	h.logger.Info("delete", "path", meta.rel, "is_dir", meta.isDir)
-	h.srv.store.LogEvent(EventDelete, h.pubHash, h.sessionID, h.remoteAddr,
+	args := []any{
 		"path", meta.rel,
 		"is_dir", meta.isDir,
-	)
+	}
+	args = append(args, h.maintainerLogArgs(meta.rel)...)
+	h.srv.store.LogEvent(EventDelete, h.pubHash, h.sessionID, h.remoteAddr, args...)
 }
 
 func (h *fsHandler) logRename(src, dst *pathMeta) {
 	h.bumpOps()
 	h.logger.Info("rename", "from", src.rel, "to", dst.rel)
-	h.srv.store.LogEvent(EventRename, h.pubHash, h.sessionID, h.remoteAddr,
+	args := []any{
 		"path", src.rel,
 		"target", dst.rel,
-	)
+	}
+	args = append(args, h.maintainerLogArgs(src.rel)...)
+	if targetScope := h.maintainerScopeForPath(dst.rel); targetScope != "" {
+		args = append(args, "maintainer_target_scope", targetScope)
+	}
+	h.srv.store.LogEvent(EventRename, h.pubHash, h.sessionID, h.remoteAddr, args...)
+}
+
+func (h *fsHandler) maintainerLogArgs(rel string) []any {
+	if h == nil || h.srv == nil || h.isAdmin {
+		return nil
+	}
+	return h.srv.maintainerLogArgs(h.pubHash, rel)
+}
+
+func (h *fsHandler) maintainerScopeForPath(rel string) string {
+	if h == nil || h.srv == nil || h.isAdmin {
+		return ""
+	}
+	return h.srv.maintainerScopeForPath(h.pubHash, rel)
 }
 
 func (h *fsHandler) Fileread(r *sftp.Request) (reader io.ReaderAt, err error) {
@@ -3683,6 +3813,10 @@ func (h *fsHandler) canRead(meta *pathMeta) error {
 		return nil
 	}
 
+	if h.canMaintain(meta.rel) {
+		return nil
+	}
+
 	if meta.isUnrestricted {
 		return nil
 	}
@@ -3720,7 +3854,7 @@ func (h *fsHandler) Filewrite(r *sftp.Request) (writer io.WriterAt, err error) {
 		return nil, err
 	}
 
-	if err := h.srv.store.ClaimFile(h.pubHash, meta.rel); err != nil {
+	if err := h.srv.store.ClaimFile(h.pubHash, meta.rel, h.canMaintain(meta.rel)); err != nil {
 		return nil, h.deny(errMsgFilenameClaimed, "path", meta.rel)
 	}
 
@@ -3766,6 +3900,10 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 		return nil
 	}
 
+	if h.canMaintain(meta.rel) {
+		return nil
+	}
+
 	// Files inside unrestricted folders like /public are still mutable by the
 	// user who created them; only system-owned entries stay protected.
 	if meta.owner == systemOwner {
@@ -3777,6 +3915,10 @@ func (h *fsHandler) canModify(meta *pathMeta) error {
 	}
 
 	return nil
+}
+
+func (h *fsHandler) canMaintain(rel string) bool {
+	return h != nil && !h.isAdmin && h.srv.canMaintainPath(h.pubHash, rel)
 }
 
 func (h *fsHandler) Filelist(r *sftp.Request) (lister sftp.ListerAt, err error) {
@@ -3915,6 +4057,9 @@ func (h *fsHandler) Filecmd(r *sftp.Request) (err error) {
 		}
 		if err := h.canModify(targetMeta); err != nil {
 			return err
+		}
+		if !h.isAdmin && h.canMaintain(meta.rel) && !h.canMaintain(targetMeta.rel) && meta.owner != h.pubHash {
+			return h.deny(errMsgMaintainerScope.Args(targetMeta.rel), "path", meta.rel, "target", targetMeta.rel)
 		}
 
 		if err := os.Rename(meta.full, targetMeta.full); err != nil {
@@ -4072,13 +4217,12 @@ func (sw *statWriter) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (sw *statWriter) reportUserStatus(pubHash string) {
-	userStats, err := sw.h.srv.store.GetUserStats(pubHash)
+	status, err := sw.h.srv.UserStatus(pubHash)
 	if err != nil {
 		return
 	}
-	isContributor, remaining := userStats.IsContributor(sw.h.srv.cfg.ContributorThreshold)
-	if !isContributor {
-		fmt.Fprintf(sw.h.stderr, "Upload %s more bytes to unlock downloads.\r\n", formatBytes(remaining))
+	if !status.IsContributor {
+		fmt.Fprintf(sw.h.stderr, "Upload %s more bytes to unlock downloads.\r\n", formatBytes(status.BytesNeeded))
 	}
 }
 
@@ -4573,6 +4717,7 @@ func setupLogger(cfg Config) (*slog.Logger, *logutil.FileWriter, error) {
 		"conn.max_per_ip", cfg.MaxConnectionsPerIP,
 		"admin.sftp", cfg.AdminSFTP,
 		"admin.keys", cfg.AdminKeysPath,
+		"maintainers", cfg.MaintainersPath,
 		"admin.http", cfg.AdminHTTP,
 		"admin.http.token", cfg.AdminHTTPToken != "",
 		"admin.http.token.file", cfg.AdminHTTPTokenFile != "",

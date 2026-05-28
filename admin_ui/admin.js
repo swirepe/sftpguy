@@ -46,6 +46,7 @@
 	        test: null
 	      },
 	      adminKeys: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [], hashes: [] },
+	      maintainers: { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [], grants: [] },
 	      oneTimeLogins: []
 	    };
 
@@ -588,6 +589,7 @@
         ["Denied", kpi.denied || 0],
         ["Conn Max Hits", kpi.conn_max_hits || 0],
         ["Admin Actions", kpi.admin_actions || 0],
+        ["Maintainer Actions", kpi.maintainer_actions || 0],
         ["Session Starts", kpi.session_starts || 0],
         ["Session Ends", kpi.session_ends || 0]
       ];
@@ -1112,6 +1114,24 @@
       const nested = nestedMeta(meta);
       return nested[key] == null ? "" : nested[key];
     }
+    function isMaintainerMeta(meta, eventName) {
+      const role = String(metaField(meta, "actor_role") || "").toLowerCase();
+      const maintainer = String(metaField(meta, "maintainer") || "").toLowerCase();
+      const action = String(metaField(meta, "action") || metaField(meta, "operation") || eventName || "").toLowerCase();
+      return role === "maintainer" || maintainer === "true" || action.indexOf("maintainers") >= 0;
+    }
+    function eventMeta(row) {
+      if (row && row.meta_obj && typeof row.meta_obj === "object") return row.meta_obj;
+      return parseMeta(row && row.meta) || null;
+    }
+    function maintainerChip(row) {
+      const meta = eventMeta(row);
+      if (!isMaintainerMeta(meta, row && row.event)) return "";
+      const scope = String(metaField(meta, "maintainer_scope") || "").trim();
+      const title = scope ? "maintainer scope " + scope : "maintainer action";
+      const label = scope ? "maintainer " + scope : "maintainer";
+      return "<span class=\"meta-chip meta-maintainer\" title=\"" + esc(title) + "\">" + esc(label) + "</span>";
+    }
     function metaNumber(meta, key) {
       const n = Number(metaField(meta, key));
       return isFinite(n) ? n : 0;
@@ -1159,8 +1179,13 @@
       const firstTime = String(metaField(meta, "first_time") || "").trim();
       const lastTime = String(metaField(meta, "last_time") || "").trim();
       const windowSeconds = metaNumber(meta, "window_seconds");
+      const maintainer = isMaintainerMeta(meta, eventName);
+      const maintainerScope = String(metaField(meta, "maintainer_scope") || "").trim();
+      const maintainerTargetScope = String(metaField(meta, "maintainer_target_scope") || "").trim();
+      const maintainerScopes = metaField(meta, "maintainer_scopes");
 
       const chips = [];
+      if (maintainer) chips.push("<span class=\"meta-chip meta-maintainer\">" + esc(maintainerScope ? "maintainer " + maintainerScope : "maintainer") + "</span>");
       if (hits) chips.push("<span class=\"meta-chip\">hits " + esc(hits) + "</span>");
       if (maxConnections) chips.push("<span class=\"meta-chip\">limit " + esc(maxConnections) + "</span>");
       if (activeConnections) chips.push("<span class=\"meta-chip\">active " + esc(activeConnections) + "</span>");
@@ -1187,6 +1212,10 @@
         ["first_time", firstTime],
         ["last_time", lastTime],
         ["window_end", metaField(meta, "window_end_time")],
+        ["actor_role", maintainer ? "maintainer" : ""],
+        ["maintainer_scope", maintainerScope],
+        ["maintainer_target_scope", maintainerTargetScope],
+        ["maintainer_scopes", Array.isArray(maintainerScopes) ? maintainerScopes.join(", ") : maintainerScopes],
         ["hits", hits],
         ["active_connections", activeConnections],
         ["max_connections", maxConnections],
@@ -1217,7 +1246,7 @@
           },
           cells: [
             "<code>" + esc(e.time || "") + "</code>",
-            "<code>" + esc(e.event || "") + "</code>",
+            "<span class=\"event-with-tags\"><code>" + esc(e.event || "") + "</code>" + maintainerChip(e) + "</span>",
             ownerCell(e.user_id),
             ipCell(e.ip),
             sessionCell(e.session),
@@ -1299,7 +1328,7 @@
           cells: [
             "<code>" + esc(e.time || "") + "</code>",
             "<code>" + esc(level) + "</code>",
-            "<code>" + esc(e.event || "") + "</code>",
+            "<span class=\"event-with-tags\"><code>" + esc(e.event || "") + "</code>" + maintainerChip(e) + "</span>",
             ownerCell(e.user_id),
             ipCell(e.ip),
             sessionCell(e.session),
@@ -2095,9 +2124,10 @@
     }
 
 	    async function loadIPLists() {
-	      const out = await Promise.all([api("/admin/api/ip-lists"), api("/admin/api/admin-keys")]);
+	      const out = await Promise.all([api("/admin/api/ip-lists"), api("/admin/api/admin-keys"), api("/admin/api/maintainers")]);
 	      const d = out[0] || {};
 	      const k = out[1] || {};
+	      const m = out[2] || {};
 	      state.ipLists = {
 	        whitelist: (d && d.whitelist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
 	        blacklist: (d && d.blacklist) || { path: "", content: "", entries: 0, invalid_count: 0, invalid_lines: [] },
@@ -2111,13 +2141,23 @@
 	        invalid_lines: k.invalid_lines || [],
 	        hashes: k.hashes || []
 	      };
+	      state.maintainers = {
+	        path: m.path || "",
+	        content: m.content || "",
+	        entries: Number(m.entries || 0),
+	        invalid_count: Number(m.invalid_count || 0),
+	        invalid_lines: m.invalid_lines || [],
+	        grants: m.grants || []
+	      };
 
 	      const wlEditor = document.getElementById("iplist-whitelist-content");
 	      const blEditor = document.getElementById("iplist-blacklist-content");
 	      const akEditor = document.getElementById("admin-keys-content");
+	      const mtEditor = document.getElementById("maintainers-content");
 	      if (wlEditor && document.activeElement !== wlEditor) wlEditor.value = state.ipLists.whitelist.content || "";
 	      if (blEditor && document.activeElement !== blEditor) blEditor.value = state.ipLists.blacklist.content || "";
 	      if (akEditor && document.activeElement !== akEditor) akEditor.value = state.adminKeys.content || "";
+	      if (mtEditor && document.activeElement !== mtEditor) mtEditor.value = state.maintainers.content || "";
 
       setTabCount("iplists", null);
       renderIPLists();
@@ -2128,13 +2168,16 @@
 	      const bl = (state.ipLists || {}).blacklist || {};
 	      const test = (state.ipLists || {}).test || null;
 	      const ak = state.adminKeys || {};
+	      const mt = state.maintainers || {};
 
 	      const wlMeta = "path=" + pathWithExplorer(wl.path || "") + " entries=" + esc(wl.entries || 0) + " invalid=" + esc(wl.invalid_count || 0);
 	      const blMeta = "path=" + pathWithExplorer(bl.path || "") + " entries=" + esc(bl.entries || 0) + " invalid=" + esc(bl.invalid_count || 0);
 	      const akMeta = "path=" + pathWithExplorer(ak.path || "") + " entries=" + esc(ak.entries || 0) + " invalid=" + esc(ak.invalid_count || 0);
+	      const mtMeta = "path=" + pathWithExplorer(mt.path || "") + " entries=" + esc(mt.entries || 0) + " invalid=" + esc(mt.invalid_count || 0);
 	      document.getElementById("iplist-whitelist-meta").innerHTML = wlMeta;
 	      document.getElementById("iplist-blacklist-meta").innerHTML = blMeta;
 	      document.getElementById("admin-keys-meta").innerHTML = akMeta;
+	      document.getElementById("maintainers-meta").innerHTML = mtMeta;
 	      document.getElementById("iplist-whitelist-invalid").innerHTML = (wl.invalid_lines || []).length
 	        ? ("Invalid lines: <code>" + esc((wl.invalid_lines || []).join(", ")) + "</code>")
 	        : "";
@@ -2143,6 +2186,9 @@
 	        : "";
 	      document.getElementById("admin-keys-invalid").innerHTML = (ak.invalid_lines || []).length
 	        ? ("Invalid lines: <code>" + esc((ak.invalid_lines || []).join(", ")) + "</code>")
+	        : "";
+	      document.getElementById("maintainers-invalid").innerHTML = (mt.invalid_lines || []).length
+	        ? ("Invalid lines: <code>" + esc((mt.invalid_lines || []).join(", ")) + "</code>")
 	        : "";
 
       if (!test) {
@@ -2204,6 +2250,29 @@
 	      editor.value = state.adminKeys.content || "";
 	      addHistory("saved admin keys");
 	      toast("Saved admin keys");
+	      renderIPLists();
+	    }
+
+	    async function saveMaintainers() {
+	      const editor = document.getElementById("maintainers-content");
+	      if (!editor) return;
+	      const content = editor.value || "";
+	      const d = await api("/admin/api/maintainers", {
+	        method: "POST",
+	        body: JSON.stringify({ content: content })
+	      });
+	      const info = (d && d.maintainers) || {};
+	      state.maintainers = {
+	        path: info.path || "",
+	        content: info.content || content,
+	        entries: Number(info.entries || 0),
+	        invalid_count: Number(info.invalid_count || 0),
+	        invalid_lines: info.invalid_lines || [],
+	        grants: info.grants || []
+	      };
+	      editor.value = state.maintainers.content || "";
+	      addHistory("saved maintainers");
+	      toast("Saved maintainers");
 	      renderIPLists();
 	    }
 

@@ -73,6 +73,7 @@ The core of the server was lovingly handcrafted by a human.  You can see this in
 - System-owned files stay protected even inside unrestricted folders.
 - A built-in admin web console exposes users, files, audit history, sessions, maintenance, self-test, IP lists, and a browser-style explorer.
 - A separate admin SFTP mode can grant system-owner access to approved keys.
+- Scoped folder maintainer grants can let trusted keys manage only selected subtrees.
 - SQLite stores file ownership, user stats, bans, and the audit log.
 
 ## Archive Rules
@@ -154,6 +155,7 @@ Run `go run . -h` for the full list. The flags most operators care about are:
 | `-admin.explorer.warm.max` | Number of files to prewarm into admin explorer caches on first use. Default: `0` (disabled). |
 | `-admin.sftp` | Enable system-owner SFTP logins for approved admin keys. |
 | `-admin.keys` | File containing admin public keys or SHA-256 key hashes. |
+| `-maintainers` | File containing scoped folder maintainer grants. |
 | `-blacklist` / `-whitelist` | IP list files used for blocking and trusted ranges. |
 | `-bad` | File of bad SHA-256 hashes that trigger automatic purge and blacklist updates. |
 | `-prometheus.enable` | Enable metrics on the admin HTTP listener. Default: `true`. |
@@ -210,6 +212,17 @@ The web console includes:
 - normal `authorized_keys` lines
 - raw 64-character SHA-256 public-key hashes
 
+### Scoped folder maintainers
+
+`maintainers.txt` grants a key maintainer powers for a specific subtree without making that key a global admin:
+
+```text
+public/audiobooks ssh-ed25519 AAAAC3... friend@example
+public/audiobooks 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+The format is `<path> <authorized-key-or-sha256-hash>`. Use a tab between the path and key if the path contains spaces. A maintainer can download any archive file, like a contributor. Write, rename, delete, and directory creation powers stay limited to the granted path, including files owned by other users or by `system`.
+
 ## Support Files
 
 These files are operator-facing and can be edited while the server is running. They are reloaded in the background.
@@ -219,6 +232,7 @@ These files are operator-facing and can be edited while the server is running. T
 | `whitelist.txt` | Trusted IPs/CIDRs. Localhost and common private-network ranges are seeded automatically. |
 | `blacklist.txt` | IPs/CIDRs to block. |
 | `admin_keys.txt` | Admin public keys or hashes for privileged SFTP access. |
+| `maintainers.txt` | Scoped folder maintainer grants as `<path> <public key or hash>`. |
 | `bad_files.txt` | SHA-256 hashes and optional filenames for content that should be purged on upload or during maintenance. |
 
 ## Maintenance And Moderation

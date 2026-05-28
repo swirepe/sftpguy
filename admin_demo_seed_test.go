@@ -21,7 +21,7 @@ func TestSeedAdminDemoDataAddsFilesHostnamesAndSecurityActivity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed admin demo data: %v", err)
 	}
-	if stats.Users != 5 || stats.Files != 2 || stats.Events < 10 || stats.BannedIPs != 1 {
+	if stats.Users != 6 || stats.Files != 2 || stats.Events < 10 || stats.BannedIPs != 1 {
 		t.Fatalf("unexpected seed stats: %+v", stats)
 	}
 
@@ -68,6 +68,17 @@ func TestSeedAdminDemoDataAddsFilesHostnamesAndSecurityActivity(t *testing.T) {
 	}
 	if adminActions < 1 {
 		t.Fatalf("expected seeded admin activity, got %d rows", adminActions)
+	}
+
+	var maintainerActions int
+	if err := srv.store.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM log
+		WHERE user_id = ? AND meta LIKE '%"actor_role":"maintainer"%'`, "demo-map-maintainer").Scan(&maintainerActions); err != nil {
+		t.Fatalf("count seeded maintainer activity: %v", err)
+	}
+	if maintainerActions < 2 {
+		t.Fatalf("expected seeded maintainer activity, got %d rows", maintainerActions)
 	}
 
 	entries, err := srv.store.blacklist.ExactEntries()

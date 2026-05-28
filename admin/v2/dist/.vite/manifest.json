@@ -5,7 +5,7 @@
     "isDynamicEntry": true
   },
   "index.html": {
-    "file": "assets/index-BBwyT8yq.js",
+    "file": "assets/index-D2QivADV.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -14,7 +14,7 @@
       "node_modules/pmtiles/dist/esm/index.js"
     ],
     "css": [
-      "assets/index-C8QfZBVo.css"
+      "assets/index-CA6dsQBq.css"
     ]
   },
   "node_modules/maplibre-gl/dist/maplibre-gl.css": {

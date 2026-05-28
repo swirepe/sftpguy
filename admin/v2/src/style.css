@@ -39,7 +39,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -69,7 +70,8 @@ button:hover,
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -80,7 +82,8 @@ button:disabled {
 }
 
 input,
-select {
+select,
+textarea {
   min-height: 36px;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -94,6 +97,10 @@ input {
 
 select {
   padding: 0 28px 0 10px;
+}
+
+textarea {
+  padding: 10px;
 }
 
 .admin-shell {
@@ -499,6 +506,11 @@ select {
   --geo-overlay-line: rgba(232, 121, 249, 0.58);
 }
 
+.geo-overlay-toggle.maintainers {
+  --geo-overlay-color: #facc15;
+  --geo-overlay-line: rgba(250, 204, 21, 0.58);
+}
+
 .geo-overlay-toggle.denied {
   --geo-overlay-color: #fb7185;
   --geo-overlay-line: rgba(251, 113, 133, 0.58);
@@ -592,6 +604,10 @@ select {
 
 .geo-activity-row.admin {
   border-color: rgba(232, 121, 249, 0.44);
+}
+
+.geo-activity-row.maintainers {
+  border-color: rgba(250, 204, 21, 0.48);
 }
 
 .geo-activity-row.denied {
@@ -712,6 +728,11 @@ select {
 .geo-activity-selection.admin {
   --geo-overlay-color: #e879f9;
   --geo-overlay-line: rgba(232, 121, 249, 0.58);
+}
+
+.geo-activity-selection.maintainers {
+  --geo-overlay-color: #facc15;
+  --geo-overlay-line: rgba(250, 204, 21, 0.58);
 }
 
 .geo-activity-selection.denied {
@@ -887,6 +908,33 @@ button.metric {
   border-radius: 8px;
   padding: 14px;
   min-width: 0;
+}
+
+.support-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.support-editor {
+  width: 100%;
+  min-height: 180px;
+  margin-bottom: 8px;
+  resize: vertical;
+  font-family: var(--mono);
+  line-height: 1.45;
+  white-space: pre;
+}
+
+.invalid-lines {
+  margin-bottom: 8px;
+  color: var(--rose);
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .panel-heading {
@@ -1717,6 +1765,20 @@ button.bar-row.clickable:hover {
   white-space: nowrap;
 }
 
+.event-name-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.event-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 button.dense-row {
   color: var(--ink);
   cursor: pointer;
@@ -1761,6 +1823,12 @@ button.dense-row {
 .status-chip.hot {
   border-color: rgba(242, 184, 75, 0.5);
   color: var(--gold);
+}
+
+.status-chip.maintainer {
+  border-color: rgba(250, 204, 21, 0.52);
+  color: #f6d58a;
+  background: rgba(106, 74, 22, 0.24);
 }
 
 .source-pill.sftp {
@@ -1832,6 +1900,23 @@ button.dense-row {
   align-items: center;
   justify-content: space-between;
   margin: 8px 0 10px;
+}
+
+.test-summary-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -2px 0 10px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.test-summary-line span {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #0b1116;
 }
 
 .risk-row {

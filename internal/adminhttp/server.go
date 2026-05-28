@@ -68,6 +68,7 @@ type RouteHandlers struct {
 	MarkBadFile      http.HandlerFunc
 	IPLists          http.HandlerFunc
 	AdminKeys        http.HandlerFunc
+	Maintainers      http.HandlerFunc
 	IPListTest       http.HandlerFunc
 	IPList           http.HandlerFunc
 	SelfTest         http.HandlerFunc
@@ -169,6 +170,7 @@ func Handler(cfg Config, handlers RouteHandlers) http.Handler {
 	register(mux, "/admin/api/maintenance/mark-bad", cfg, handlers.MarkBadFile)
 	register(mux, "/admin/api/ip-lists", cfg, handlers.IPLists)
 	register(mux, "/admin/api/admin-keys", cfg, handlers.AdminKeys)
+	register(mux, "/admin/api/maintainers", cfg, handlers.Maintainers)
 	register(mux, "/admin/api/ip-lists/test", cfg, handlers.IPListTest)
 	register(mux, "/admin/api/ip-lists/", cfg, handlers.IPList)
 	register(mux, "/admin/api/self-test", cfg, handlers.SelfTest)

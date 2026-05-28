@@ -62,6 +62,10 @@ An SSH public key is treated as admin when either:
 - its SHA-256 hash matches the server host public key
 - its hash or full authorized-key line appears in `admin_keys.txt`
 
+Scoped folder maintainers are separate from admin SFTP. A key listed in `maintainers.txt`
+gets elevated file powers only under the configured subtree and remains a normal user
+elsewhere.
+
 ### Admin web access
 
 Admin web exists only when `-admin.http` is configured.
@@ -94,6 +98,29 @@ Admin SFTP sessions may:
 The main remaining limit is:
 
 - max file size still applies
+
+## Scoped Folder Maintainers
+
+`maintainers.txt` is a live-reloaded support file. Each non-comment line is:
+
+```text
+path authorized-key-or-sha256-hash
+```
+
+For example:
+
+```text
+public/audiobooks ssh-ed25519 AAAAC3... friend@example
+```
+
+Scoped maintainers:
+
+- keep their normal user hash for logging, stats, and ownership of new files
+- are treated as contributors for downloads and may read any path
+- may write, rename, delete, and create directories under each granted path
+- may modify files owned by other users or by `system` inside the granted path
+- do not receive web admin access or global SFTP admin powers
+- fall back to ordinary mutation permissions outside the granted path
 
 ### Audit behavior
 
@@ -157,6 +184,15 @@ The admin system relies heavily on live-reloaded text files.
 - Invalid lines are ignored and logged as warnings.
 - Reloads in the background every 30 seconds.
 - When admin SFTP is enabled, startup tries to append the server host public key if it is not already present.
+
+### `maintainers.txt`
+
+- Stores scoped maintainer grants as `<path> <authorized-key-or-sha256-hash>`.
+- Paths are archive-relative; leading slashes are accepted and normalized away.
+- Grants match the exact path and all descendants, but not sibling prefixes.
+- Supports comments and trailing inline comments on the credential.
+- Invalid lines are ignored and logged as warnings.
+- Reloads in the background every 30 seconds.
 
 ### `bad_files.txt`
 

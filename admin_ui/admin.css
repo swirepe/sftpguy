@@ -225,6 +225,18 @@
 	      border-color: rgba(86,216,151,.42);
 	      background: rgba(39,93,71,.22);
 	    }
+	    .meta-maintainer {
+	      color: #f6d58a;
+	      border-color: rgba(242,184,75,.5);
+	      background: rgba(106,74,22,.28);
+	    }
+	    .event-with-tags {
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 5px;
+	      min-width: 0;
+	      flex-wrap: wrap;
+	    }
 	    .meta-section {
 	      margin-top: 7px;
 	      padding: 7px;

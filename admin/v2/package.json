@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "check": "tsc --noEmit && vite build"
+    "check": "tsc --noEmit && vite build",
+    "test:ui": "node ./tests/support/run-ui-tests.mjs",
+    "test:ui:headed": "node ./tests/support/run-ui-tests.mjs --headed",
+    "test:ui:direct": "playwright test",
+    "test:ui:install": "playwright install chromium"
   },
   "dependencies": {
     "@tanstack/preact-query": "^5.76.1",
@@ -16,6 +20,7 @@
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.10.2",
+    "@playwright/test": "^1.60.0",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"
   }

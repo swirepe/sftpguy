@@ -193,16 +193,24 @@ func (s *Server) handleAdminInsights(w http.ResponseWriter, r *http.Request) {
 			"hours":      int(window.Duration.Hours()),
 		},
 		"kpi": map[string]any{
-			"events":         scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ?`, since),
-			"users":          scalar(`SELECT COUNT(DISTINCT user_id) FROM log WHERE timestamp >= ? AND user_id != ''`, since),
-			"ips":            scalar(`SELECT COUNT(DISTINCT ip_address) FROM log WHERE timestamp >= ? AND ip_address != ''`, since),
-			"logins":         scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'login'`, since),
-			"uploads":        scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'upload'`, since),
-			"downloads":      scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'download'`, since),
-			"denied":         scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'denied%'`, since),
-			"conn_max_hits":  connectionLimitHits,
-			"conn_max_rows":  scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = ?`, since, string(EventDeniedConnectionLimit)),
-			"admin_actions":  scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'admin/%'`, since),
+			"events":        scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ?`, since),
+			"users":         scalar(`SELECT COUNT(DISTINCT user_id) FROM log WHERE timestamp >= ? AND user_id != ''`, since),
+			"ips":           scalar(`SELECT COUNT(DISTINCT ip_address) FROM log WHERE timestamp >= ? AND ip_address != ''`, since),
+			"logins":        scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'login'`, since),
+			"uploads":       scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'upload'`, since),
+			"downloads":     scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'download'`, since),
+			"denied":        scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'denied%'`, since),
+			"conn_max_hits": connectionLimitHits,
+			"conn_max_rows": scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = ?`, since, string(EventDeniedConnectionLimit)),
+			"admin_actions": scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event LIKE 'admin/%'`, since),
+			"maintainer_actions": scalar(`
+				SELECT COUNT(*) FROM log
+				WHERE timestamp >= ?
+				  AND (
+					meta LIKE '%"actor_role":"maintainer"%'
+					OR meta LIKE '%"maintainer":true%'
+					OR meta LIKE '%"action":"maintainers-%'
+				  )`, since),
 			"session_starts": scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'session/start'`, since),
 			"session_ends":   scalar(`SELECT COUNT(*) FROM log WHERE timestamp >= ? AND event = 'session/end'`, since),
 		},

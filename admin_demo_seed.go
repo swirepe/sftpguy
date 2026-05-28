@@ -79,6 +79,13 @@ func seedAdminDemoData(store *Store, absUploadDir string, now time.Time) (AdminD
 		Host:    "demo-edge.sftpguy.test",
 		Session: "demo-exec-" + batch,
 	}
+	maintainer := adminDemoActor{
+		Hash:    "demo-map-maintainer",
+		IP:      "208.67.222.222",
+		Port:    51027,
+		Host:    "resolver1.opendns.com",
+		Session: "demo-maintainer-" + batch,
+	}
 	scanner := adminDemoActor{
 		Hash:    "demo-map-scanner",
 		IP:      adminDemoBannedIP,
@@ -93,7 +100,7 @@ func seedAdminDemoData(store *Store, absUploadDir string, now time.Time) (AdminD
 		Host:    "localhost",
 		Session: "demo-local-" + batch,
 	}
-	actors := []adminDemoActor{uploader, downloader, operator, scanner, local}
+	actors := []adminDemoActor{uploader, downloader, operator, maintainer, scanner, local}
 	for _, actor := range actors {
 		if _, err := store.UpsertUserSession(actor.Hash, actor.Addr()); err != nil {
 			return AdminDemoSeedStats{}, fmt.Errorf("upsert demo user %s: %w", actor.Hash, err)
@@ -185,6 +192,26 @@ func seedAdminDemoData(store *Store, absUploadDir string, now time.Time) (AdminD
 	logEvent(EventAdminConfig, operator,
 		"source", "admin",
 		"action", "rotate demo admin key")
+	logEvent(EventUpload, maintainer,
+		"path", "demo/reports/monthly-audit.csv",
+		"source", "sftp",
+		"actor_role", "maintainer",
+		"maintainer", true,
+		"maintainer_scope", "demo/reports",
+		"size", int64(512),
+		"delta", int64(128),
+		"transferred", int64(512),
+		"duration_ms", 52,
+		"avg_bytes_per_sec", int64(9846))
+	logEvent(EventRename, maintainer,
+		"path", "demo/reports/monthly-audit.csv",
+		"target", "demo/reports/monthly-audit-reviewed.csv",
+		"source", "sftp",
+		"actor_role", "maintainer",
+		"maintainer", true,
+		"maintainer_scope", "demo/reports",
+		"maintainer_target_scope", "demo/reports",
+		"operation", "rename")
 
 	logEvent(EventConnect, scanner, "source", "sftp")
 	for _, deniedPath := range []string{"../private/keys.txt", "../../etc/shadow", ".ssh/authorized_keys"} {

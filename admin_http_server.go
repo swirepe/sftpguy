@@ -81,6 +81,7 @@ func (d *adminHTTPDeps) AdminHTTPHandlers() adminhttp.RouteHandlers {
 		MarkBadFile:      d.srv.handleAdminMarkBadFile,
 		IPLists:          d.srv.handleAdminIPLists,
 		AdminKeys:        d.srv.handleAdminKeys,
+		Maintainers:      d.srv.handleAdminMaintainers,
 		IPListTest:       d.srv.handleAdminIPListTest,
 		IPList:           d.srv.handleAdminIPList,
 		SelfTest:         d.srv.handleAdminSelfTest,

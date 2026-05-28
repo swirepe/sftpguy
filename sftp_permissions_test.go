@@ -35,10 +35,11 @@ func startPermissionsTestServer(t *testing.T, name string) (*Server, *selfTestRu
 		BlacklistPath:        filepath.Join(tmpDir, "blacklist.txt"),
 		WhitelistPath:        filepath.Join(tmpDir, "whitelist.txt"),
 		AdminKeysPath:        filepath.Join(tmpDir, "admin_keys.txt"),
+		MaintainersPath:      filepath.Join(tmpDir, "maintainers.txt"),
 		BadFilesPath:         filepath.Join(tmpDir, "bad_files.txt"),
 	}
 
-	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.BadFilesPath} {
+	for _, p := range []string{cfg.BlacklistPath, cfg.WhitelistPath, cfg.AdminKeysPath, cfg.MaintainersPath, cfg.BadFilesPath} {
 		if err := os.WriteFile(p, []byte(""), permFile); err != nil {
 			t.Fatalf("write support file %s: %v", p, err)
 		}
@@ -237,5 +238,173 @@ func TestSFTPOwnershipEnforcedInPublicDirectory(t *testing.T) {
 	}
 	if srv.store.FileExistsInDB(publicPath) {
 		t.Fatal("expected deleted public file metadata to be removed from the database")
+	}
+}
+
+func TestSFTPScopedMaintainerCanManageGrantedFolderOnly(t *testing.T) {
+	srv, runner := startPermissionsTestServer(t, "sftpguy-scoped-maintainer-test")
+	requireSystemOwnedPublicDir(t, srv)
+
+	ownerAuth, _, ownerHash := runner.newPubKeyAuth()
+	maintainerAuth, _, maintainerHash := runner.newPubKeyAuth()
+
+	grant := "public/audiobooks " + maintainerHash + "\n"
+	if err := os.WriteFile(srv.store.maintainersPath, []byte(grant), permFile); err != nil {
+		t.Fatalf("write scoped maintainer file: %v", err)
+	}
+	if _, err := srv.store.scopedMaintainers.Reload(srv.store.maintainersPath); err != nil {
+		t.Fatalf("reload scoped maintainers: %v", err)
+	}
+
+	ownerSSH, ownerSFTP, err := runner.openSFTP(ownerAuth)
+	if err != nil {
+		t.Fatalf("open owner sftp: %v", err)
+	}
+	defer ownerSSH.Close()
+	defer ownerSFTP.Close()
+
+	maintSSH, maintSFTP, err := runner.openSFTP(maintainerAuth)
+	if err != nil {
+		t.Fatalf("open maintainer sftp: %v", err)
+	}
+	defer maintSSH.Close()
+	defer maintSFTP.Close()
+
+	inScope := "public/audiobooks/book-" + stRandHex() + ".txt"
+	renamedInScope := "public/audiobooks/book-renamed-" + stRandHex() + ".txt"
+	escapeTarget := "public/escaped-" + stRandHex() + ".txt"
+	outside := "public/not-audiobooks-" + stRandHex() + ".txt"
+
+	if err := stWrite(ownerSFTP, inScope, []byte("owner v1")); err != nil {
+		t.Fatalf("owner writes in-scope file: %v", err)
+	}
+	if err := stWrite(ownerSFTP, outside, []byte("outside v1")); err != nil {
+		t.Fatalf("owner writes outside file: %v", err)
+	}
+
+	if err := stWrite(maintSFTP, inScope, []byte("maintainer v2")); err != nil {
+		t.Fatalf("maintainer overwrite in scoped folder: %v", err)
+	}
+	assertMaintainerEventMeta(t, srv, EventUpload, maintainerHash, inScope, "public/audiobooks")
+	owner, err := srv.store.GetFileOwner(inScope)
+	if err != nil {
+		t.Fatalf("get in-scope owner after overwrite: %v", err)
+	}
+	if owner != ownerHash {
+		t.Fatalf("expected scoped overwrite to preserve owner, got=%q want=%q", owner, ownerHash)
+	}
+
+	if err := maintSFTP.Rename(inScope, renamedInScope); err != nil {
+		t.Fatalf("maintainer rename within scoped folder: %v", err)
+	}
+	assertMaintainerEventMeta(t, srv, EventRename, maintainerHash, inScope, "public/audiobooks")
+	if _, err := os.Stat(filepath.Join(srv.absUploadDir, filepath.FromSlash(renamedInScope))); err != nil {
+		t.Fatalf("expected renamed in-scope file to exist: %v", err)
+	}
+
+	if err := stWrite(ownerSFTP, inScope, []byte("owner escape candidate")); err != nil {
+		t.Fatalf("owner writes second in-scope file: %v", err)
+	}
+	if err := maintSFTP.Rename(inScope, escapeTarget); err == nil {
+		t.Fatal("expected maintainer rename out of scoped folder to be denied")
+	}
+	if _, err := os.Stat(filepath.Join(srv.absUploadDir, filepath.FromSlash(inScope))); err != nil {
+		t.Fatalf("expected source to remain after denied escape rename: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(srv.absUploadDir, filepath.FromSlash(escapeTarget))); !os.IsNotExist(err) {
+		t.Fatalf("expected escape target not to be created, got err=%v", err)
+	}
+
+	if err := stWrite(maintSFTP, outside, []byte("maintainer outside overwrite")); err == nil {
+		t.Fatal("expected maintainer overwrite outside scoped folder to be denied")
+	}
+	if err := maintSFTP.Remove(outside); err == nil {
+		t.Fatal("expected maintainer delete outside scoped folder to be denied")
+	}
+	if err := maintSFTP.Remove(renamedInScope); err != nil {
+		t.Fatalf("maintainer delete in scoped folder: %v", err)
+	}
+	assertMaintainerEventMeta(t, srv, EventDelete, maintainerHash, renamedInScope, "public/audiobooks")
+}
+
+func assertMaintainerEventMeta(t *testing.T, srv *Server, event EventKind, userID, relPath, scope string) {
+	t.Helper()
+
+	var rawMeta string
+	if err := srv.store.db.QueryRow(`
+		SELECT IFNULL(meta, '')
+		FROM log
+		WHERE event = ? AND user_id = ? AND path = ?
+		ORDER BY id DESC
+		LIMIT 1`, string(event), userID, relPath).Scan(&rawMeta); err != nil {
+		t.Fatalf("query %s maintainer event meta for %s: %v", event, relPath, err)
+	}
+	meta := parseJSONMap(rawMeta)
+	if got := stringFromAny(meta["actor_role"]); got != "maintainer" {
+		t.Fatalf("%s actor_role = %q, want maintainer; meta=%s", event, got, rawMeta)
+	}
+	if got := stringFromAny(meta["maintainer"]); got != "true" {
+		t.Fatalf("%s maintainer = %q, want true; meta=%s", event, got, rawMeta)
+	}
+	if got := stringFromAny(meta["maintainer_scope"]); got != scope {
+		t.Fatalf("%s maintainer_scope = %q, want %q; meta=%s", event, got, scope, rawMeta)
+	}
+}
+
+func TestSFTPScopedMaintainerCanReadAnyPrivateFolder(t *testing.T) {
+	srv, runner := startPermissionsTestServer(t, "sftpguy-scoped-maintainer-read-test")
+
+	ownerAuth, _, _ := runner.newPubKeyAuth()
+	maintainerAuth, _, maintainerHash := runner.newPubKeyAuth()
+	otherAuth, _, _ := runner.newPubKeyAuth()
+
+	grant := "private/audiobooks " + maintainerHash + "\n"
+	if err := os.WriteFile(srv.store.maintainersPath, []byte(grant), permFile); err != nil {
+		t.Fatalf("write scoped maintainer file: %v", err)
+	}
+	if _, err := srv.store.scopedMaintainers.Reload(srv.store.maintainersPath); err != nil {
+		t.Fatalf("reload scoped maintainers: %v", err)
+	}
+
+	ownerSSH, ownerSFTP, err := runner.openSFTP(ownerAuth)
+	if err != nil {
+		t.Fatalf("open owner sftp: %v", err)
+	}
+	defer ownerSSH.Close()
+	defer ownerSFTP.Close()
+
+	grantedPrivatePath := "private/audiobooks/book-" + stRandHex() + ".txt"
+	otherPrivatePath := "private/other/book-" + stRandHex() + ".txt"
+	if err := stWrite(ownerSFTP, grantedPrivatePath, []byte("private book")); err != nil {
+		t.Fatalf("owner writes private in-scope file: %v", err)
+	}
+	if err := stWrite(ownerSFTP, otherPrivatePath, []byte("other private book")); err != nil {
+		t.Fatalf("owner writes private out-of-scope file: %v", err)
+	}
+
+	otherSSH, otherSFTP, err := runner.openSFTP(otherAuth)
+	if err != nil {
+		t.Fatalf("open other sftp: %v", err)
+	}
+	defer otherSSH.Close()
+	defer otherSFTP.Close()
+	if err := stRead(otherSFTP, grantedPrivatePath); err == nil {
+		t.Fatal("expected ordinary non-contributor read of granted private path to be denied")
+	}
+	if err := stRead(otherSFTP, otherPrivatePath); err == nil {
+		t.Fatal("expected ordinary non-contributor read of other private path to be denied")
+	}
+
+	maintSSH, maintSFTP, err := runner.openSFTP(maintainerAuth)
+	if err != nil {
+		t.Fatalf("open maintainer sftp: %v", err)
+	}
+	defer maintSSH.Close()
+	defer maintSFTP.Close()
+	if err := stRead(maintSFTP, grantedPrivatePath); err != nil {
+		t.Fatalf("expected scoped maintainer to read granted private file: %v", err)
+	}
+	if err := stRead(maintSFTP, otherPrivatePath); err != nil {
+		t.Fatalf("expected scoped maintainer to read any private file as contributor: %v", err)
 	}
 }

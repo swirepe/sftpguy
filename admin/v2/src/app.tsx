@@ -18,7 +18,7 @@ import {
 
 type View = "overview" | "activity" | "map" | "thumbnails" | "users" | "security";
 type SourceFilter = "all" | "sftp" | "admin" | "explorer";
-type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec";
+type ActivityKind = "all" | "attention" | "denied" | "transfer" | "mutating" | "session" | "exec" | "maintainer";
 type ActorType = "ip" | "user";
 type LiveTargetKind = "connection" | "session" | "transfer" | "request";
 type MetricTarget = {
@@ -47,6 +47,22 @@ type InsightRow = { label: string; value?: string };
 type EventsPayload = {
   events?: EventRow[];
   window?: { label?: string };
+};
+
+type SelfTestReportPayload = {
+  passed?: number;
+  failed?: number;
+  skipped?: number;
+  duration?: string;
+  error?: string;
+};
+
+type SelfTestPayload = {
+  running?: boolean;
+  run_id?: number;
+  started_at?: string;
+  running_for?: string;
+  last_report?: SelfTestReportPayload | null;
 };
 
 type EventStreamPayload = {
@@ -95,6 +111,7 @@ type GeoActivityOverlay =
   | "exec"
   | "mutations"
   | "admin"
+  | "maintainers"
   | "denied"
   | "auth"
   | "flagged"
@@ -357,6 +374,25 @@ type AuthAttemptsPayload = {
   window?: { label?: string };
 };
 
+type MaintainerGrant = {
+  path?: string;
+  hash?: string;
+};
+
+type MaintainersPayload = {
+  path?: string;
+  content?: string;
+  entries?: number;
+  invalid_count?: number;
+  invalid_lines?: string[];
+  grants?: MaintainerGrant[];
+};
+
+type MaintainersSavePayload = {
+  ok?: boolean;
+  maintainers?: MaintainersPayload;
+};
+
 type InspectorAction =
   | { type: "delete"; path: string }
   | { type: "rename"; path: string; newName: string }
@@ -383,15 +419,16 @@ const geoActivityOverlays: Array<{ value: GeoActivityOverlay; label: string }> =
   { value: "exec", label: "Exec" },
   { value: "mutations", label: "Mutations" },
   { value: "admin", label: "Admin Actions" },
+  { value: "maintainers", label: "Maintainers" },
   { value: "denied", label: "Denied" },
   { value: "auth", label: "Auth Attempts" },
   { value: "flagged", label: "Flagged IPs" },
   { value: "banned", label: "Banned IPs" }
 ];
 const geoActivityMapPresets: Array<{ label: string; overlays: GeoActivityOverlay[] }> = [
-  { label: "Live Ops", overlays: ["connections", "uploads", "downloads", "exec"] },
+  { label: "Live Ops", overlays: ["connections", "uploads", "downloads", "exec", "maintainers"] },
   { label: "File Flow", overlays: ["uploads", "downloads", "files"] },
-  { label: "Changes", overlays: ["mutations", "admin", "exec", "denied"] },
+  { label: "Changes", overlays: ["mutations", "admin", "maintainers", "exec", "denied"] },
   { label: "Security", overlays: ["denied", "auth", "flagged", "banned"] },
   { label: "Exec Watch", overlays: ["exec", "denied", "auth"] },
   { label: "All", overlays: geoActivityOverlays.map((overlay) => overlay.value) }
@@ -482,7 +519,9 @@ export function App() {
   const sessionsEnabled = overviewDetailsEnabled;
   const bannedEnabled = overviewDetailsEnabled || view === "map" || view === "security";
   const authAttemptsEnabled = view === "map" || view === "security";
+  const maintainersEnabled = view === "security";
   const maintenanceEnabled = overviewDetailsEnabled;
+  const selfTestEnabled = overviewDetailsEnabled;
 
   const summary = useQuery({
     queryKey: ["summary"],
@@ -553,11 +592,23 @@ export function App() {
     enabled: authAttemptsEnabled,
     refetchInterval: authAttemptsEnabled ? 30_000 : false
   });
+  const maintainers = useQuery({
+    queryKey: ["maintainers"],
+    queryFn: () => api<MaintainersPayload>("/admin/api/maintainers"),
+    enabled: maintainersEnabled,
+    refetchInterval: maintainersEnabled ? 60_000 : false
+  });
   const maintenance = useQuery({
     queryKey: ["maintenance"],
     queryFn: () => api<Record<string, unknown>>("/admin/api/maintenance"),
     enabled: maintenanceEnabled,
     refetchInterval: maintenanceEnabled ? 30_000 : false
+  });
+  const selfTest = useQuery({
+    queryKey: ["self-test"],
+    queryFn: () => api<SelfTestPayload>("/admin/api/self-test"),
+    enabled: selfTestEnabled,
+    refetchInterval: selfTestEnabled ? 5_000 : false
   });
 
   const runMaintenance = useMutation({
@@ -567,10 +618,27 @@ export function App() {
       await queryClient.invalidateQueries({ queryKey: ["events"] });
     }
   });
+  const runSelfTest = useMutation({
+    mutationFn: () => postJSON<SelfTestPayload>("/admin/api/self-test/run", {}),
+    onSuccess: (payload) => {
+      queryClient.setQueryData(["self-test"], payload);
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["self-test"] });
+      await queryClient.invalidateQueries({ queryKey: ["events"] });
+    }
+  });
   const banIP = useMutation({
     mutationFn: (ip: string) => postJSON("/admin/api/banned/ip", { ip }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["banned"] });
+      await queryClient.invalidateQueries({ queryKey: ["events"] });
+    }
+  });
+  const saveMaintainers = useMutation({
+    mutationFn: (content: string) => postJSON<MaintainersSavePayload>("/admin/api/maintainers", { content }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["maintainers"] });
       await queryClient.invalidateQueries({ queryKey: ["events"] });
     }
   });
@@ -721,7 +789,9 @@ export function App() {
               sessions={sessions.data?.sessions ?? []}
               banned={banned.data}
               maintenance={maintenance.data}
+              selfTest={selfTest.data}
               maintenancePending={runMaintenance.isPending}
+              selfTestPending={runSelfTest.isPending}
               banIPPending={banIP.isPending}
               loading={summary.isLoading || events.isLoading || insights.isLoading}
               onOpenPath={openInspector}
@@ -735,6 +805,7 @@ export function App() {
               onOpenUsers={openUsers}
               onDrillSearch={drillSearch}
               onRunMaintenance={() => runMaintenance.mutate()}
+              onRunSelfTest={() => runSelfTest.mutate()}
               onBanIP={confirmedBanIP}
             />
           ) : view === "activity" ? (
@@ -785,9 +856,13 @@ export function App() {
               insights={insights.data}
               banned={banned.data}
               auth={authAttempts.data}
+              maintainers={maintainers.data}
               loading={authAttempts.isLoading || insights.isLoading}
+              maintainersLoading={maintainers.isLoading}
+              maintainersSaving={saveMaintainers.isPending}
               banIPPending={banIP.isPending}
               onBanIP={confirmedBanIP}
+              onSaveMaintainers={(content) => saveMaintainers.mutate(content)}
               onInspectMetric={inspectMetric}
               onOpenActivity={openActivity}
               onInspectEvent={inspectEvent}
@@ -921,7 +996,9 @@ function Overview(props: {
   sessions: SessionRow[];
   banned?: BannedPayload;
   maintenance?: Record<string, unknown>;
+  selfTest?: SelfTestPayload;
   maintenancePending: boolean;
+  selfTestPending: boolean;
   banIPPending: boolean;
   loading: boolean;
   onOpenPath: (path?: string) => void;
@@ -935,6 +1012,7 @@ function Overview(props: {
   onOpenUsers: (filter?: UserFilter, sort?: UserSort) => void;
   onDrillSearch: (value: string, view?: View) => void;
   onRunMaintenance: () => void;
+  onRunSelfTest: () => void;
   onBanIP: (ip: string) => void;
 }) {
   const downloads = props.downloads?.files ?? [];
@@ -966,6 +1044,7 @@ function Overview(props: {
           tone={Number(kpi.denied || 0) > 0 ? "warn" : "normal"}
           onClick={() => props.onOpenActivity("denied")}
         />
+        <Metric label="Maint" value={formatNumber(kpi.maintainer_actions)} onClick={() => props.onOpenActivity("maintainer")} />
         <Metric
           label="Conn Max"
           value={formatNumber(connMaxHits)}
@@ -1068,9 +1147,12 @@ function Overview(props: {
           bannedHashes={bannedHashes}
           bannedIPs={bannedIPs}
           maintenance={props.maintenance}
+          selfTest={props.selfTest}
           maintenancePending={props.maintenancePending}
+          selfTestPending={props.selfTestPending}
           banIPPending={props.banIPPending}
           onRunMaintenance={props.onRunMaintenance}
+          onRunSelfTest={props.onRunSelfTest}
           onBanIP={props.onBanIP}
           onInspectActor={props.onInspectActor}
         />
@@ -1120,6 +1202,7 @@ function Activity(props: {
         <Metric label="Transfers" value={formatNumber(profile.transfer)} active={props.kind === "transfer"} onClick={() => props.onKind("transfer")} />
         <Metric label="Mutations" value={formatNumber(profile.mutating)} active={props.kind === "mutating"} onClick={() => props.onKind("mutating")} />
         <Metric label="Sessions" value={formatNumber(profile.session)} active={props.kind === "session"} onClick={() => props.onKind("session")} />
+        <Metric label="Maint" value={formatNumber(profile.maintainer)} active={props.kind === "maintainer"} onClick={() => props.onKind("maintainer")} />
         <Metric
           label="Exec"
           value={formatNumber(profile.exec)}
@@ -1168,6 +1251,7 @@ function GeoActivityMapView(props: {
     exec: true,
     mutations: false,
     admin: false,
+    maintainers: true,
     denied: false,
     auth: false,
     flagged: false,
@@ -1903,9 +1987,13 @@ function Security(props: {
   insights?: InsightsPayload;
   banned?: BannedPayload;
   auth?: AuthAttemptsPayload;
+  maintainers?: MaintainersPayload;
   loading: boolean;
+  maintainersLoading: boolean;
+  maintainersSaving: boolean;
   banIPPending: boolean;
   onBanIP: (ip: string) => void;
+  onSaveMaintainers: (content: string) => void;
   onInspectMetric: (metric: MetricTarget) => void;
   onOpenActivity: (kind: ActivityKind, source?: SourceFilter, query?: string) => void;
   onInspectEvent: (event: EventRow) => void;
@@ -1953,6 +2041,7 @@ function Security(props: {
           tone={connMaxHits > 0 ? "warn" : "normal"}
           onClick={() => props.onInspectMetric(connectionLimitMetric(props.insights))}
         />
+        <Metric label="Maintainers" value={formatNumber(props.insights?.kpi?.maintainer_actions)} onClick={() => props.onOpenActivity("maintainer")} />
         <Metric label="Panics" value={formatNumber(panics)} tone={panics > 0 ? "warn" : "normal"} onClick={() => props.onInspectMetric(panicMetric(props.insights))} />
         <Metric label="Geo" value={geoStatusLabel(geoStatus)} onClick={() => props.onInspectMetric(geoMetric(geoStatus))} />
         <Metric label="Banned IPs" value={formatNumber(bannedIPs.length)} onClick={() => props.onInspectMetric(bannedIPMetric(props.banned))} />
@@ -1976,8 +2065,21 @@ function Security(props: {
       </section>
 
       <section class="split">
-        <AuthAttemptsPanel attempts={attempts} onInspectEvent={props.onInspectEvent} />
+        <MaintainersPanel
+          maintainers={props.maintainers}
+          loading={props.maintainersLoading}
+          saving={props.maintainersSaving}
+          onSave={props.onSaveMaintainers}
+        />
         <BannedPanel banned={props.banned} />
+      </section>
+
+      <section class="wide-panel">
+        <div class="panel-heading">
+          <h2>Auth Attempts</h2>
+          <span>{attempts.length} rows</span>
+        </div>
+        <AuthAttemptsPanelContent attempts={attempts} onInspectEvent={props.onInspectEvent} />
       </section>
 
       <section class="split">
@@ -2040,9 +2142,69 @@ function AuthCombosPanel(props: { combos: AuthComboRow[]; banIPPending: boolean;
   );
 }
 
+function MaintainersPanel(props: {
+  maintainers?: MaintainersPayload;
+  loading: boolean;
+  saving: boolean;
+  onSave: (content: string) => void;
+}) {
+  const remoteContent = props.maintainers?.content ?? "";
+  const [content, setContent] = useState(remoteContent);
+  useEffect(() => {
+    setContent(remoteContent);
+  }, [remoteContent]);
+
+  const invalidLines = props.maintainers?.invalid_lines ?? [];
+  const grants = props.maintainers?.grants ?? [];
+  const pathLabel = props.maintainers?.path || "maintainers.txt";
+
+  return (
+    <DataPanel
+      title="Maintainers"
+      empty="No maintainer data"
+      action={
+        <button type="button" onClick={() => props.onSave(content)} disabled={props.loading || props.saving}>
+          {props.saving ? "Saving" : "Save"}
+        </button>
+      }
+    >
+      <div class="support-meta">
+        <span>{pathLabel}</span>
+        <span>{formatNumber(props.maintainers?.entries)} grants</span>
+        <span>{formatNumber(props.maintainers?.invalid_count)} invalid</span>
+      </div>
+      <textarea
+        class="support-editor"
+        spellcheck={false}
+        value={content}
+        placeholder="public/audiobooks ssh-ed25519 AAAAC3... friend-laptop"
+        onInput={(event) => setContent((event.currentTarget as HTMLTextAreaElement).value)}
+      />
+      {invalidLines.length > 0 ? <div class="invalid-lines">Invalid: {invalidLines.join(", ")}</div> : null}
+      {grants.slice(0, 8).map((grant) => (
+        <div class="dense-row" key={`${grant.path || ""}:${grant.hash || ""}`}>
+          <div>
+            <strong>{grant.path || "(path)"}</strong>
+            <small>{shortValue(grant.hash, 28)}</small>
+          </div>
+          <span>grant</span>
+        </div>
+      ))}
+    </DataPanel>
+  );
+}
+
 function AuthAttemptsPanel({ attempts, onInspectEvent }: { attempts: AuthAttemptRow[]; onInspectEvent: (event: EventRow) => void }) {
   return (
     <DataPanel title="Recent Auth Attempts" empty="No auth attempts">
+      <AuthAttemptsPanelContent attempts={attempts} onInspectEvent={onInspectEvent} />
+    </DataPanel>
+  );
+}
+
+function AuthAttemptsPanelContent({ attempts, onInspectEvent }: { attempts: AuthAttemptRow[]; onInspectEvent: (event: EventRow) => void }) {
+  return (
+    <>
       {attempts.slice(0, 18).map((attempt) => (
         <button class="dense-row auth-attempt-row" type="button" key={attempt.id} onClick={() => onInspectEvent(eventFromAuthAttempt(attempt))}>
           <div>
@@ -2053,7 +2215,7 @@ function AuthAttemptsPanel({ attempts, onInspectEvent }: { attempts: AuthAttempt
           <span>{shortValue(attempt.session, 14)}</span>
         </button>
       ))}
-    </DataPanel>
+    </>
   );
 }
 
@@ -2505,6 +2667,7 @@ function ActivityKindTabs(props: { value: ActivityKind; onChange: (kind: Activit
     { value: "transfer", label: "Transfers" },
     { value: "mutating", label: "Mutations" },
     { value: "session", label: "Sessions" },
+    { value: "maintainer", label: "Maintainers" },
     { value: "exec", label: "Exec" }
   ];
   return (
@@ -2528,6 +2691,7 @@ function ActivityBreakdownPanel({ profile }: { profile: ReturnType<typeof activi
           { name: "Transfer", count: profile.transfer },
           { name: "Mutating", count: profile.mutating },
           { name: "Session", count: profile.session },
+          { name: "Maintainer", count: profile.maintainer },
           { name: "Exec", count: profile.exec }
         ]}
       />
@@ -2585,7 +2749,10 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
             <span class="event-cell" data-label="Source">
               <SourcePill source={sourceFor(row)} />
             </span>
-            <span class="event-cell event-name" data-label="Event">{row.event || ""}</span>
+            <span class="event-cell event-name event-name-cell" data-label="Event">
+              <span class="event-name-text">{row.event || ""}</span>
+              <MaintainerPill event={row} compact />
+            </span>
             <span class="event-cell" data-label="Status">
               <span class={statusClass(row)}>{statusFor(row)}</span>
             </span>
@@ -2597,6 +2764,18 @@ function EventTable(props: { rows: EventRow[]; onInspectEvent: (event: EventRow)
         );
       })}
     </div>
+  );
+}
+
+function MaintainerPill({ event, compact = false }: { event: EventRow; compact?: boolean }) {
+  if (!isMaintainerEvent(event)) {
+    return null;
+  }
+  const scope = maintainerScopeForEvent(event);
+  return (
+    <span class="status-chip maintainer" title={scope ? `maintainer scope ${scope}` : "maintainer action"}>
+      {compact ? "Maint" : scope ? `Maintainer ${scope}` : "Maintainer"}
+    </span>
   );
 }
 
@@ -2669,6 +2848,7 @@ function KPIBars({ kpi, liveCount }: { kpi: Record<string, number>; liveCount: n
     { name: "Denied", count: kpi.denied ?? 0 },
     { name: "Conn Max", count: kpi.conn_max_hits ?? 0 },
     { name: "Admin", count: kpi.admin_actions ?? 0 },
+    { name: "Maint", count: kpi.maintainer_actions ?? 0 },
     { name: "Sessions", count: kpi.session_starts ?? 0 },
     { name: "Live", count: liveCount }
   ];
@@ -2928,17 +3108,25 @@ function RiskPanel(props: {
   bannedHashes: number;
   bannedIPs: number;
   maintenance?: Record<string, unknown>;
+  selfTest?: SelfTestPayload;
   maintenancePending: boolean;
+  selfTestPending: boolean;
   banIPPending: boolean;
   onRunMaintenance: () => void;
+  onRunSelfTest: () => void;
   onBanIP: (ip: string) => void;
   onInspectActor: (actorType: ActorType, value: string) => void;
 }) {
   const suspicious = props.insights?.suspicious_ips ?? [];
   const connMaxHits = numberFromUnknown(props.insights?.kpi?.conn_max_hits);
   const running = Boolean(props.maintenance?.running);
+  const testRunning = Boolean(props.selfTest?.running);
+  const testReport = props.selfTest?.last_report ?? null;
+  const testFailures = Number(testReport?.failed || 0);
+  const testState = testRunning ? "Running" : testReport ? (testFailures > 0 ? "Failed" : "Passing") : "Not Run";
+  const testTone = testRunning || testFailures > 0 ? "status-chip hot" : "status-chip";
   return (
-    <DataPanel title="Risk & Maintenance" empty="No risk data available">
+    <DataPanel title="Risk & Tests" empty="No risk data available">
       <div class="risk-summary">
         <Metric label="Banned Users" value={formatNumber(props.bannedHashes)} compact />
         <Metric label="Banned IPs" value={formatNumber(props.bannedIPs)} compact />
@@ -2951,6 +3139,20 @@ function RiskPanel(props: {
           Run Maintenance
         </button>
       </div>
+      <div class="action-line">
+        <span class={testTone}>{testState}</span>
+        <button type="button" onClick={props.onRunSelfTest} disabled={testRunning || props.selfTestPending}>
+          Run Self Test
+        </button>
+      </div>
+      {testReport ? (
+        <div class="test-summary-line">
+          <span>{formatNumber(testReport.passed)} passed</span>
+          <span>{formatNumber(testFailures)} failed</span>
+          <span>{formatNumber(testReport.skipped)} skipped</span>
+          <span>{testReport.duration || "0s"}</span>
+        </div>
+      ) : null}
       {suspicious.map((ip) => (
         <div class="dense-row risk-row" key={ip.name}>
           <button class="dense-row-main" type="button" onClick={() => props.onInspectActor("ip", ip.name)}>
@@ -3427,6 +3629,7 @@ function EventSummary({ event }: { event: EventRow }) {
     <div class="event-card">
       <div class="event-card-head">
         <SourcePill source={sourceFor(event)} />
+        <MaintainerPill event={event} />
         <span class={statusClass(event)}>{statusFor(event)}</span>
       </div>
       <dl class="metadata">
@@ -3439,6 +3642,9 @@ function EventSummary({ event }: { event: EventRow }) {
         <Meta label="IP" value={event.ip} />
         <Meta label="Hosts" value={metaString(event, ["hosts", "hostnames", "hostname"])} />
         <Meta label="Geo" value={geoLabel(event.geo)} />
+        <Meta label="Actor Role" value={isMaintainerEvent(event) ? "maintainer" : ""} />
+        <Meta label="Maintainer Scope" value={maintainerScopeForEvent(event)} />
+        <Meta label="Target Scope" value={metaString(event, ["maintainer_target_scope"])} />
         <Meta label="Session" value={session} />
         <Meta label="Error" value={error} />
       </dl>
@@ -4422,6 +4628,7 @@ function activityProfile(rows: EventRow[]) {
     transfer: rows.filter(isTransferEvent).length,
     mutating: rows.filter(isMutatingEvent).length,
     session: rows.filter(isSessionEvent).length,
+    maintainer: rows.filter(isMaintainerEvent).length,
     exec: rows.filter(isExecEvent).length
   };
 }
@@ -4438,6 +4645,8 @@ function matchesActivityKind(row: EventRow, kind: ActivityKind): boolean {
       return isMutatingEvent(row);
     case "session":
       return isSessionEvent(row);
+    case "maintainer":
+      return isMaintainerEvent(row);
     case "exec":
       return isExecEvent(row);
     case "all":
@@ -4495,6 +4704,17 @@ function isExecEvent(row: EventRow): boolean {
 function isAdminEvent(row: EventRow): boolean {
   const name = (row.event || "").toLowerCase();
   return name.startsWith("admin/") || sourceFor(row) === "admin";
+}
+
+function isMaintainerEvent(row: EventRow): boolean {
+  const role = metaString(row, ["actor_role"]).toLowerCase();
+  const maintainer = metaString(row, ["maintainer"]).toLowerCase();
+  const action = metaString(row, ["action", "operation"]).toLowerCase();
+  return role === "maintainer" || maintainer === "true" || action.includes("maintainers");
+}
+
+function maintainerScopeForEvent(row: EventRow): string {
+  return metaString(row, ["maintainer_scope"]);
 }
 
 function sessionNodeClass(row: EventRow): string {
@@ -5237,6 +5457,7 @@ function geoActivityCounts(points: GeoActivityPoint[]): Record<GeoActivityOverla
     exec: 0,
     mutations: 0,
     admin: 0,
+    maintainers: 0,
     denied: 0,
     auth: 0,
     flagged: 0,
@@ -5258,6 +5479,7 @@ function geoActivityOverlayState(active: GeoActivityOverlay[]): Record<GeoActivi
     exec: selected.has("exec"),
     mutations: selected.has("mutations"),
     admin: selected.has("admin"),
+    maintainers: selected.has("maintainers"),
     denied: selected.has("denied"),
     auth: selected.has("auth"),
     flagged: selected.has("flagged"),
@@ -5402,6 +5624,9 @@ function geoActivityModel(
     if (isAdminEvent(row)) {
       addEvent("admin", row);
     }
+    if (isMaintainerEvent(row)) {
+      addEvent("maintainers", row);
+    }
     if (isDeniedEvent(row)) {
       addEvent("denied", row);
     }
@@ -5492,7 +5717,8 @@ function geoActivityLivePoint(
 }
 
 function geoActivityEventLabel(event: EventRow): string {
-  return [event.event || "event", basename(cleanPath(event.path)) || eventCommand(event)].filter(Boolean).join(" ");
+  const scope = maintainerScopeForEvent(event);
+  return [event.event || "event", basename(cleanPath(event.path)) || eventCommand(event), scope ? `scope ${scope}` : ""].filter(Boolean).join(" ");
 }
 
 function matchesLiveSource(row: Record<string, unknown>, sourceFilter: SourceFilter): boolean {
@@ -5557,6 +5783,7 @@ function geoActivityCoordinate(point: GeoActivityPoint): [number, number] {
     exec: [-1.3, -0.7],
     mutations: [1.35, -1.05],
     admin: [-1.35, -1.05],
+    maintainers: [0, -1.45],
     denied: [0.8, -1.1],
     auth: [-0.85, 1.2],
     flagged: [1.55, -0.1],
@@ -5580,6 +5807,8 @@ function geoActivityColor(overlay: GeoActivityOverlay): { color: string; wash: s
       return { color: "#fb923c", wash: "rgba(251, 146, 60, 0.18)" };
     case "admin":
       return { color: "#e879f9", wash: "rgba(232, 121, 249, 0.18)" };
+    case "maintainers":
+      return { color: "#facc15", wash: "rgba(250, 204, 21, 0.18)" };
     case "denied":
       return { color: "#fb7185", wash: "rgba(251, 113, 133, 0.18)" };
     case "auth":

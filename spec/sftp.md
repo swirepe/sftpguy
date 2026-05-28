@@ -89,7 +89,7 @@ The SFTP surface is primarily shaped by these flags and env vars:
 - `-dir.rate`: global mkdir rate limit
 - `-dir.max`: maximum tracked directory count
 - `-maxsize`: per-file size ceiling, `0` means unlimited
-- `-blacklist`, `-whitelist`, `-admin.keys`, `-bad`, `-caid.db`: anti-abuse and moderation support files
+- `-blacklist`, `-whitelist`, `-admin.keys`, `-maintainers`, `-bad`, `-caid.db`: anti-abuse, maintainer, and moderation support files
 - `-test` and `-test.continue`: startup self-test modes
 
 Admin web flags exist alongside the SFTP service but are covered separately in [spec/admin.md](admin.md) and [spec/web/admin.md](web/admin.md).
@@ -223,6 +223,7 @@ Configured unrestricted paths can be exact files, exact directories, or any pare
 Read access is allowed when any of the following is true:
 
 - the session is admin
+- the session key has any scoped maintainer grant
 - the path is unrestricted
 - the user has uploaded at least the contributor threshold
 
@@ -233,6 +234,7 @@ Otherwise file reads are denied with a contributor-lock message.
 Write, delete, and rename access is allowed when:
 
 - the session is admin
+- the target path is covered by a scoped maintainer grant for the session key
 - the target path does not yet exist
 - the existing path is owned by the same user
 
@@ -241,6 +243,10 @@ Write and modify access is denied when:
 - the existing path is system-owned and the session is not admin
 - the existing path is owned by another user
 - directory-owner locking is enabled and the parent directory belongs to another non-system user
+
+Scoped maintainer grants bypass those ownership denials only within the granted subtree.
+When a maintainer renames a file they do not own, both the source and destination must
+be covered by a scoped maintainer grant.
 
 ### Directory creation limits
 
