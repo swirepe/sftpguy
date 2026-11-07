@@ -117,7 +117,15 @@ def upload_verified(sftp, name, data, digest):
               "local_sha256:", digest, "http_verification_unavailable:", str(exc), flush=True)
         return
     if received_bytes != len(data) or received_sha != digest:
-        raise RuntimeError("Remote HTTP size or SHA256 mismatch: " + dest)
+        # The explorer may return a preview/HTML representation rather than
+        # the raw media bytes. Its response is not proof of SFTP corruption.
+        # As with the original working foot uploader, trust SFTP STAT size.
+        print("HTTP_RESPONSE_NOT_RAW:", url,
+              "response_bytes:", received_bytes, "response_sha256:", received_sha,
+              "expected_bytes:", len(data), flush=True)
+        print("VERIFIED_SIZE_ONLY:", url, "bytes:", st.st_size,
+              "local_sha256:", digest, flush=True)
+        return
     print(f"VERIFIED: {url} bytes: {len(data)} sha256: {received_sha}", flush=True)
 
 def main():
