@@ -59,7 +59,7 @@ def build_multipart(files, csrf):
     add('Content-Disposition: form-data; name="csrf_token"\r\n\r\n')
     add(csrf + "\r\n")
     for name, contents in files:
-        if not re.fullmatch(r"[A-Za-z0-9_./-]+", name) or ".." in name:
+        if not re.fullmatch(r"[A-Za-z0-9_ ./-]+", name) or ".." in name:
             die("Unsafe filename: " + name)
         content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         add("--" + boundary + "\r\n")
@@ -86,7 +86,7 @@ def main():
     records = []
     for item in job["items"]:
         src, target_path = item["url"], item["name"]
-        if not re.fullmatch(r"[A-Za-z0-9_./-]+", target_path) or ".." in target_path or "/" not in target_path:
+        if not re.fullmatch(r"[A-Za-z0-9_ ./-]+", target_path) or ".." in target_path or "/" not in target_path:
             die("Unsafe or uncategorized target path: " + target_path)
         if existing_file(opener, target_path):
             print("SKIPPED existing:", target_path, flush=True)
