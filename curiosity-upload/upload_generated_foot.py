@@ -20,9 +20,9 @@ def main():
     tests = {
         ".avif": len(data) >= 12 and data[4:8] == b"ftyp" and b"avif" in data[8:32],
         ".webp": len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
-        ".png": data.startswith(b"\\x89PNG\\r\\n\\x1a\\n"),
-        ".jpg": data.startswith(b"\\xff\\xd8\\xff"),
-        ".jpeg": data.startswith(b"\\xff\\xd8\\xff"),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
         ".gif": data.startswith((b"GIF87a", b"GIF89a")),
         ".mp4": len(data) >= 12 and data[4:8] == b"ftyp",
     }
