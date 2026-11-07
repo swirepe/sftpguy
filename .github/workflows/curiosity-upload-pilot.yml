@@ -61,7 +61,7 @@ jobs:
           set -euo pipefail
           mapfile -t manifests < <(
             git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
-            grep -E '^curiosity-upload/convention-manifest-[A-Za-z0-9_-]+\.json || true
+            grep -E '^curiosity-upload/convention-manifest-[A-Za-z0-9_-]+\.json$' || true
           )
           if (("${#manifests[@]}" > 0)); then
             python -m pip install --quiet Pillow
@@ -70,3 +70,19 @@ jobs:
             done
           fi
           echo "Processed ${#manifests[@]} new convention release manifest(s)."
+
+      - name: Upload native convention media directly (no fake GIFs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t media < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/convention-media/[^/]+\.(png|gif)\.b64$' || true
+          )
+          if (("${#media[@]}" > 0)); then
+            python -m pip install --quiet Pillow
+            for media_file in "${media[@]}"; do
+              python3 curiosity-upload/upload_native_convention.py "$media_file"
+            done
+          fi
+          echo "Processed ${#media[@]} native convention media file(s)."
