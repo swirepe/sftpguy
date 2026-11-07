@@ -76,10 +76,7 @@ def main():
         die("Usage: uploader.py manifest.json")
     with open(sys.argv[1], encoding="utf-8") as f:
         job = json.load(f)
-    collection = job["collection"]
     day = job["date"]
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", collection):
-        die("Invalid collection")
     if not re.fullmatch(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}", day):
         die("Invalid date")
 
@@ -88,7 +85,8 @@ def main():
     opener.cookiejar = jar
     records = []
     for item in job["items"]:
-        src, target_path = item["url"], item["name"]
+        src = item["url"]
+        target_path = item["name"]
         # Every name is a complete destination relative to the archive root.
         # There is no date-based collection folder.
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", target_path) or ".." in target_path or "/" not in target_path:
@@ -110,7 +108,7 @@ def main():
     # Keep an audit trail without making an isolated date-based collection.
     # Metadata is stored under a clearly named archive-wide index folder.
     report = {**job, "items": records, "uploaded_by": "GitHub Actions curiosity pilot"}
-    manifest_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + "\\n").encode("utf-8")
+    manifest_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + chr(10)).encode("utf-8")
     upload_one(opener, "Archive-Manifests/curiosity-" + day + ".json", manifest_bytes)
     print("SUCCESS: category-integrated files verified.", flush=True)
 
