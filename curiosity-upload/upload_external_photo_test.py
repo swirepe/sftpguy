@@ -25,7 +25,7 @@ VALID_FOLDERS = {
     "if these artificial women can remember to eat, you can too",
     "if these artificial women can remember to do drugs, you can too",
 }
-VALID_NAME = re.compile(r"20\\d{2}-\\d{2}-\\d{2}_[a-z0-9_-]+\\.(png|jpg|jpeg|webp|gif)\\Z")
+VALID_NAME = re.compile(r"20\d{2}-\d{2}-\d{2}_[a-z0-9_-]+\.(png|jpg|jpeg|webp|gif)\Z")
 MAX = 32_000_000
 
 def fetch(url):
