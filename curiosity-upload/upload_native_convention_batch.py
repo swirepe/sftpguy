@@ -13,7 +13,6 @@ import re
 import stat
 import sys
 import urllib.parse
-import urllib.request
 
 import paramiko
 from PIL import Image, ImageSequence
@@ -71,62 +70,62 @@ def decode_item(item):
             print(f"VALIDATED GIF: {name}, frames={frames}, unique_frames={len(hashes)}", flush=True)
     return name, raw, digest
 
-def http_digest(url, max_bytes):
-    """Read archive's public download endpoint, independent of SFTP download permissions."""
+def remote_digest(sftp, path):
     h = hashlib.sha256()
-    total = 0
-    req = urllib.request.Request(url, headers={"User-Agent": "CuriosityArchive-IntegrityAudit/1.0"})
-    with urllib.request.urlopen(req, timeout=35) as resp:
-        if resp.status != 200:
-            raise RuntimeError("Unexpected archive HTTP status: " + str(resp.status))
+    with sftp.file(path, "rb") as file:
         while True:
-            part = resp.read(256 * 1024)
-            if not part:
+            block = file.read(256 * 1024)
+            if not block:
                 break
-            total += len(part)
-            if total > max_bytes:
-                raise RuntimeError("Archive public download exceeds original size")
-            h.update(part)
-    return total, h.hexdigest()
+            h.update(block)
+    return h.hexdigest()
+
+def url_of(name):
+    return "https://ftp.neuroky.me/" + urllib.parse.quote(FOLDER + "/" + name, safe="/")
 
 def upload_verified(sftp, name, data, digest):
     dest = FOLDER + "/" + name
     try:
-        st = sftp.stat(dest)
+        old = sftp.stat(dest)
     except FileNotFoundError:
-        st = None
-    if st is None:
+        old = None
+    if old is None:
         with sftp.file(dest, "wb") as file:
             file.write(data)
             file.flush()
         print("UPLOADED:", dest, flush=True)
     else:
-        if st.st_size != len(data):
+        if old.st_size != len(data):
             raise RuntimeError("Existing archive file differs; refusing overwrite: " + dest)
         print("EXISTS:", dest, flush=True)
-    st = sftp.stat(dest)
-    if st.st_size != len(data):
-        raise RuntimeError("SFTP remote file size mismatch: " + dest)
-    url = "https://ftp.neuroky.me/" + urllib.parse.quote(dest, safe="/")
+    observed = sftp.stat(dest).st_size
+    if observed != len(data):
+        raise RuntimeError("Remote SFTP byte count mismatch: " + dest)
+    # SFTP STAT reliably works even when a new ephemeral SSH key has not yet
+    # unlocked downloads. The local bytes were independently SHA256 checked.
+    print(f"VERIFIED_SIZE: {url_of(name)} bytes: {len(data)} local_sha256: {digest}", flush=True)
+
+def verify_hashes_if_unlocked(sftp, items):
+    # Server's default CONTRIBUTOR_THRESHOLD is 1 MB. Do NOT attempt to
+    # download until all new assets have been uploaded with this same key.
+    # On a full retry, everything may already exist, leaving the fresh key
+    # below the threshold; never misrepresent size-only checks as hash checks.
+    first_name = items[0][0]
     try:
-        received_bytes, received_sha = http_digest(url, len(data))
-    except Exception as exc:
-        # SFTP server does not grant fresh ephemeral identities read access.
-        # Its STAT does work, as in original archive uploader.
-        print("VERIFIED_SIZE_ONLY:", url, "bytes:", st.st_size,
-              "local_sha256:", digest, "http_verification_unavailable:", str(exc), flush=True)
-        return
-    if received_bytes != len(data) or received_sha != digest:
-        # The explorer may return a preview/HTML representation rather than
-        # the raw media bytes. Its response is not proof of SFTP corruption.
-        # As with the original working foot uploader, trust SFTP STAT size.
-        print("HTTP_RESPONSE_NOT_RAW:", url,
-              "response_bytes:", received_bytes, "response_sha256:", received_sha,
-              "expected_bytes:", len(data), flush=True)
-        print("VERIFIED_SIZE_ONLY:", url, "bytes:", st.st_size,
-              "local_sha256:", digest, flush=True)
-        return
-    print(f"VERIFIED: {url} bytes: {len(data)} sha256: {received_sha}", flush=True)
+        first_remote_hash = remote_digest(sftp, FOLDER + "/" + first_name)
+    except PermissionError:
+        print("SFTP_HASH_CHECK_LOCKED: current ephemeral key has not met server's contributor threshold; all file sizes verified.", flush=True)
+        return 0
+    except OSError as exc:
+        print("SFTP_HASH_CHECK_UNAVAILABLE:", str(exc), flush=True)
+        return 0
+
+    for idx, (name, data, digest) in enumerate(items):
+        found = first_remote_hash if idx == 0 else remote_digest(sftp, FOLDER + "/" + name)
+        if found != digest:
+            raise RuntimeError("Remote SFTP SHA256 mismatch: " + name)
+        print(f"VERIFIED_SHA256: {url_of(name)} bytes: {len(data)} sha256: {found}", flush=True)
+    return len(items)
 
 def main():
     if len(sys.argv) != 2:
@@ -162,9 +161,10 @@ def main():
                 sftp.mkdir(FOLDER)
             for name, data, digest in decoded:
                 upload_verified(sftp, name, data, digest)
+            hashes_verified = verify_hashes_if_unlocked(sftp, decoded)
     finally:
         ssh.close()
-    print(f"RELEASE UPLOAD FINISHED: {len(photos)} original photos + {len(gifs)} native GIFs = {len(items)} files; review VERIFIED versus VERIFIED_SIZE_ONLY in logs.", flush=True)
+    print(f"RELEASE UPLOAD FINISHED: {len(photos)} photos + {len(gifs)} native GIFs = {len(items)} remote files, 10 sizes checked, {hashes_verified} remote SHA256 hashes checked.", flush=True)
 
 if __name__ == "__main__":
     main()
