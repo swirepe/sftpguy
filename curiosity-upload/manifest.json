@@ -1,37 +1,45 @@
 {
   "date": "2026-11-07",
-  "purpose": "Pilot: place discoveries in subject-oriented archive directories, not a dated collection folder.",
+  "purpose": "Curiosity archival pilot: integrate unusual redistributable artifacts into existing top-level topical directories; no daily folders.",
   "items": [
     {
-      "name": "PDF/Straight-Line-Engineering-Diagrams-1911.pdf",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/e/ee/Straight_line_engineering_diagrams_%28IA_straightlineengi00mani%29.pdf",
+      "name": "Engineering/Straight-Line-Engineering-Diagrams-1911.pdf",
+      "url": "https://archive.org/download/straightlineengi00mani/straightlineengi00mani.pdf",
       "page": "https://commons.wikimedia.org/wiki/File:Straight_line_engineering_diagrams_(IA_straightlineengi00mani).pdf",
       "creator": "Manifold & Poole",
-      "license": "Public domain (US; 1911 publication)",
-      "description": "An obscure 104-page illustrated San Francisco technical publication collecting straight-line mechanisms and linkage diagrams.",
+      "license": "Public domain US",
+      "description": "104 pages of historical precision straight-line engineering diagrams (1911).",
       "signature": "%PDF",
       "max_bytes": 12000000
     },
     {
-      "name": "Historical-Recordings/Alexander-Graham-Bell-Voice-1885.ogg",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/4/47/Alexander_Graham_Bell_speaking.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Alexander_Graham_Bell_speaking.ogg",
-      "creator": "Alexander Graham Bell",
-      "license": "Public domain (US)",
-      "description": "A short recovered 1885 sound recording of Alexander Graham Bell's voice.",
+      "name": "Recordings/Big-Ben-1890-Phonograph.ogg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Big_Ben_recorded_in_1890.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Big_Ben_recorded_in_1890.ogg",
+      "creator": "Miss Ferguson and Graham Hope",
+      "license": "Public domain",
+      "description": "A July 16 1890 phonograph recording of Big Ben, a remarkable early sonic document.",
       "signature": "OggS",
-      "sha1": "0c2a815ecdf854422bef41f1f27a8d30f9a2f079",
-      "max_bytes": 2000000
+      "max_bytes": 5000000
     },
     {
-      "name": "Scientific-3D-Models/Chronokinematograph-Eclipse-Camera.stl",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/d/d5/Chronokinematograph.stl",
-      "page": "https://commons.wikimedia.org/wiki/File:Chronokinematograph.stl",
-      "creator": "RDW MIC / Virtual Małopolska",
+      "name": "Recordings/Edison-Talking-Doll-Jack-and-Jill-1890.ogg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Jack_and_Jill_(1890).ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Jack_and_Jill_(1890).ogg",
+      "creator": "Unknown performer; Edison Talking Doll recording",
+      "license": "Public domain US",
+      "description": "A rare surviving c. 1890 recording made for an Edison Talking Doll.",
+      "signature": "OggS",
+      "max_bytes": 1000000
+    },
+    {
+      "name": "Scientific-3D/Apollo-11-Hatch-Ratchet-Gear.stl",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Key_-_Ratchet_Gear_v2_(Hatch,_Crew,_Apollo_11_by_NASA_and_Smithsonian_Institution).stl",
+      "page": "https://commons.wikimedia.org/wiki/File:Key_-_Ratchet_Gear_v2_(Hatch,_Crew,_Apollo_11_by_NASA_and_Smithsonian_Institution).stl",
+      "creator": "NASA Johnson Space Center / Smithsonian Institution",
       "license": "CC0",
-      "description": "A rare 3D scan of a precision eclipse-photography timing instrument.",
-      "sha1": "2450bb67d523dedfddce29e14eb247c9cfe27860",
-      "max_bytes": 20000000
+      "description": "NASA/Smithsonian digitization of a ratchet gear from the Apollo 11 crew hatch.",
+      "max_bytes": 1000000
     }
   ]
 }
