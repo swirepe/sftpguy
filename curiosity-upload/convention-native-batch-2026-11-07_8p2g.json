@@ -78,5 +78,6 @@
       "bytes": 794693,
       "frames": 6
     }
-  ]
+  ],
+  "recovery_note": "Retry after ordering uploads before SFTP read verification (download access requires a prior upload with the session key)."
 }
