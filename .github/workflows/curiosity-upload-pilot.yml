@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: curiosity-upload-pilot
+  group: curiosity-upload-pilot-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -55,22 +55,6 @@ jobs:
           done
           echo "Finished processing ${#files[@]} staged generated-media file(s)."
 
-      - name: Upload new convention fundraiser release manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t manifests < <(
-            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
-            grep -E '^curiosity-upload/convention-manifest-[A-Za-z0-9_-]+\.json$' || true
-          )
-          if (("${#manifests[@]}" > 0)); then
-            python -m pip install --quiet Pillow
-            for manifest in "${manifests[@]}"; do
-              python3 curiosity-upload/upload_convention_release.py "$manifest"
-            done
-          fi
-          echo "Processed ${#manifests[@]} new convention release manifest(s)."
-
       - name: Upload native convention media directly (no fake GIFs)
         shell: bash
         run: |
@@ -86,3 +70,24 @@ jobs:
             done
           fi
           echo "Processed ${#media[@]} native convention media file(s)."
+
+      - name: Upload and verify complete native convention release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t batch_manifests < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/convention-native-batch-[a-zA-Z0-9_-]+\.json$' || true
+          )
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            mapfile -t batch_manifests < <(
+              find curiosity-upload -maxdepth 1 -name 'convention-native-batch-*.json' | sort
+            )
+          fi
+          if (("${#batch_manifests[@]}" > 0)); then
+            python -m pip install --quiet Pillow
+            for batch_manifest in "${batch_manifests[@]}"; do
+              python3 curiosity-upload/upload_native_convention_batch.py "$batch_manifest"
+            done
+          fi
+          echo "Processed ${#batch_manifests[@]} complete native convention release batch(es)."
