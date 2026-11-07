@@ -15,7 +15,7 @@ def main():
     folder = "do androids dream of erotic feet?"
     if not destination.startswith(folder + "/"):
         raise RuntimeError("Unexpected archive destination: " + destination)
-    data = base64.b64decode(pathlib.Path(b64_path).read_text().strip(), validate=True)
+    data = base64.b64decode("".join(pathlib.Path(b64_path).read_text().split()), validate=True)
     ext = pathlib.Path(destination).suffix.lower()
     tests = {
         ".avif": len(data) >= 12 and data[4:8] == b"ftyp" and b"avif" in data[8:32],
