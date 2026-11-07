@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "folder": "ai macromastia convention and fundraiser",
+  "release_id": "2026-11-07-native-8photos-2gifs",
+  "photos": [
+    {
+      "name": "2026-11-07_01_welcome_registration.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_01_welcome_registration.png.b64",
+      "sha256": "864961311c17533f3397a23c8c2f84ca1b14a8715f7c737446fc1c1d5cb8b3f5",
+      "bytes": 214314
+    },
+    {
+      "name": "2026-11-07_02_attendee_networking.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_02_attendee_networking.png.b64",
+      "sha256": "3d75adf830c310ab4323175dc8cba0df5a9f57efb0bda89148a6085d1d726d2e",
+      "bytes": 228486
+    },
+    {
+      "name": "2026-11-07_03_benefit_luncheon.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_03_benefit_luncheon.png.b64",
+      "sha256": "823c7c3bdcd527c394dbc1c30319cc54686f4b3bc8d6ca1e459f6da88335bec4",
+      "bytes": 223892
+    },
+    {
+      "name": "2026-11-07_04_discussion_panel.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_04_discussion_panel.png.b64",
+      "sha256": "6584686c7289aac3baed3c91d7ef6bcdb2f66892adc39128bfddecda9ba44105",
+      "bytes": 215389
+    },
+    {
+      "name": "2026-11-07_05_secretary_service_charity_auction.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_05_secretary_service_charity_auction.png.b64",
+      "sha256": "2968221596712a5db3b0bf80519df684644bfbc24860d9f039ee0d022e1da48a",
+      "bytes": 176938
+    },
+    {
+      "name": "2026-11-07_06_beach_group_portrait.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_06_beach_group_portrait.png.b64",
+      "sha256": "681b8d3b7e9b01aa3b656754c53043666d78373ddecad64d747923ab1718e989",
+      "bytes": 202870
+    },
+    {
+      "name": "2026-11-07_07_beach_relaxation.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_07_beach_relaxation.png.b64",
+      "sha256": "047eeed5de6c437914aef0005cbecfa2f20f1586ab9c573d8cf1347d0f19ab51",
+      "bytes": 191653
+    },
+    {
+      "name": "2026-11-07_08_after_party.png",
+      "source": "curiosity-upload/convention-media/2026-11-07_08_after_party.png.b64",
+      "sha256": "4ef66b43d18077bd3f6b2760284e0cdfa727e34395b412d6bac813f6b88b2bc9",
+      "bytes": 207446
+    }
+  ],
+  "gifs": [
+    {
+      "name": "2026-11-07_native_charity_luncheon_toast.gif",
+      "parts": [
+        "staging-convention-parts/2026-11-07_native_charity_luncheon_toast.gif.b64.part01",
+        "staging-convention-parts/2026-11-07_native_charity_luncheon_toast.gif.b64.part02",
+        "staging-convention-parts/2026-11-07_native_charity_luncheon_toast.gif.b64.part03",
+        "staging-convention-parts/2026-11-07_native_charity_luncheon_toast.gif.b64.part04",
+        "staging-convention-parts/2026-11-07_native_charity_luncheon_toast.gif.b64.part05"
+      ],
+      "sha256": "6db93300c16af2670e70c79f30001b425cb9fffdb67ae8ae48bb08f829a976fa",
+      "bytes": 880920,
+      "frames": 6
+    },
+    {
+      "name": "2026-11-07_native_charity_auction_volunteer_wave.gif",
+      "parts": [
+        "staging-convention-parts/2026-11-07_native_charity_auction_volunteer_wave.gif.b64.part01",
+        "staging-convention-parts/2026-11-07_native_charity_auction_volunteer_wave.gif.b64.part02",
+        "staging-convention-parts/2026-11-07_native_charity_auction_volunteer_wave.gif.b64.part03",
+        "staging-convention-parts/2026-11-07_native_charity_auction_volunteer_wave.gif.b64.part04"
+      ],
+      "sha256": "4924c8d577b37df674cc6abcc531597542f83f5c8ec387248aaa7b97cf7ce761",
+      "bytes": 794693,
+      "frames": 6
+    }
+  ]
+}
