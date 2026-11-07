@@ -79,5 +79,5 @@
       "frames": 6
     }
   ],
-  "recovery_note": "Re-verify 8 existing native photos and 2 six-frame native GIFs. Treat the explorer's HTTP preview separately from raw SFTP file bytes; verify all 10 SFTP stat sizes."
+  "recovery_note": "Final regression: two-stage SFTP size verification then optional SHA256 after >=1 MB uploaded under same ephemeral key. Existing media must not be overwritten."
 }
