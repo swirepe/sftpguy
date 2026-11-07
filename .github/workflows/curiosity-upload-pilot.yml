@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           if git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -Fq '.github/workflows/curiosity-upload-pilot.yml'; then
-            # Repair pass: send all previously staged media, skipping archive files that already exist.
+            # Recovery pass: check all staged media after verifying broken redirects.
             mapfile -t files < <(find curiosity-upload/generated-media -maxdepth 1 -type f -name '*.b64' | sort)
           else
             mapfile -t files < <(
