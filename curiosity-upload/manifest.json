@@ -1,0 +1,38 @@
+{
+  "date": "2026-11-07",
+  "collection": "Daily-Curiosity-Finds",
+  "purpose": "Pilot: verify automated download and HTTP multipart upload into the public sftpguy explorer.",
+  "items": [
+    {
+      "name": "Engineering/Straight-Line-Engineering-Diagrams-1911.pdf",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/e/ee/Straight_line_engineering_diagrams_%28IA_straightlineengi00mani%29.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:Straight_line_engineering_diagrams_(IA_straightlineengi00mani).pdf",
+      "creator": "Manifold & Poole",
+      "license": "Public domain (US; 1911 publication)",
+      "description": "An obscure 104-page illustrated San Francisco technical publication collecting straight-line mechanisms and linkage diagrams.",
+      "signature": "%PDF",
+      "max_bytes": 12000000
+    },
+    {
+      "name": "Recordings/Alexander-Graham-Bell-Voice-1885.ogg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/4/47/Alexander_Graham_Bell_speaking.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Alexander_Graham_Bell_speaking.ogg",
+      "creator": "Alexander Graham Bell",
+      "license": "Public domain (US)",
+      "description": "A short recovered 1885 sound recording of Alexander Graham Bell's voice.",
+      "signature": "OggS",
+      "sha1": "0c2a815ecdf854422bef41f1f27a8d30f9a2f079",
+      "max_bytes": 2000000
+    },
+    {
+      "name": "Scientific-3D/Chronokinematograph-Eclipse-Camera.stl",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/d/d5/Chronokinematograph.stl",
+      "page": "https://commons.wikimedia.org/wiki/File:Chronokinematograph.stl",
+      "creator": "RDW MIC / Virtual Małopolska",
+      "license": "CC0",
+      "description": "A rare 3D scan of a precision eclipse-photography timing instrument.",
+      "sha1": "2450bb67d523dedfddce29e14eb247c9cfe27860",
+      "max_bytes": 20000000
+    }
+  ]
+}
