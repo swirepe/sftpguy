@@ -85,65 +85,83 @@ def main():
 
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    base_exists = existing(opener, collection)
-    if base_exists and existing(opener, collection + "/" + day):
-        die("Dated archive directory already exists. Refusing to create a duplicate.")
-
+    opener.cookiejar = jar
     records = []
-    contents = []
     for item in job["items"]:
-        src, relative = item["url"], item["name"]
+        src, target_path = item["url"], item["name"]
+        # Every name is a complete destination relative to the archive root.
+        # There is no date-based collection folder.
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", target_path) or ".." in target_path or "/" not in target_path:
+            die("Unsafe or uncategorized target path: " + target_path)
+        if existing_file(opener, target_path):
+            print("SKIPPED existing:", target_path, flush=True)
+            continue
         print("Downloading:", src, flush=True)
         data = get_bytes(opener, src, min(item.get("max_bytes", LIMIT), LIMIT))
         if item.get("signature") and not data.startswith(item["signature"].encode("ascii")):
-            die("Unexpected file signature for " + relative)
+            die("Unexpected file signature for " + target_path)
         sha1 = hashlib.sha1(data).hexdigest()
         if item.get("sha1") and item["sha1"].lower() != sha1:
-            die("Upstream SHA-1 mismatch: " + relative)
-        records.append({**item, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-        contents.append((relative, data))
+            die("Upstream SHA-1 mismatch: " + target_path)
+        recorded = {**item, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        records.append(recorded)
+        upload_one(opener, target_path, data)
 
+    # Keep an audit trail without making an isolated date-based collection.
+    # Metadata is stored under a clearly named archive-wide index folder.
     report = {**job, "items": records, "uploaded_by": "GitHub Actions curiosity pilot"}
-    manifest_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    contents.append(("manifest.json", manifest_bytes))
+    manifest_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + "\\n").encode("utf-8")
+    upload_one(opener, "Archive-Manifests/curiosity-" + day + ".json", manifest_bytes)
+    print("SUCCESS: category-integrated files verified.", flush=True)
 
-    # Acquire same-origin CSRF cookie from the explorer before posting.
-    target = BASE + ("/" + urllib.parse.quote(collection, safe="") + "/" if base_exists else "/")
-    with opener.open(urllib.request.Request(target, headers={"User-Agent": UA}), timeout=35) as resp:
+
+def existing_file(opener, path):
+    url = BASE + "/" + urllib.parse.quote(path.strip("/"), safe="/")
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+    try:
+        with opener.open(req, timeout=30) as response:
+            return response.status == 200
+    except urllib.error.HTTPError as err:
+        if err.code == 404:
+            return False
+        raise
+
+
+def upload_one(opener, dest, contents):
+    parts = dest.strip("/").split("/")
+    # The explorer creates the FIRST multipart path component as a new folder
+    # even if it already exists; POST directly into the longest existing parent.
+    prefix_length = 0
+    for i in range(1, len(parts)):
+        if existing(opener, "/".join(parts[:i])):
+            prefix_length = i
+        else:
+            break
+    parent = "/".join(parts[:prefix_length])
+    filename = "/".join(parts[prefix_length:])
+    url = BASE + ("/" + urllib.parse.quote(parent, safe="/") + "/" if parent else "/")
+    with opener.open(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=35) as resp:
         resp.read(250000)
-    csrf = next((c.value for c in jar if c.name == "explorer_csrf"), None)
+    csrf = next((c.value for c in opener.cookiejar if c.name == "explorer_csrf"), None)
     if not csrf:
         die("Explorer did not provide a CSRF cookie")
-    sub = day + "/" if base_exists else collection + "/" + day + "/"
-    payload = [(sub + name, data) for name, data in contents]
-    boundary, body = build_multipart(payload, csrf)
-    req = urllib.request.Request(
-        target, data=body, method="POST",
-        headers={
-            "User-Agent": UA,
-            "X-CSRF-Token": csrf,
-            "Content-Type": "multipart/form-data; boundary=" + boundary,
-        },
-    )
-    print("Uploading", len(payload), "files to", target, "(bytes:", len(body), ")", flush=True)
+    boundary, body = build_multipart([(filename, contents)], csrf)
+    req = urllib.request.Request(url, data=body, method="POST",
+        headers={"User-Agent": UA, "X-CSRF-Token": csrf,
+            "Content-Type": "multipart/form-data; boundary=" + boundary})
+    print("Uploading:", dest, "via", url, flush=True)
     with opener.open(req, timeout=180) as response:
-        print("Upload HTTP status:", response.status, flush=True)
         if response.status not in (200, 201, 204):
-            die("Unexpected upload response")
-
-    # Check the exact expected paths. No success without remote verification.
-    for relative, data in contents:
-        name = collection + "/" + day + "/" + relative
-        url = BASE + "/" + urllib.parse.quote(name, safe="/")
-        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
-        with opener.open(req, timeout=40) as resp:
-            if resp.status != 200:
-                die("Verification HEAD failed: " + url)
-            size = resp.headers.get("Content-Length")
-            if size is not None and int(size) != len(data):
-                die("Verification size mismatch for " + url + ": " + size)
-        print("VERIFIED:", url, "(", len(data), "bytes )", flush=True)
-    print("SUCCESS: all remote files verified.", flush=True)
+            die("Unexpected upload HTTP status: " + str(response.status))
+    target_url = BASE + "/" + urllib.parse.quote(dest, safe="/")
+    with opener.open(urllib.request.Request(target_url, method="HEAD",
+        headers={"User-Agent": UA}), timeout=40) as resp:
+        if resp.status != 200:
+            die("Remote verification failed: " + target_url)
+        size = resp.headers.get("Content-Length")
+        if size is not None and int(size) != len(contents):
+            die("Remote byte count mismatch: " + target_url)
+    print("VERIFIED:", target_url, "bytes:", len(contents), flush=True)
 
 
 if __name__ == "__main__":
