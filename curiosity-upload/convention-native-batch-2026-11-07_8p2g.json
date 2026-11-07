@@ -79,5 +79,5 @@
       "frames": 6
     }
   ],
-  "recovery_note": "Use HTTPS SHA256 verification because SFTP server denies reads for ephemeral upload identities; SFTP STAT remains available."
+  "recovery_note": "Re-verify 8 existing native photos and 2 six-frame native GIFs. Treat the explorer's HTTP preview separately from raw SFTP file bytes; verify all 10 SFTP stat sizes."
 }
