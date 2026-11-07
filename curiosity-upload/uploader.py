@@ -85,14 +85,12 @@ def main():
     opener.cookiejar = jar
     records = []
     for item in job["items"]:
-        src = item["url"]
-        target_path = item["name"]
-        # Every name is a complete destination relative to the archive root.
-        # There is no date-based collection folder.
+        src, target_path = item["url"], item["name"]
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", target_path) or ".." in target_path or "/" not in target_path:
             die("Unsafe or uncategorized target path: " + target_path)
         if existing_file(opener, target_path):
             print("SKIPPED existing:", target_path, flush=True)
+            records.append({**item, "remote_path": target_path, "status": "already_present"})
             continue
         print("Downloading:", src, flush=True)
         data = get_bytes(opener, src, min(item.get("max_bytes", LIMIT), LIMIT))
@@ -101,16 +99,25 @@ def main():
         sha1 = hashlib.sha1(data).hexdigest()
         if item.get("sha1") and item["sha1"].lower() != sha1:
             die("Upstream SHA-1 mismatch: " + target_path)
-        recorded = {**item, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-        records.append(recorded)
+        recorded = {**item, "remote_path": target_path, "status": "uploaded",
+                    "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         upload_one(opener, target_path, data)
+        records.append(recorded)
 
-    # Keep an audit trail without making an isolated date-based collection.
-    # Metadata is stored under a clearly named archive-wide index folder.
-    report = {**job, "items": records, "uploaded_by": "GitHub Actions curiosity pilot"}
+    # A stable, collision-safe provenance filename for each distinct selection.
+    # Keep originals inside their existing subject folders; only metadata is separate.
+    selection_key = hashlib.sha256(json.dumps(job, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    manifest_path = "Archive-Manifests/curiosity-" + day + "-" + selection_key + ".json"
+    report = {**job, "items": records, "uploader": "GitHub Actions curiosity pilot"}
     manifest_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + chr(10)).encode("utf-8")
-    upload_one(opener, "Archive-Manifests/curiosity-" + day + ".json", manifest_bytes)
-    print("SUCCESS: category-integrated files verified.", flush=True)
+    if existing_file(opener, manifest_path):
+        print("SKIPPED existing manifest:", manifest_path, flush=True)
+    else:
+        upload_one(opener, manifest_path, manifest_bytes)
+    uploaded = sum(1 for r in records if r["status"] == "uploaded")
+    skipped = len(records) - uploaded
+    print("SUCCESS: uploaded", uploaded, "files; skipped", skipped,
+          "already present; all new uploads verified.", flush=True)
 
 
 def existing_file(opener, path):
