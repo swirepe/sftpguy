@@ -60,14 +60,14 @@ def main():
     release_id=manifest.get("release_id",manifest.get("date","release"))
     if not re.fullmatch(r"[A-Za-z0-9_-]{4,90}",release_id):
         raise RuntimeError("Invalid release_id")
-    if len(items)!=10:
-        raise RuntimeError("Expected 10 distinct images")
+    if len(items) not in (8, 10):
+        raise RuntimeError("Expected 8 distinct images (or 10 for legacy releases)")
     names=[i["filename"] for i in items]
     if len(set(names))!=10 or any("/" in n or "\\" in n or not n.endswith(".png") for n in names):
         raise RuntimeError("Invalid or duplicate filenames")
     original=[]
     for idx,item in enumerate(items):
-        print(f"Downloading still {idx+1}/10",flush=True)
+        print(f"Downloading still {idx+1}/{len(items)}",flush=True)
         original.append(fetch(item["url"]))
     gifs=[
       (f"{release_id}_convention_opening_candid_pan.gif",gif_from_original(original[0],1)),
@@ -91,7 +91,7 @@ def main():
                 upload(sftp,name,data)
     finally:
         ssh.close()
-    print("CONVENTION COMPLETE: verified 10 photos and 2 animated GIFs.",flush=True)
+    print(f"CONVENTION COMPLETE: verified {len(items)} photos and 2 animated GIFs.",flush=True)
 
 if __name__=="__main__":
     main()
