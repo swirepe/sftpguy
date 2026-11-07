@@ -1,10 +1,9 @@
 {
   "date": "2026-11-07",
-  "collection": "Daily-Curiosity-Finds",
-  "purpose": "Pilot: verify automated download and HTTP multipart upload into the public sftpguy explorer.",
+  "purpose": "Pilot: place discoveries in subject-oriented archive directories, not a dated collection folder.",
   "items": [
     {
-      "name": "Engineering/Straight-Line-Engineering-Diagrams-1911.pdf",
+      "name": "PDF/Straight-Line-Engineering-Diagrams-1911.pdf",
       "url": "https://upload.wikimedia.org/wikipedia/commons/e/ee/Straight_line_engineering_diagrams_%28IA_straightlineengi00mani%29.pdf",
       "page": "https://commons.wikimedia.org/wiki/File:Straight_line_engineering_diagrams_(IA_straightlineengi00mani).pdf",
       "creator": "Manifold & Poole",
@@ -14,7 +13,7 @@
       "max_bytes": 12000000
     },
     {
-      "name": "Recordings/Alexander-Graham-Bell-Voice-1885.ogg",
+      "name": "Historical-Recordings/Alexander-Graham-Bell-Voice-1885.ogg",
       "url": "https://upload.wikimedia.org/wikipedia/commons/4/47/Alexander_Graham_Bell_speaking.ogg",
       "page": "https://commons.wikimedia.org/wiki/File:Alexander_Graham_Bell_speaking.ogg",
       "creator": "Alexander Graham Bell",
@@ -25,7 +24,7 @@
       "max_bytes": 2000000
     },
     {
-      "name": "Scientific-3D/Chronokinematograph-Eclipse-Camera.stl",
+      "name": "Scientific-3D-Models/Chronokinematograph-Eclipse-Camera.stl",
       "url": "https://upload.wikimedia.org/wikipedia/commons/d/d5/Chronokinematograph.stl",
       "page": "https://commons.wikimedia.org/wiki/File:Chronokinematograph.stl",
       "creator": "RDW MIC / Virtual Małopolska",
