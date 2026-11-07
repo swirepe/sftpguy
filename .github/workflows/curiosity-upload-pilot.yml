@@ -30,10 +30,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t files < <(
-            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
-            grep -E '^curiosity-upload/generated-media/[^/]+\.(avif|webp|png|jpg|jpeg|gif|mp4)\.b64$' || true
-          )
+          if git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -q '^.github/workflows/curiosity-upload-pilot.yml
+          for file in "${files[@]}"; do
+            filename="${file##*/}"
+            filename="${filename%.b64}"
+            if [[ "$filename" == "2026-11-07_mossy_garden_lavender_nails.avif" ]]; then
+              filename="2026-11-07_mossy_garden_metallic_lavender_nails.avif"
+            fi
+            python3 curiosity-upload/upload_generated_foot.py "$file" "do androids dream of erotic feet?/$filename"
+          done
+          echo "Finished processing ${#files[@]} newly staged generated-media file(s)."
+; then
+            # When this workflow changes, recover previously staged media after an uploader fix.
+            mapfile -t files < <(find curiosity-upload/generated-media -maxdepth 1 -type f -name '*.b64' | sort)
+          else
+            mapfile -t files < <(
+              git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+              grep -E '^curiosity-upload/generated-media/[^/]+\.(avif|webp|png|jpg|jpeg|gif)\.b64
+          for file in "${files[@]}"; do
+            filename="${file##*/}"
+            filename="${filename%.b64}"
+            if [[ "$filename" == "2026-11-07_mossy_garden_lavender_nails.avif" ]]; then
+              filename="2026-11-07_mossy_garden_metallic_lavender_nails.avif"
+            fi
+            python3 curiosity-upload/upload_generated_foot.py "$file" "do androids dream of erotic feet?/$filename"
+          done
+          echo "Finished processing ${#files[@]} newly staged generated-media file(s)."
+ || true
+            )
+          fi
           for file in "${files[@]}"; do
             filename="${file##*/}"
             filename="${filename%.b64}"
