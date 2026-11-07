@@ -1,33 +1,66 @@
 #!/usr/bin/env python3
-"""Upload generated feet photos/GIFs using sftpguy's HTTP explorer."""
+"""Upload original-quality photos and GIFs through the archive's open SFTP service."""
 import base64
-import http.cookiejar
 import pathlib
+import stat
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 
-from uploader import BASE, existing_file, upload_one
+import paramiko
+
+from uploader import BASE
 
 
-def verify_remote(opener, destination, expected_bytes):
-    url = BASE + "/" + urllib.parse.quote(destination, safe="/")
-    req = urllib.request.Request(url, method="HEAD")
-    with opener.open(req, timeout=40) as resp:
-        size = resp.headers.get("Content-Length")
-        if resp.status != 200 or (size is not None and int(size) != expected_bytes):
-            raise RuntimeError("Remote file missing or size mismatch: " + url)
-    print("VERIFIED:", url, "bytes:", expected_bytes, flush=True)
+def upload_sftp(destination, contents):
+    folder = "do androids dream of erotic feet?"
+    filename = pathlib.PurePosixPath(destination).name
+    if not filename or destination != folder + "/" + filename:
+        raise RuntimeError("Unexpected target path: " + destination)
+    host = urllib.parse.urlsplit(BASE).hostname or "ftp.neuroky.me"
+    key = paramiko.RSAKey.generate(2048)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host, port=22, username="anonymous", pkey=key,
+            look_for_keys=False, allow_agent=False,
+            timeout=35, auth_timeout=35, banner_timeout=35,
+        )
+        with client.open_sftp() as sftp:
+            try:
+                info = sftp.stat(folder)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise RuntimeError("Archive destination exists but is not a directory")
+            except FileNotFoundError:
+                sftp.mkdir(folder)
+            try:
+                existing = sftp.stat(destination)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if existing.st_size != len(contents):
+                    raise RuntimeError("Remote file exists with unexpected size: " + destination)
+                print("SKIPPED existing verified:", destination, flush=True)
+            else:
+                with sftp.file(destination, "wb") as stream:
+                    stream.write(contents)
+                    stream.flush()
+            observed = sftp.stat(destination)
+            if observed.st_size != len(contents):
+                raise RuntimeError(
+                    "SFTP remote byte count mismatch for " + destination +
+                    ": expected " + str(len(contents)) + ", got " + str(observed.st_size)
+                )
+            url = BASE + "/" + urllib.parse.quote(destination, safe="/")
+            print("VERIFIED:", url, "bytes:", len(contents), flush=True)
+    finally:
+        client.close()
 
 
 def main():
     if len(sys.argv) != 3:
         raise SystemExit("Usage: upload_generated_foot.py FILE.b64 DESTINATION")
     b64_path, destination = sys.argv[1:]
-    folder = "do androids dream of erotic feet?"
-    if not destination.startswith(folder + "/"):
-        raise RuntimeError("Unexpected archive destination: " + destination)
     data = base64.b64decode("".join(pathlib.Path(b64_path).read_text().split()), validate=True)
     ext = pathlib.Path(destination).suffix.lower()
     tests = {
@@ -39,24 +72,8 @@ def main():
         ".gif": data.startswith((b"GIF87a", b"GIF89a")),
     }
     if not tests.get(ext, False):
-        raise RuntimeError("Media bytes do not match supported extension: " + ext)
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    opener.cookiejar = jar
-    if existing_file(opener, destination):
-        verify_remote(opener, destination, len(data))
-        print("SKIPPED already archived:", destination, flush=True)
-        return
-    try:
-        upload_one(opener, destination, data)
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            raise
-        # The explorer can save successfully, then emit a redirect containing a
-        # literal question mark. urllib follows that broken redirect to a 404.
-        # Verify the file rather than mistaking the redirect for an upload failure.
-        verify_remote(opener, destination, len(data))
-    print("SUCCESS: generated media uploaded and verified at", destination, flush=True)
+        raise RuntimeError("Media bytes do not match declared extension: " + ext)
+    upload_sftp(destination, data)
 
 
 if __name__ == "__main__":
