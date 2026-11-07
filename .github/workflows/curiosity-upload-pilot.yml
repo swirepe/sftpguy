@@ -1,0 +1,26 @@
+name: Curiosity upload pilot
+on:
+  push:
+    branches:
+      - curiosity-upload-pilot-2026-11-07
+    paths:
+      - curiosity-upload/**
+      - .github/workflows/curiosity-upload-pilot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: curiosity-upload-pilot
+  cancel-in-progress: false
+
+jobs:
+  test-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Check out pilot code
+        uses: actions/checkout@v4
+      - name: Fetch and upload selected files
+        run: python3 curiosity-upload/uploader.py curiosity-upload/manifest.json
