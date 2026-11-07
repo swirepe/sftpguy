@@ -24,3 +24,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Fetch and upload selected files
         run: python3 curiosity-upload/uploader.py curiosity-upload/manifest.json
+      - name: Upload freshly generated garden photo into feet collection
+        run: |
+          python3 curiosity-upload/upload_generated_foot.py \
+            curiosity-upload/generated-media/2026-11-07_mossy_garden_lavender_nails.avif.b64 \
+            'do androids dream of erotic feet?/2026-11-07_mossy_garden_metallic_lavender_nails.avif'
