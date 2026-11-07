@@ -15,7 +15,7 @@ import uuid
 
 BASE = os.environ.get("ARCHIVE_URL", "https://ftp.neuroky.me").rstrip("/")
 UA = "Curiosity-Archive-Pilot/0.1 (+https://github.com/swirepe/sftpguy)"
-LIMIT = 25_000_000
+LIMIT = 64_000_000
 
 
 def die(message):
