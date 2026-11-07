@@ -91,3 +91,19 @@ jobs:
             done
           fi
           echo "Processed ${#batch_manifests[@]} complete native convention release batch(es)."
+
+      - name: Upload externally generated four-series test media
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t photo_manifests < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/external-photo-test-[A-Za-z0-9_-]+[.]json$' || true
+          )
+          if ((${#photo_manifests[@]} > 0)); then
+            python -m pip install --quiet Pillow
+            for photo_manifest in "${photo_manifests[@]}"; do
+              python3 curiosity-upload/upload_external_photo_test.py "$photo_manifest"
+            done
+          fi
+          echo "Processed ${#photo_manifests[@]} external test manifest(s)."
