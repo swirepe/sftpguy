@@ -111,7 +111,9 @@ def main():
     gifs = job.get("gifs", [])
     if len(photos) != 8 or len(gifs) != 2:
         raise ValueError("Release requires 8 photos and 2 native animated GIFs")
-    items = photos + gifs
+    # New GIFs first: this archive grants downloads only after the key uploads a file.
+    # Existing PNGs may be readable only after this session has uploaded one new asset.
+    items = gifs + photos
     names = [x["name"] for x in items]
     if len(names) != len(set(names)):
         raise ValueError("Repeated remote filenames")
