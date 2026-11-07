@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fetch 10 original-resolution event stills and produce 2 short original-frame animated GIFs, uploading all by SFTP."""
-import io, json, pathlib, stat, sys, urllib.request, urllib.parse
+import io, json, pathlib, re, stat, sys, urllib.request, urllib.parse
 from PIL import Image, ImageEnhance, ImageFilter
 import paramiko
 
@@ -57,6 +57,9 @@ def upload(sftp, name, data):
 def main():
     manifest=json.loads(pathlib.Path(sys.argv[1]).read_text())
     items=manifest["photos"]
+    release_id=manifest.get("release_id",manifest.get("date","release"))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,90}",release_id):
+        raise RuntimeError("Invalid release_id")
     if len(items)!=10:
         raise RuntimeError("Expected 10 distinct images")
     names=[i["filename"] for i in items]
@@ -67,8 +70,8 @@ def main():
         print(f"Downloading still {idx+1}/10",flush=True)
         original.append(fetch(item["url"]))
     gifs=[
-      ("2026-11-07_convention_opening_candid_pan.gif",gif_from_original(original[0],1)),
-      ("2026-11-07_charity_luncheon_candid_pan.gif",gif_from_original(original[2],-1)),
+      (f"{release_id}_convention_opening_candid_pan.gif",gif_from_original(original[0],1)),
+      (f"{release_id}_charity_luncheon_candid_pan.gif",gif_from_original(original[2],-1)),
     ]
     key=paramiko.RSAKey.generate(2048)
     ssh=paramiko.SSHClient()
