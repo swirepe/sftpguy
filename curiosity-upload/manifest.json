@@ -1,56 +1,71 @@
 {
   "date": "2026-11-07",
-  "run_label": "Next Curiosity Finds — historical erotica and unusual technology",
-  "purpose": "Expand into historical adult printmaking, early audio advertising, and precision telegraph machinery; use existing topic folders when present, create Erotic-Art as needed; no dated folders.",
-  "content_rules": [
-    "exclude Nazi/white-supremacist content",
-    "exclude gore videos",
-    "avoid duplicate filenames",
-    "retain copyright and provenance"
-  ],
+  "run_label": "Archive Expansion — outsider art, feminist originals, vintage magazines, historical erotica and ephemeral radio",
+  "purpose": "Substantive current upload batch to existing topical directories; create only Outsider-Art/ where absent. Preserve source attributions, rights and byte hashes; no dated content dump.",
   "items": [
     {
-      "name": "Erotic-Art/Keisai-Eisen-1818-Shunga-Mirror-Calendar.jpg",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/9/95/Shunga%2C_egoyomi_%28BM_OA%2B%2C0.449.6%29.jpg",
-      "page": "https://commons.wikimedia.org/wiki/File:Shunga,_egoyomi_(BM_OA%2B,0.449.6).jpg",
-      "creator": "Keisai Eisen (British Museum object OA+,0.449.6)",
-      "date": "1818",
-      "license": "Public domain US (PD-scan of pre-1931 Japanese woodblock print); British Museum photo reuse note claims CC BY-NC-SA 4.0; preserve attribution and do not assume unrestricted reuse outside USA.",
-      "description": "Adult historical Japanese shunga e-goyomi calendar print, showing a woman's mirror reflection; rare intersection of erotic print culture, illustrated calendars and woodblock technique.",
-      "max_bytes": 3000000
+      "name": "Feminism/Charlotte-Perkins-Gilman-Women-and-Economics-1898-First-Printing.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Charlotte_Perkins_Gilman_-_Women_and_Economics_%E2%80%93_A_Study_of_the_Economic_Relation_Between_Men_and_Women_as_a_Factor_in_Social_Evolution_(1898_first_printing).pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:Charlotte_Perkins_Gilman_-_Women_and_Economics_%E2%80%93_A_Study_of_the_Economic_Relation_Between_Men_and_Women_as_a_Factor_in_Social_Evolution_(1898_first_printing).pdf",
+      "creator": "Charlotte Perkins Gilman",
+      "date": "1898",
+      "license": "Public domain US (published before 1931)",
+      "description": "Complete 358-page first printing of Women and Economics; primary-source feminist economic critique.",
+      "signature": "%PDF",
+      "max_bytes": 11000000
     },
     {
-      "name": "Erotic-Art/Kitagawa-Utamaro-18th-Century-Shunga.jpg",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/3/33/17XX_Utamaro_Shunga_anagoria.JPG",
-      "page": "https://commons.wikimedia.org/wiki/File:17XX_Utamaro_Shunga_anagoria.JPG",
-      "creator": "Kitagawa Utamaro (photograph: Anagoria; Beate Uhse Erotik-Museum Berlin)",
-      "date": "18th century",
-      "license": "Public domain US (2D photograph of historical public-domain art); Commons PD-Art, other jurisdictions may differ.",
-      "description": "Historical Japanese erotic shunga artwork; color reproduction photographed in the former Berlin erotic museum. Adult material, with provenance retained.",
-      "sha1": "681404cc150116955bf2bbb1da1de1ee98a8fc50",
-      "max_bytes": 15000000
-    },
-    {
-      "name": "Recordings/Edison-I-Am-The-Phonograph-Advertising-1906.ogg",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/7/76/Advertising_Record.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Advertising_Record.ogg",
-      "creator": "Len Spencer; digitization from UCSB Cylinder Preservation & Digitization Project",
-      "date": "ca. 1906",
-      "license": "Public domain US, pre-1926 sound recording",
-      "description": "A cylinder-era advertisement in which the Edison phonograph speaks in first person to prospective purchasers; an uncanny early talking-machine pitch.",
-      "signature": "OggS",
-      "sha1": "130399d86bcfe4c3accff6fe815d97aadaad9f3e",
+      "name": "Outsider-Art/Adolf-Wolfli-Hotel-Berner-Hof-1905.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Adolf_Wolfli_002.JPG",
+      "page": "https://commons.wikimedia.org/wiki/File:Adolf_Wolfli_002.JPG",
+      "creator": "Adolf Wölfli (1905 drawing); JoJan (2010 photograph)",
+      "date": "1905 / photograph 2010",
+      "license": "Adolf Wölfli original drawing public domain; JoJan photograph CC BY 3.0, attribution required",
+      "description": "Hotel Berner-Hof pencil work (1905), canonical outsider / Art Brut visionary drawing held at LaM Lille Métropole museum.",
       "max_bytes": 4000000
     },
     {
-      "name": "Scientific-3D/Morse-Vail-1844-Telegraph-Key-Smithsonian.stl",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/d/d4/Morse-telegraph-key-150k_%28Smithsonian_Institution%29.stl",
-      "page": "https://commons.wikimedia.org/wiki/File:Morse-telegraph-key-150k_(Smithsonian_Institution).stl",
-      "creator": "Smithsonian Institution; Morse-Vail telegraph key design 1844",
-      "date": "1844 (artifact), 2023 digitization upload",
-      "license": "CC0 1.0",
-      "description": "Digitized dimensional 3D model of the early Morse-Vail telegraph key, generated from Smithsonian meshes. Historical electromechanical communication artifact.",
-      "max_bytes": 13000000
+      "name": "Erotic-Art/La-Vie-Parisienne-1916-12-23-Complete-Issue.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/La_Vie_parisienne_-_1916-12-23.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:La_Vie_parisienne_-_1916-12-23.pdf",
+      "creator": "La Vie Parisienne (French illustrated magazine; scanned by Bibliothèque nationale de France via Gallica)",
+      "date": "1916-12-23",
+      "license": "Public domain US and France (Commons PD tags; source Gallica BnF)",
+      "description": "Complete 23-page issue (No. 54) of the risqué French illustrated satirical and lifestyle periodical, an unusually vivid source for belle-époque/post-belle-époque erotic print culture.",
+      "signature": "%PDF",
+      "max_bytes": 45000000
+    },
+    {
+      "name": "Computer Documents/InfoWorld-Volume-1-Issue-11-July-1979.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/InfoWorld_issue_1.11.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:InfoWorld_issue_1.11.pdf",
+      "creator": "Jim C. Warren Jr., InfoWorld",
+      "date": "1979-07-18",
+      "license": "Public domain in the US per Wikimedia Commons: 1978-1989 US publication without copyright notice and no registration in 5 years",
+      "description": "Complete 24-page issue 1.11 of early microcomputing trade magazine InfoWorld, a snapshot of the 1979 software industry.",
+      "signature": "%PDF",
+      "max_bytes": 8000000
+    },
+    {
+      "name": "Computer Documents/KIM-1-MOS-Technology-BYTE-Ad-1976.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/KIM-1_Computer_Ad_May_1976.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:KIM-1_Computer_Ad_May_1976.jpg",
+      "creator": "MOS Technology; scan Michael Holley",
+      "date": "1976-05",
+      "license": "Public domain US per Commons: U.S. advertisement published without copyright notice",
+      "description": "Original MOS Technology KIM-1 microcomputer debut advertisement in BYTE magazine, May 1976; companion artifact for vintage computer experience.",
+      "max_bytes": 1200000
+    },
+    {
+      "name": "Recordings/Lincolnshire-Poacher-Numbers-Station-E3-2007.ogg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Poacher.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Poacher.ogg",
+      "creator": "Oona Räisänen (recordist)",
+      "date": "2007",
+      "license": "Public domain dedication by recordist (PD-self)",
+      "description": "26-second surviving noisy shortwave recording of Lincolnshire Poacher numbers station ENIGMA E3; ephemeral Cold War-era-style coded radio practice captured in 2007.",
+      "signature": "OggS",
+      "max_bytes": 400000
     }
   ]
 }
