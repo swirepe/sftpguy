@@ -55,8 +55,18 @@ jobs:
           done
           echo "Finished processing ${#files[@]} staged generated-media file(s)."
 
-      - name: Upload convention fundraiser photo release
-        if: ${{ hashFiles('curiosity-upload/convention-manifest-2026-11-07.json') != '' }}
+      - name: Upload new convention fundraiser release manifests
+        shell: bash
         run: |
-          python -m pip install --quiet Pillow
-          python3 curiosity-upload/upload_convention_release.py curiosity-upload/convention-manifest-2026-11-07.json
+          set -euo pipefail
+          mapfile -t manifests < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/convention-manifest-[A-Za-z0-9_-]+\.json || true
+          )
+          if (("${#manifests[@]}" > 0)); then
+            python -m pip install --quiet Pillow
+            for manifest in "${manifests[@]}"; do
+              python3 curiosity-upload/upload_convention_release.py "$manifest"
+            done
+          fi
+          echo "Processed ${#manifests[@]} new convention release manifest(s)."
