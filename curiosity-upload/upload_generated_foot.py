@@ -16,8 +16,8 @@ def main():
     if not destination.startswith(folder + "/"):
         raise RuntimeError("Unexpected archive destination: " + destination)
     data = base64.b64decode(pathlib.Path(b64_path).read_text().strip(), validate=True)
-    if not (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
-        raise RuntimeError("Expected actual WebP bytes")
+    if not (len(data) >= 12 and data[4:8] == b"ftyp" and b"avif" in data[8:32]):
+        raise RuntimeError("Expected actual AVIF bytes")
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     opener.cookiejar = jar
