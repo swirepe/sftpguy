@@ -1,45 +1,56 @@
 {
   "date": "2026-11-07",
-  "purpose": "Curiosity archival pilot: integrate unusual redistributable artifacts into existing top-level topical directories; no daily folders.",
+  "run_label": "Next Curiosity Finds — historical erotica and unusual technology",
+  "purpose": "Expand into historical adult printmaking, early audio advertising, and precision telegraph machinery; use existing topic folders when present, create Erotic-Art as needed; no dated folders.",
+  "content_rules": [
+    "exclude Nazi/white-supremacist content",
+    "exclude gore videos",
+    "avoid duplicate filenames",
+    "retain copyright and provenance"
+  ],
   "items": [
     {
-      "name": "Engineering/Straight-Line-Engineering-Diagrams-1911.pdf",
-      "url": "https://archive.org/download/straightlineengi00mani/straightlineengi00mani.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:Straight_line_engineering_diagrams_(IA_straightlineengi00mani).pdf",
-      "creator": "Manifold & Poole",
-      "license": "Public domain US",
-      "description": "104 pages of historical precision straight-line engineering diagrams (1911).",
-      "signature": "%PDF",
-      "max_bytes": 12000000
+      "name": "Erotic-Art/Keisai-Eisen-1818-Shunga-Mirror-Calendar.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/9/95/Shunga%2C_egoyomi_%28BM_OA%2B%2C0.449.6%29.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:Shunga,_egoyomi_(BM_OA%2B,0.449.6).jpg",
+      "creator": "Keisai Eisen (British Museum object OA+,0.449.6)",
+      "date": "1818",
+      "license": "Public domain US (PD-scan of pre-1931 Japanese woodblock print); British Museum photo reuse note claims CC BY-NC-SA 4.0; preserve attribution and do not assume unrestricted reuse outside USA.",
+      "description": "Adult historical Japanese shunga e-goyomi calendar print, showing a woman's mirror reflection; rare intersection of erotic print culture, illustrated calendars and woodblock technique.",
+      "max_bytes": 3000000
     },
     {
-      "name": "Recordings/Big-Ben-1890-Phonograph.ogg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Big_Ben_recorded_in_1890.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Big_Ben_recorded_in_1890.ogg",
-      "creator": "Miss Ferguson and Graham Hope",
-      "license": "Public domain",
-      "description": "A July 16 1890 phonograph recording of Big Ben, a remarkable early sonic document.",
+      "name": "Erotic-Art/Kitagawa-Utamaro-18th-Century-Shunga.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/3/33/17XX_Utamaro_Shunga_anagoria.JPG",
+      "page": "https://commons.wikimedia.org/wiki/File:17XX_Utamaro_Shunga_anagoria.JPG",
+      "creator": "Kitagawa Utamaro (photograph: Anagoria; Beate Uhse Erotik-Museum Berlin)",
+      "date": "18th century",
+      "license": "Public domain US (2D photograph of historical public-domain art); Commons PD-Art, other jurisdictions may differ.",
+      "description": "Historical Japanese erotic shunga artwork; color reproduction photographed in the former Berlin erotic museum. Adult material, with provenance retained.",
+      "sha1": "681404cc150116955bf2bbb1da1de1ee98a8fc50",
+      "max_bytes": 15000000
+    },
+    {
+      "name": "Recordings/Edison-I-Am-The-Phonograph-Advertising-1906.ogg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/7/76/Advertising_Record.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Advertising_Record.ogg",
+      "creator": "Len Spencer; digitization from UCSB Cylinder Preservation & Digitization Project",
+      "date": "ca. 1906",
+      "license": "Public domain US, pre-1926 sound recording",
+      "description": "A cylinder-era advertisement in which the Edison phonograph speaks in first person to prospective purchasers; an uncanny early talking-machine pitch.",
       "signature": "OggS",
-      "max_bytes": 5000000
+      "sha1": "130399d86bcfe4c3accff6fe815d97aadaad9f3e",
+      "max_bytes": 4000000
     },
     {
-      "name": "Recordings/Edison-Talking-Doll-Jack-and-Jill-1890.ogg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Jack_and_Jill_(1890).ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Jack_and_Jill_(1890).ogg",
-      "creator": "Unknown performer; Edison Talking Doll recording",
-      "license": "Public domain US",
-      "description": "A rare surviving c. 1890 recording made for an Edison Talking Doll.",
-      "signature": "OggS",
-      "max_bytes": 1000000
-    },
-    {
-      "name": "Scientific-3D/Apollo-11-Hatch-Ratchet-Gear.stl",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Key_-_Ratchet_Gear_v2_(Hatch,_Crew,_Apollo_11_by_NASA_and_Smithsonian_Institution).stl",
-      "page": "https://commons.wikimedia.org/wiki/File:Key_-_Ratchet_Gear_v2_(Hatch,_Crew,_Apollo_11_by_NASA_and_Smithsonian_Institution).stl",
-      "creator": "NASA Johnson Space Center / Smithsonian Institution",
-      "license": "CC0",
-      "description": "NASA/Smithsonian digitization of a ratchet gear from the Apollo 11 crew hatch.",
-      "max_bytes": 1000000
+      "name": "Scientific-3D/Morse-Vail-1844-Telegraph-Key-Smithsonian.stl",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/d/d4/Morse-telegraph-key-150k_%28Smithsonian_Institution%29.stl",
+      "page": "https://commons.wikimedia.org/wiki/File:Morse-telegraph-key-150k_(Smithsonian_Institution).stl",
+      "creator": "Smithsonian Institution; Morse-Vail telegraph key design 1844",
+      "date": "1844 (artifact), 2023 digitization upload",
+      "license": "CC0 1.0",
+      "description": "Digitized dimensional 3D model of the early Morse-Vail telegraph key, generated from Smithsonian meshes. Historical electromechanical communication artifact.",
+      "max_bytes": 13000000
     }
   ]
 }
