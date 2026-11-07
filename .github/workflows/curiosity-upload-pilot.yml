@@ -107,3 +107,19 @@ jobs:
             done
           fi
           echo "Processed ${#photo_manifests[@]} external test manifest(s)."
+
+      - name: Upload native ChatGPT anthropology image batches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/anthropology-native-batch-[a-zA-Z0-9_-]+[.]json$' || true
+          )
+          if ((${#manifests[@]} > 0)); then
+            python -m pip install --quiet Pillow
+            for manifest in "${manifests[@]}"; do
+              python3 curiosity-upload/upload_native_anthropology_batch.py "$manifest"
+            done
+          fi
+          echo "Processed ${#manifests[@]} native anthropology batches."
