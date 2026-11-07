@@ -1,0 +1,76 @@
+{
+  "date": "2026-11-07",
+  "note": "First ten original ChatGPT native generation images, original pixel dimensions retained, quality-97 4:4:4 JPEG, ten independent topical root folders; no third-party generators.",
+  "items": [
+    {
+      "folder": "do androids dream of erotic feet?",
+      "name": "2026-11-07_1811_test_reading_nook_feet.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_01_feet.jpg.b64",
+      "bytes": 835963,
+      "sha256": "32bcf74d6e0adeca8e28cd343c8b7c0cc9ae493da0a63e7372877dcd19488367"
+    },
+    {
+      "folder": "ai macromastia convention and fundraiser",
+      "name": "2026-11-07_1811_test_convention_registration.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_02_convention.jpg.b64",
+      "bytes": 728477,
+      "sha256": "bd142fa010ada2d6825ac90d68a725db985b457437ec6a2760c2a22553d6e3a8"
+    },
+    {
+      "folder": "if these artificial women can remember to eat, you can too",
+      "name": "2026-11-07_1811_test_morning_coffee.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_03_meals.jpg.b64",
+      "bytes": 760578,
+      "sha256": "58e6f454f759aeb291206deb055da1eea69e2d3e006f2db7024e9f39a65ca407"
+    },
+    {
+      "folder": "if these artificial women can remember to do drugs, you can too",
+      "name": "2026-11-07_1811_test_nighttime_medication.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_04_drugs.jpg.b64",
+      "bytes": 624910,
+      "sha256": "dc0c74fe2b43e213de4ee382ea4b5caa96de4cd162e2bbc6edb526ff47c26fb7"
+    },
+    {
+      "folder": "Artificial Women Make Terrible Decisions",
+      "name": "2026-11-07_1811_test_diy_bangs.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_05_decisions.jpg.b64",
+      "bytes": 661627,
+      "sha256": "88c443776a21947ce2b83e6fe470ee1858d1f803ddc0c1901d9218e735246bc7"
+    },
+    {
+      "folder": "Artificial Women Have to Work Tomorrow",
+      "name": "2026-11-07_1811_test_late_night_work.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_06_work_tomorrow.jpg.b64",
+      "bytes": 588881,
+      "sha256": "d8943680f39a8dd49b0867a57c7a629ff8fe2b99982310c8200f89eb2804bacd"
+    },
+    {
+      "folder": "Artificial Women Get Sick Too",
+      "name": "2026-11-07_1811_test_sick_day_couch.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_07_sick.jpg.b64",
+      "bytes": 772892,
+      "sha256": "60749e20ed986480c5861b756628dbb05b441939f0497a7995840fe18631fba5"
+    },
+    {
+      "folder": "Artificial Women Don't Know What to Do With Themselves",
+      "name": "2026-11-07_1811_test_unfinished_hobbies.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_08_aimless.jpg.b64",
+      "bytes": 754369,
+      "sha256": "c77ae7ea67c80a7e78827b1a2814a7f9a279772eb55473c3bf508cee53df7b78"
+    },
+    {
+      "folder": "Artificial Women Waiting for Something",
+      "name": "2026-11-07_1811_test_dusk_train_platform.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_09_waiting.jpg.b64",
+      "bytes": 723479,
+      "sha256": "e338e85d83982978e25efeed47802dc658183b43a76b065249af7cd4d9b0e9ab"
+    },
+    {
+      "folder": "Bad Artificial Women Behaving Badly",
+      "name": "2026-11-07_1811_test_stolen_breakroom_pastry.jpg",
+      "source": "staging-anthropology/2026-11-07_1811_10_behaving_badly.jpg.b64",
+      "bytes": 770171,
+      "sha256": "fe2631f6eeff0050003aa30ab32aaa8ead15bd7c1e81c0892dd88412db71312d"
+    }
+  ]
+}
