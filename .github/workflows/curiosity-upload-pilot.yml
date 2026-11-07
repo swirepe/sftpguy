@@ -22,10 +22,24 @@ jobs:
     steps:
       - name: Check out pilot code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - name: Fetch and upload selected files
         run: python3 curiosity-upload/uploader.py curiosity-upload/manifest.json
-      - name: Upload freshly generated garden photo into feet collection
+      - name: Upload newly staged generated media into feet collection
+        shell: bash
         run: |
-          python3 curiosity-upload/upload_generated_foot.py \
-            curiosity-upload/generated-media/2026-11-07_mossy_garden_lavender_nails.avif.b64 \
-            'do androids dream of erotic feet?/2026-11-07_mossy_garden_metallic_lavender_nails.avif'
+          set -euo pipefail
+          mapfile -t files < <(
+            git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" |
+            grep -E '^curiosity-upload/generated-media/[^/]+\\.(avif|webp|png|jpg|jpeg|gif|mp4)\\.b64 || true
+          )
+          for file in "${files[@]}"; do
+            filename="${file##*/}"
+            filename="${filename%.b64}"
+            if [[ "$filename" == "2026-11-07_mossy_garden_lavender_nails.avif" ]]; then
+              filename="2026-11-07_mossy_garden_metallic_lavender_nails.avif"
+            fi
+            python3 curiosity-upload/upload_generated_foot.py "$file" "do androids dream of erotic feet?/$filename"
+          done
+          echo "Finished processing ${#files[@]} newly staged generated-media file(s)."
