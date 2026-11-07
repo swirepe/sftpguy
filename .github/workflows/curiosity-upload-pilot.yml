@@ -24,6 +24,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+      - name: Prepare Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install SFTP transport
+        run: python -m pip install --quiet paramiko
       - name: Fetch and upload selected files
         run: python3 curiosity-upload/uploader.py curiosity-upload/manifest.json
       - name: Upload newly staged generated media into feet collection
