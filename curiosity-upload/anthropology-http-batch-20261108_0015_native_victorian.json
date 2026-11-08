@@ -1,0 +1,31 @@
+{
+  "release": "20261108_0015_http_native_bridge_test",
+  "note": "Original ChatGPT native generated image, preserved full-resolution PNG. HTTP multipart upload with remote SHA256 roundtrip.",
+  "items": [
+    {
+      "folder": "Artificial Women from the Victorian Era Love The 1980s",
+      "name": "2026-11-08_0015_victorian_arcade_muse_http.png",
+      "bytes": 2547005,
+      "sha256": "fe667cb987692bf0f30041908abc222184d114a37624da1965f9c353d7ef3df0",
+      "parts": [
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part01",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part02",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part03",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part04",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part05",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part06",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part07",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part08",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part09",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part10",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part11",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part12",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part13",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part14",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part15",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part16",
+        "staging-anthropology/20261108_0015_victorian_arcade_muse_http.png.b64.part17"
+      ]
+    }
+  ]
+}
