@@ -1,73 +1,37 @@
 {
   "date": "2026-11-08",
-  "run_label": "Weekly Digital Time Capsule — The Talking Machine (1890–1906)",
-  "purpose": "Reconstruct an entirely offline runnable listening experience from three historical recordings with an interactive exhibit, context, instructions, provenance and integrity checks. A coherent subject subfolder inside existing Recordings.",
+  "run_label": "Historical adult-media pilot — early cinema and erotic art",
+  "purpose": "Curate adult historical material with identified public-domain or CC0 reuse status. Distinguish period softcore film from modern explicit pornography; archive original files with attribution, source links, and rights notes.",
   "items": [
     {
-      "name": "Recordings/Talking-Machine-1890-1906/START_HERE.html",
-      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/START_HERE.html",
-      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/START_HERE.html",
-      "creator": "OpenAI / digital time capsule reconstruction",
-      "date": "2026-11-08",
-      "license": "CC0 (original interpretive UI); third-party sound recordings separately licensed",
-      "description": "Complete standalone offline interactive historical listening-room with controls, contextual notes and 1877–1906 timeline",
-      "signature": "<!doctype html>",
-      "max_bytes": 1000000
+      "name": "Erotic-Art/Early-Cinema/La-Coiffeuse-c1905.ogv",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/2/29/La_coiffeuse.ogv",
+      "page": "https://commons.wikimedia.org/wiki/File:La_coiffeuse.ogv",
+      "creator": "Anonymous filmmaker",
+      "date": "circa 1905",
+      "license": "Public domain US (pre-1931 publication); PD anonymous 70 EU, per Wikimedia Commons file record",
+      "description": "42-second French silent erotic short; topless adult woman combing her hair; historical softcore film, no depicted sexual activity",
+      "max_bytes": 12000000
     },
     {
-      "name": "Recordings/Talking-Machine-1890-1906/README.md",
-      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/README.md",
-      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/README.md",
-      "creator": "OpenAI",
-      "date": "2026-11-08",
-      "license": "CC0",
-      "description": "Offline start instructions, provenance and authenticity limitations",
-      "signature": "# The Talking Machine",
-      "max_bytes": 100000
+      "name": "Erotic-Art/Felicien-Rops-Pornokrates-1878.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/0/0c/F%C3%A9licien_Rops_-_Pornokrat%C3%A8s_-_1878.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:F%C3%A9licien_Rops_-_Pornokrat%C3%A8s_-_1878.jpg",
+      "creator": "Félicien Rops",
+      "date": "1878",
+      "license": "Public domain in US and Belgium per Wikimedia Commons; faithful PD reproduction",
+      "description": "Original high-resolution Pornokratès, Decadent-era erotic satire with nudity; watercolor, 1878",
+      "max_bytes": 12000000
     },
     {
-      "name": "Recordings/Talking-Machine-1890-1906/Big-Ben-1890-Phonograph.ogg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Big_Ben_recorded_in_1890.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Big_Ben_recorded_in_1890.ogg",
-      "creator": "Miss Ferguson and Graham Hope (recording attribution)",
-      "date": "1890-07-16",
-      "license": "Public domain per Wikimedia Commons file record",
-      "description": "Historic 1890 phonograph capture of Big Ben",
-      "signature": "OggS",
-      "max_bytes": 5000000
-    },
-    {
-      "name": "Recordings/Talking-Machine-1890-1906/Edison-Talking-Doll-Jack-and-Jill-1890.ogg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Jack_and_Jill_(1890).ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Jack_and_Jill_(1890).ogg",
-      "creator": "Unknown performer, Edison Talking Doll",
-      "date": "circa 1890",
-      "license": "Public domain US per Wikimedia Commons",
-      "description": "Voice cylinder originally intended for an Edison Talking Doll",
-      "signature": "OggS",
-      "max_bytes": 1000000
-    },
-    {
-      "name": "Recordings/Talking-Machine-1890-1906/Edison-I-Am-The-Phonograph-Advertising-1906.ogg",
-      "url": "https://upload.wikimedia.org/wikipedia/commons/7/76/Advertising_Record.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Advertising_Record.ogg",
-      "creator": "Len Spencer; UCSB Cylinder Preservation and Digitization Project",
-      "date": "circa 1906",
-      "license": "Public domain US, historical pre-1926 sound recording",
-      "description": "Early Edison advertising cylinder spoken as the phonograph",
-      "signature": "OggS",
-      "max_bytes": 4000000
-    },
-    {
-      "name": "Recordings/Talking-Machine-1890-1906/MANIFEST.json",
-      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/MANIFEST.json",
-      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/MANIFEST.json",
-      "creator": "OpenAI",
-      "date": "2026-11-08",
-      "license": "CC0",
-      "description": "Structured provenance, original sources and authenticity distinctions",
-      "signature": "{",
-      "max_bytes": 100000
+      "name": "Erotic-Art/Sarah-Goodridge-Beauty-Revealed-1828.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/c/cd/Sarah_Goodridge_Beauty_Revealed_The_Metropolitan_Museum_of_Art.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:Sarah_Goodridge_Beauty_Revealed_The_Metropolitan_Museum_of_Art.jpg",
+      "creator": "Sarah Goodridge; Metropolitan Museum of Art digitization",
+      "date": "1828",
+      "license": "Public domain, faithful reproduction, Wikimedia Commons PD-Art",
+      "description": "High-resolution intimate breast self-portrait miniature painted in 1828; history of private erotic art",
+      "max_bytes": 9000000
     }
   ]
 }
