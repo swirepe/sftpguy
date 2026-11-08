@@ -1,0 +1,45 @@
+{
+  "title": "The Talking Machine — 1890–1906",
+  "created": "2026-11-08",
+  "category": "historical listening-room experience",
+  "offline": true,
+  "primary_artifacts": [
+    {
+      "name": "Big-Ben-1890-Phonograph.ogg",
+      "source": "https://commons.wikimedia.org/wiki/File:Big_Ben_recorded_in_1890.ogg",
+      "creator": "Miss Ferguson and Graham Hope (recording attribution)",
+      "date": "1890-07-16",
+      "license": "Public domain per Wikimedia Commons file record",
+      "description": "Historic 1890 phonograph capture of Big Ben"
+    },
+    {
+      "name": "Edison-Talking-Doll-Jack-and-Jill-1890.ogg",
+      "source": "https://commons.wikimedia.org/wiki/File:Jack_and_Jill_(1890).ogg",
+      "creator": "Unknown performer, Edison Talking Doll",
+      "date": "circa 1890",
+      "license": "Public domain US per Wikimedia Commons",
+      "description": "Voice cylinder originally intended for an Edison Talking Doll"
+    },
+    {
+      "name": "Edison-I-Am-The-Phonograph-Advertising-1906.ogg",
+      "source": "https://commons.wikimedia.org/wiki/File:Advertising_Record.ogg",
+      "creator": "Len Spencer; UCSB Cylinder Preservation and Digitization Project",
+      "date": "circa 1906",
+      "license": "Public domain US, historical pre-1926 sound recording",
+      "description": "Early Edison advertising cylinder spoken as the phonograph"
+    }
+  ],
+  "interpretive_artifacts": [
+    {
+      "name": "START_HERE.html",
+      "source": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/START_HERE.html",
+      "license": "CC0 (original interpretive UI); third-party sound recordings separately licensed"
+    },
+    {
+      "name": "README.md",
+      "source": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/README.md",
+      "license": "CC0"
+    }
+  ],
+  "disclaimer": "Original recordings are historic transfers, modern interface is interpretive. Verify upstream licenses in your jurisdiction. SHA-256 per uploaded file is recorded in the GitHub Actions generated Archive-Manifests report."
+}
