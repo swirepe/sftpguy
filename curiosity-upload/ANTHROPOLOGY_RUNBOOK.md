@@ -1,6 +1,6 @@
 # Artificial Women Photo Anthropology — verified uploader runbook
 
-Updated: 2026-11-08. This guide is for the replacement scheduled automation; the 22 creative series, titles, time slots, and deliverables are in **`curiosity-upload/anthropology-series-catalog.md`** in this same repository/branch. Those two files, not a sprawling multi-year scheduled-task prompt or a prior read-only run conversation, are the source of truth.
+Updated: 2026-11-08. This guide is for the replacement scheduled automation; the 24 creative series, titles, time slots, and deliverables are in **`curiosity-upload/anthropology-series-catalog.md`** in this same repository/branch. Those two files, not a sprawling multi-year scheduled-task prompt or a prior read-only run conversation, are the source of truth.
 
 ## What is actually working
 
@@ -8,7 +8,7 @@ Updated: 2026-11-08. This guide is for the replacement scheduled automation; the
 - Primary uploader: `curiosity-upload/upload_native_anthropology_http.py`.
 - GitHub Action: `.github/workflows/anthropology-http-upload.yml` called "Native anthropology HTTP POST upload". It is triggered by a **new commit that adds a new manifest** matching `curiosity-upload/anthropology-http-batch-*.json` on that branch.
 - The action decodes exact original image bytes from GitHub-staged base64 chunks, checks format/size/SHA256, and POSTs multipart to `https://ftp.neuroky.me/` using a cookie and `X-CSRF-Token`, then reads back `?please` to check the full remote bytes and SHA256. No SFTP login or explorer credentials are needed for this transport. It can now create a missing allowed root folder by sending a `folder/filename` multipart name to the archive root, while existing folders continue using their ordinary folder POST.
-- The HTTP script has an allowlist for **all 22 series**, exact spelling and case, and refuses conflicting overwrites or incorrectly named content.
+- The HTTP script has an allowlist for **all 24 series**, exact spelling and case, and refuses conflicting overwrites or incorrectly named content.
 - Successful real-file proof from 2026-11-08: https://github.com/swirepe/sftpguy/actions/runs/42450851693 verified an original native PNG and remote read-back SHA256; destination: https://ftp.neuroky.me/Artificial%20Women%20from%20the%20Victorian%20Era%20Love%20The%201980s/2026-11-08_0015_victorian_arcade_muse_http.png .
 - Fallback: `curiosity-upload/upload_native_anthropology_batch.py` run by `.github/workflows/curiosity-upload-pilot.yml` for manifests named `curiosity-upload/anthropology-native-batch-*.json`. This uses ephemeral-key SFTP, creates root folders if missing, and checks `VERIFIED_SIZE:` per file, with `VERIFIED_SHA256:` only if remote read is permitted. Prefer the HTTP route because it performs remote content-hash round trips and has been proved end-to-end. Do **not** confuse "SFTP stat succeeded" with a remote hash verification.
 
@@ -43,6 +43,10 @@ Updated: 2026-11-08. This guide is for the replacement scheduled automation; the
    This JSON is **illustrative only**, not a valid task output: use measured byte count, real sha256, and list ALL actual parts, even if more than two. Each manifest can contain **1–30** independently generated items. File names must match `YYYY-MM-DD_<safe_ascii_slug>.<png|jpg|jpeg|webp|gif>`; date plus HHMM and descriptive slug are recommended. Use a new unique manifest name `curiosity-upload/anthropology-http-batch-<release-id>.json` each slot. This final manifest commit is what triggers the HTTP Action.
 7. Inspect GitHub Actions for the **manifest commit SHA** using the connected GitHub workflow-run/job/steps/logs actions. A correct finished batch has exactly one `HTTP_VERIFIED:` or matching `HTTP_ALREADY_VERIFIED:` per requested file, containing the **exact expected remote folder and filename, byte count and SHA256**, and a final `HTTP_NATIVE_ANTHROPOLOGY_BATCH_COMPLETE:` for all items. A pending workflow, merged commit, locally present file, or upload POST alone does **not** prove archive success. Check `?please` from a proper networked environment if needed to reconcile discrepancies.
 8. On errors, check missing parts, wrong branch, manifest filename, checksum, exact folder case, nonanimated GIF, CSRF/HTTP response, connection and collision. Retry only with idempotent no-overwrite handling; don't spam identical jobs or duplicate files. Report a per-series count of **generated / verified uploaded / failed**, exact missing items, action run URLs if available. Say "staged" or "workflow submitted" if verification is not yet complete. Do not claim success on inference. Do not let recovery of an old backlog block today's due slot.
+
+## v3 series and camera-direction requirements
+
+As of 2026-11-08 the catalog has **24 series**. In "Artificial Women Notice You From Across The Room", the subject always makes unmistakable **direct eye contact with the camera from across the room**. New series: "Artificial Women Are In Love with Art" at 11 local and "Artificial Women Are In Love with Artless Smut" at 22 local, with visibly cybernetic women in the latter. The HTTP and SFTP uploader allowlists both include these exact new root folder names.
 
 ## Workflow constraints and durability
 
