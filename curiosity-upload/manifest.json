@@ -1,60 +1,73 @@
 {
   "date": "2026-11-08",
-  "run_label": "Experimental print and radical visual culture: Picabia 391, WSPU, La Vie Parisienne",
-  "purpose": "Build a coherent mini-collection of three original Dada 391 issues and related early 20th century feminist and risqué visual print culture, using existing archive folders and preserving rights evidence.",
+  "run_label": "Weekly Digital Time Capsule — The Talking Machine (1890–1906)",
+  "purpose": "Reconstruct an entirely offline runnable listening experience from three historical recordings with an interactive exhibit, context, instructions, provenance and integrity checks. A coherent subject subfolder inside existing Recordings.",
   "items": [
     {
-      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-01-1917.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_1.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_1.pdf",
-      "creator": "Francis Picabia",
-      "date": "1917-01-25",
-      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
-      "description": "Complete four-page inaugural issue of 391, Picabia's anarchic experimental Dada magazine; foundational primary-source avant-garde print ephemera.",
-      "signature": "%PDF",
-      "max_bytes": 11000000
-    },
-    {
-      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-08-1919.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_8.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_8.pdf",
-      "creator": "Francis Picabia",
-      "date": "1919-02",
-      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
-      "description": "Complete eight-page 1919 Dada 391 issue; a deliberately anti-establishment experimental periodical.",
-      "signature": "%PDF",
-      "max_bytes": 16000000
-    },
-    {
-      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-19-1924.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_19.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_19.pdf",
-      "creator": "Francis Picabia",
-      "date": "1924-10",
-      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
-      "description": "Final issue 19 of Picabia's 391 magazine, providing a long-range comparison with the 1917 and 1919 issues.",
-      "signature": "%PDF",
-      "max_bytes": 16000000
-    },
-    {
-      "name": "Feminism/Alfred-Pearse-Votes-for-Women-WSPU-1910.jpg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Alfred_Pearse_Votes_for_Women_on_behalf_of_WSPU_1910.jpg",
-      "page": "https://commons.wikimedia.org/wiki/File:Alfred_Pearse_Votes_for_Women_on_behalf_of_WSPU_1910.jpg",
-      "creator": "Alfred Pearse, for Women's Social and Political Union",
-      "date": "1910",
-      "license": "Public domain; Commons PD-old/PD-mark",
-      "description": "Original Edwardian British women's suffrage graphic; visual ephemera complementing feminist books and essays.",
+      "name": "Recordings/Talking-Machine-1890-1906/START_HERE.html",
+      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/START_HERE.html",
+      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/START_HERE.html",
+      "creator": "OpenAI / digital time capsule reconstruction",
+      "date": "2026-11-08",
+      "license": "CC0 (original interpretive UI); third-party sound recordings separately licensed",
+      "description": "Complete standalone offline interactive historical listening-room with controls, contextual notes and 1877–1906 timeline",
+      "signature": "<!doctype html>",
       "max_bytes": 1000000
     },
     {
-      "name": "Erotic-Art/Charles-Martin-La-Vie-Parisienne-May-1914.jpg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Charles_Martin_-_La_Vie_Parisienne_2_mai_1914.jpg",
-      "page": "https://commons.wikimedia.org/wiki/File:Charles_Martin_-_La_Vie_Parisienne_2_mai_1914.jpg",
-      "creator": "Charles Martin",
-      "date": "1914-05-02",
-      "license": "CC0 1.0 per Wikimedia Commons file page",
-      "description": "Les extravagances de demain, illustrated 1914 La Vie Parisienne magazine artwork, capturing prewar Parisian risqué visual culture.",
+      "name": "Recordings/Talking-Machine-1890-1906/README.md",
+      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/README.md",
+      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/README.md",
+      "creator": "OpenAI",
+      "date": "2026-11-08",
+      "license": "CC0",
+      "description": "Offline start instructions, provenance and authenticity limitations",
+      "signature": "# The Talking Machine",
+      "max_bytes": 100000
+    },
+    {
+      "name": "Recordings/Talking-Machine-1890-1906/Big-Ben-1890-Phonograph.ogg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Big_Ben_recorded_in_1890.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Big_Ben_recorded_in_1890.ogg",
+      "creator": "Miss Ferguson and Graham Hope (recording attribution)",
+      "date": "1890-07-16",
+      "license": "Public domain per Wikimedia Commons file record",
+      "description": "Historic 1890 phonograph capture of Big Ben",
+      "signature": "OggS",
       "max_bytes": 5000000
+    },
+    {
+      "name": "Recordings/Talking-Machine-1890-1906/Edison-Talking-Doll-Jack-and-Jill-1890.ogg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Jack_and_Jill_(1890).ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Jack_and_Jill_(1890).ogg",
+      "creator": "Unknown performer, Edison Talking Doll",
+      "date": "circa 1890",
+      "license": "Public domain US per Wikimedia Commons",
+      "description": "Voice cylinder originally intended for an Edison Talking Doll",
+      "signature": "OggS",
+      "max_bytes": 1000000
+    },
+    {
+      "name": "Recordings/Talking-Machine-1890-1906/Edison-I-Am-The-Phonograph-Advertising-1906.ogg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/7/76/Advertising_Record.ogg",
+      "page": "https://commons.wikimedia.org/wiki/File:Advertising_Record.ogg",
+      "creator": "Len Spencer; UCSB Cylinder Preservation and Digitization Project",
+      "date": "circa 1906",
+      "license": "Public domain US, historical pre-1926 sound recording",
+      "description": "Early Edison advertising cylinder spoken as the phonograph",
+      "signature": "OggS",
+      "max_bytes": 4000000
+    },
+    {
+      "name": "Recordings/Talking-Machine-1890-1906/MANIFEST.json",
+      "url": "https://raw.githubusercontent.com/swirepe/sftpguy/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/MANIFEST.json",
+      "page": "https://github.com/swirepe/sftpguy/blob/curiosity-upload-pilot-2026-11-07/time-capsules/1890-1906-talking-machines/MANIFEST.json",
+      "creator": "OpenAI",
+      "date": "2026-11-08",
+      "license": "CC0",
+      "description": "Structured provenance, original sources and authenticity distinctions",
+      "signature": "{",
+      "max_bytes": 100000
     }
   ]
 }
