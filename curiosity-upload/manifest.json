@@ -1,71 +1,60 @@
 {
-  "date": "2026-11-07",
-  "run_label": "Archive Expansion — outsider art, feminist originals, vintage magazines, historical erotica and ephemeral radio",
-  "purpose": "Substantive current upload batch to existing topical directories; create only Outsider-Art/ where absent. Preserve source attributions, rights and byte hashes; no dated content dump.",
+  "date": "2026-11-08",
+  "run_label": "Experimental print and radical visual culture: Picabia 391, WSPU, La Vie Parisienne",
+  "purpose": "Build a coherent mini-collection of three original Dada 391 issues and related early 20th century feminist and risqué visual print culture, using existing archive folders and preserving rights evidence.",
   "items": [
     {
-      "name": "Feminism/Charlotte-Perkins-Gilman-Women-and-Economics-1898-First-Printing.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Charlotte_Perkins_Gilman_-_Women_and_Economics_%E2%80%93_A_Study_of_the_Economic_Relation_Between_Men_and_Women_as_a_Factor_in_Social_Evolution_(1898_first_printing).pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:Charlotte_Perkins_Gilman_-_Women_and_Economics_%E2%80%93_A_Study_of_the_Economic_Relation_Between_Men_and_Women_as_a_Factor_in_Social_Evolution_(1898_first_printing).pdf",
-      "creator": "Charlotte Perkins Gilman",
-      "date": "1898",
-      "license": "Public domain US (published before 1931)",
-      "description": "Complete 358-page first printing of Women and Economics; primary-source feminist economic critique.",
+      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-01-1917.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_1.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_1.pdf",
+      "creator": "Francis Picabia",
+      "date": "1917-01-25",
+      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
+      "description": "Complete four-page inaugural issue of 391, Picabia's anarchic experimental Dada magazine; foundational primary-source avant-garde print ephemera.",
       "signature": "%PDF",
       "max_bytes": 11000000
     },
     {
-      "name": "Outsider-Art/Adolf-Wolfli-Hotel-Berner-Hof-1905.jpg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Adolf_Wolfli_002.JPG",
-      "page": "https://commons.wikimedia.org/wiki/File:Adolf_Wolfli_002.JPG",
-      "creator": "Adolf Wölfli (1905 drawing); JoJan (2010 photograph)",
-      "date": "1905 / photograph 2010",
-      "license": "Adolf Wölfli original drawing public domain; JoJan photograph CC BY 3.0, attribution required",
-      "description": "Hotel Berner-Hof pencil work (1905), canonical outsider / Art Brut visionary drawing held at LaM Lille Métropole museum.",
-      "max_bytes": 4000000
-    },
-    {
-      "name": "Erotic-Art/La-Vie-Parisienne-1916-12-23-Complete-Issue.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/La_Vie_parisienne_-_1916-12-23.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:La_Vie_parisienne_-_1916-12-23.pdf",
-      "creator": "La Vie Parisienne (French illustrated magazine; scanned by Bibliothèque nationale de France via Gallica)",
-      "date": "1916-12-23",
-      "license": "Public domain US and France (Commons PD tags; source Gallica BnF)",
-      "description": "Complete 23-page issue (No. 54) of the risqué French illustrated satirical and lifestyle periodical, an unusually vivid source for belle-époque/post-belle-époque erotic print culture.",
+      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-08-1919.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_8.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_8.pdf",
+      "creator": "Francis Picabia",
+      "date": "1919-02",
+      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
+      "description": "Complete eight-page 1919 Dada 391 issue; a deliberately anti-establishment experimental periodical.",
       "signature": "%PDF",
-      "max_bytes": 45000000
+      "max_bytes": 16000000
     },
     {
-      "name": "Computer Documents/InfoWorld-Volume-1-Issue-11-July-1979.pdf",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/InfoWorld_issue_1.11.pdf",
-      "page": "https://commons.wikimedia.org/wiki/File:InfoWorld_issue_1.11.pdf",
-      "creator": "Jim C. Warren Jr., InfoWorld",
-      "date": "1979-07-18",
-      "license": "Public domain in the US per Wikimedia Commons: 1978-1989 US publication without copyright notice and no registration in 5 years",
-      "description": "Complete 24-page issue 1.11 of early microcomputing trade magazine InfoWorld, a snapshot of the 1979 software industry.",
+      "name": "Outsider-Art/Francis-Picabia-391-Dada-Issue-19-1924.pdf",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/391_magazine_Volume_19.pdf",
+      "page": "https://commons.wikimedia.org/wiki/File:391_magazine_Volume_19.pdf",
+      "creator": "Francis Picabia",
+      "date": "1924-10",
+      "license": "Public domain (Picabia died 1953; US publication pre-1931; Wikimedia Commons PD)",
+      "description": "Final issue 19 of Picabia's 391 magazine, providing a long-range comparison with the 1917 and 1919 issues.",
       "signature": "%PDF",
-      "max_bytes": 8000000
+      "max_bytes": 16000000
     },
     {
-      "name": "Computer Documents/KIM-1-MOS-Technology-BYTE-Ad-1976.jpg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/KIM-1_Computer_Ad_May_1976.jpg",
-      "page": "https://commons.wikimedia.org/wiki/File:KIM-1_Computer_Ad_May_1976.jpg",
-      "creator": "MOS Technology; scan Michael Holley",
-      "date": "1976-05",
-      "license": "Public domain US per Commons: U.S. advertisement published without copyright notice",
-      "description": "Original MOS Technology KIM-1 microcomputer debut advertisement in BYTE magazine, May 1976; companion artifact for vintage computer experience.",
-      "max_bytes": 1200000
+      "name": "Feminism/Alfred-Pearse-Votes-for-Women-WSPU-1910.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Alfred_Pearse_Votes_for_Women_on_behalf_of_WSPU_1910.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:Alfred_Pearse_Votes_for_Women_on_behalf_of_WSPU_1910.jpg",
+      "creator": "Alfred Pearse, for Women's Social and Political Union",
+      "date": "1910",
+      "license": "Public domain; Commons PD-old/PD-mark",
+      "description": "Original Edwardian British women's suffrage graphic; visual ephemera complementing feminist books and essays.",
+      "max_bytes": 1000000
     },
     {
-      "name": "Recordings/Lincolnshire-Poacher-Numbers-Station-E3-2007.ogg",
-      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Poacher.ogg",
-      "page": "https://commons.wikimedia.org/wiki/File:Poacher.ogg",
-      "creator": "Oona Räisänen (recordist)",
-      "date": "2007",
-      "license": "Public domain dedication by recordist (PD-self)",
-      "description": "26-second surviving noisy shortwave recording of Lincolnshire Poacher numbers station ENIGMA E3; ephemeral Cold War-era-style coded radio practice captured in 2007.",
-      "signature": "OggS",
-      "max_bytes": 400000
+      "name": "Erotic-Art/Charles-Martin-La-Vie-Parisienne-May-1914.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Charles_Martin_-_La_Vie_Parisienne_2_mai_1914.jpg",
+      "page": "https://commons.wikimedia.org/wiki/File:Charles_Martin_-_La_Vie_Parisienne_2_mai_1914.jpg",
+      "creator": "Charles Martin",
+      "date": "1914-05-02",
+      "license": "CC0 1.0 per Wikimedia Commons file page",
+      "description": "Les extravagances de demain, illustrated 1914 La Vie Parisienne magazine artwork, capturing prewar Parisian risqué visual culture.",
+      "max_bytes": 5000000
     }
   ]
 }
