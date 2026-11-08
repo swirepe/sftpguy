@@ -43,7 +43,7 @@ ALLOWED = {
     "Big Dumb Slutty Classical Goddesses",
     "Artificial Women Maybe Overreacted But Are Not Yet Ready To Apologize",
 }
-NAME = re.compile(r"20\\d{2}-\\d{2}-\\d{2}_[A-Za-z0-9_-]+\\.(?:png|jpe?g|webp|gif)\\Z")
+NAME = re.compile(r"20\d{2}-\d{2}-\d{2}_[A-Za-z0-9_-]+\.(?:png|jpe?g|webp|gif)\Z")
 USER_AGENT = "ChatGPT-Anthropology-HTTP-Upload/1.0"
 
 
@@ -123,11 +123,11 @@ def upload_one(client, cookies, item, raw, digest):
     boundary = "----ChatGPTNativeArchive" + secrets.token_hex(16)
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     prefix = (
-        f"--{boundary}\\r\\n"
-        f'Content-Disposition: form-data; name="upload"; filename="{name}"\\r\\n'
-        f"Content-Type: {mime}\\r\\n\\r\\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="upload"; filename="{name}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
     ).encode("utf-8")
-    body = prefix + raw + f"\\r\\n--{boundary}--\\r\\n".encode("ascii")
+    body = prefix + raw + f"\r\n--{boundary}--\r\n".encode("ascii")
     status, _ = request(client, dir_url, method="POST", data=body, headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "X-CSRF-Token": csrf,
