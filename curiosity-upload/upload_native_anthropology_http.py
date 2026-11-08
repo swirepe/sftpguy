@@ -47,6 +47,8 @@ ALLOWED = {
     "Artificial Women Notice You From Across The Room",
     "Artificial Women Feel Uncomfortable and Want To Go Home",
     "candid monstress",
+    "Artificial Women Are In Love with Art",
+    "Artificial Women Are In Love with Artless Smut",
 }
 NAME = re.compile(r"20\d{2}-\d{2}-\d{2}_[A-Za-z0-9_-]+\.(?:png|jpe?g|webp|gif)\Z")
 USER_AGENT = "ChatGPT-Anthropology-HTTP-Upload/1.0"
