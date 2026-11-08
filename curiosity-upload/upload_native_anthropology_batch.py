@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload verified, high-quality native ChatGPT images to seventeen independent archive folders.
+"""Upload verified, high-quality native ChatGPT images to 24 independent archive folders.
 
 Manifest: curiosity-upload/anthropology-native-batch-*.json
 Parts: staging-anthropology/*.b64.partNN; each base64-aligned, no resizing or recompression.
@@ -35,6 +35,8 @@ ALLOWED = {
     "Artificial Women Notice You From Across The Room",
     "Artificial Women Feel Uncomfortable and Want To Go Home",
     "candid monstress",
+    "Artificial Women Are In Love with Art",
+    "Artificial Women Are In Love with Artless Smut",
 }
 NAME = re.compile(r"20\d\d-\d\d-\d\d_[A-Za-z0-9_-]+\.(png|jpe?g|webp|gif)\Z")
 def data_for(item):
