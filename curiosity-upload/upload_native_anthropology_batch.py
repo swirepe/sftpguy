@@ -30,6 +30,11 @@ ALLOWED = {
     "Artificial Women from the 1980s Love The Victorian Era",
     "Big Dumb Slutty Classical Goddesses",
     "Artificial Women Maybe Overreacted But Are Not Yet Ready To Apologize",
+    "married to her artificial sea",
+    "Artificial Moms Are Proud Of You",
+    "Artificial Women Notice You From Across The Room",
+    "Artificial Women Feel Uncomfortable and Want To Go Home",
+    "candid monstress",
 }
 NAME = re.compile(r"20\d\d-\d\d-\d\d_[A-Za-z0-9_-]+\.(png|jpe?g|webp|gif)\Z")
 def data_for(item):
