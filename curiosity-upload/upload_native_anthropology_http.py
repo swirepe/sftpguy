@@ -42,6 +42,11 @@ ALLOWED = {
     "Artificial Women from the 1980s Love The Victorian Era",
     "Big Dumb Slutty Classical Goddesses",
     "Artificial Women Maybe Overreacted But Are Not Yet Ready To Apologize",
+    "married to her artificial sea",
+    "Artificial Moms Are Proud Of You",
+    "Artificial Women Notice You From Across The Room",
+    "Artificial Women Feel Uncomfortable and Want To Go Home",
+    "candid monstress",
 }
 NAME = re.compile(r"20\d{2}-\d{2}-\d{2}_[A-Za-z0-9_-]+\.(?:png|jpe?g|webp|gif)\Z")
 USER_AGENT = "ChatGPT-Anthropology-HTTP-Upload/1.0"
@@ -106,8 +111,19 @@ def upload_one(client, cookies, item, raw, digest):
     dir_url = url_for(folder)
     file_url = url_for(folder, name)
     status, _ = request(client, dir_url)
-    if status != 200:
-        raise RuntimeError(f"Archive folder missing: {dir_url} (HTTP {status})")
+    if status == 404:
+        # The explorer accepts "folder/filename" in a root-level multipart upload,
+        # creating the missing root folder as part of the same operation.
+        target_dir = BASE + "/"
+        multipart_name = folder + "/" + name
+        root_status, _ = request(client, target_dir)
+        if root_status != 200:
+            raise RuntimeError(f"Archive root unavailable: HTTP {root_status}")
+    elif status == 200:
+        target_dir = dir_url
+        multipart_name = name
+    else:
+        raise RuntimeError(f"Archive folder lookup failed: {dir_url} (HTTP {status})")
     csrf = next((c.value for c in cookies if c.name == "explorer_csrf"), None)
     if not csrf or not re.fullmatch(r"[a-f0-9]{64}", csrf):
         raise RuntimeError("Missing or invalid CSRF cookie from explorer")
@@ -124,11 +140,11 @@ def upload_one(client, cookies, item, raw, digest):
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     prefix = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="upload"; filename="{name}"\r\n'
+        f'Content-Disposition: form-data; name="upload"; filename="{multipart_name}"\r\n'
         f"Content-Type: {mime}\r\n\r\n"
     ).encode("utf-8")
     body = prefix + raw + f"\r\n--{boundary}--\r\n".encode("ascii")
-    status, _ = request(client, dir_url, method="POST", data=body, headers={
+    status, _ = request(client, target_dir, method="POST", data=body, headers={
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         "X-CSRF-Token": csrf,
     })
