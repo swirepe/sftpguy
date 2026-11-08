@@ -1,0 +1,58 @@
+name: HTTP multipart archive upload probe
+on:
+  push:
+    branches:
+      - curiosity-upload-pilot-2026-11-07
+    paths:
+      - .github/workflows/http-upload-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Upload a small verification file through the public explorer HTTP POST
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='https://ftp.neuroky.me'
+          filename='chatgpt_http_post_probe_2026-11-08_0010.txt'
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          echo 'Fetching public directory to establish the explorer session and CSRF cookie.'
+          curl -fsSL --connect-timeout 15 --max-time 45 -c "$tmp/cookies" "$base/public/" -o "$tmp/index.html"
+          token="$(awk -F $'\t' '$6 == "explorer_csrf" {print $7}' "$tmp/cookies" | tail -1)"
+          if [[ ! "$token" =~ ^[a-f0-9]{64}$ ]]; then
+            echo 'HTTP_PROBE_ERROR: No valid explorer_csrf session cookie was set.'
+            exit 1
+          fi
+
+          printf 'ChatGPT HTTP multipart POST connectivity probe. Not part of the photo archive.\n' > "$tmp/probe.txt"
+          expected_size="$(wc -c < "$tmp/probe.txt" | tr -d ' ')"
+          expected_hash="$(sha256sum "$tmp/probe.txt" | cut -d' ' -f1)"
+          echo 'Posting one small file to /public/ (without exposing any cookies or tokens).'
+          status="$(curl -sS --connect-timeout 15 --max-time 60 -o "$tmp/post_response" -w '%{http_code}' \
+            -b "$tmp/cookies" -H "X-CSRF-Token: $token" \
+            -F "upload=@$tmp/probe.txt;filename=$filename;type=text/plain" \
+            "$base/public/")"
+          echo "HTTP_POST_STATUS: $status"
+          if [[ "$status" != '303' && "$status" != '201' && "$status" != '200' ]]; then
+            head -c 500 "$tmp/post_response" || true
+            echo
+            echo 'HTTP_PROBE_ERROR: POST rejected.'
+            exit 1
+          fi
+
+          echo 'Downloading the uploaded path with ?please to verify bytes.'
+          curl -fsSL --connect-timeout 15 --max-time 60 "$base/public/$filename?please" -o "$tmp/roundtrip.txt"
+          if ! cmp -s "$tmp/probe.txt" "$tmp/roundtrip.txt"; then
+            echo "HTTP_PROBE_ERROR: Downloaded file mismatch (wanted $expected_size bytes)."
+            exit 1
+          fi
+          received_hash="$(sha256sum "$tmp/roundtrip.txt" | cut -d' ' -f1)"
+          [[ "$expected_hash" == "$received_hash" ]]
+          echo "HTTP_POST_VERIFIED: $base/public/$filename bytes: $expected_size sha256: $received_hash"
