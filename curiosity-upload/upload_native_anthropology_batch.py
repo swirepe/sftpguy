@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload verified, high-quality native ChatGPT images to ten independent archive folders.
+"""Upload verified, high-quality native ChatGPT images to seventeen independent archive folders.
 
 Manifest: curiosity-upload/anthropology-native-batch-*.json
 Parts: staging-anthropology/*.b64.partNN; each base64-aligned, no resizing or recompression.
@@ -24,6 +24,12 @@ ALLOWED = {
     "Artificial Women Waiting for Something",
     "Bad Artificial Women Behaving Badly",
     "Artificial Women Have Feelings Too",
+    "Artificial Women Are In Love With The Night",
+    "Artificial Women Are In Love With Themselves",
+    "Artificial Women from the Victorian Era Love The 1980s",
+    "Artificial Women from the 1980s Love The Victorian Era",
+    "Big Dumb Slutty Classical Goddesses",
+    "Artificial Women Maybe Overreacted But Are Not Yet Ready To Apologize",
 }
 NAME = re.compile(r"20\d\d-\d\d-\d\d_[A-Za-z0-9_-]+\.(png|jpe?g|webp|gif)\Z")
 def data_for(item):
