@@ -327,3 +327,26 @@ This repo also contains a couple of related helper binaries:
 - [`cmd/explorer-deluxe`](cmd/explorer-deluxe/main.go): a fancier `cmd/explorer` with thumbnails, a tree view, etc.  The basis of the [admin explorer](internal/adminexplorer/explorer.go), but without the admin capabilities.  
 
 The main project entrypoint is still the root `./sftpguy` binary.
+
+## HTTP explorer: on-demand SHA-256 verification
+
+The standalone HTTP explorer supports an opt-in hash on a file HEAD request.
+For example:
+
+    curl -sSI 'https://ftp.neuroky.me/Erotic-Art/example.pdf?please&sha256=1'
+
+When deployed, a successful response includes both Content-Length and
+X-Content-SHA256 (64-character lowercase hexadecimal SHA-256 of the stored
+file). No file bytes are sent to the requester. Hashes are computed from
+the on-disk file only when specifically requested; simultaneous hash jobs
+are limited to two to bound disk I/O. A file modified during hashing
+returns an error rather than a potentially inconsistent checksum.
+The existing file access checks still apply. Requests without the opt-in
+query parameter do not compute a checksum.
+
+**Deployment:** This change is source code until the standalone explorer
+binary is rebuilt and restarted. The explorer flag -maxsize is measured
+in MiB and defaults to 1000 MiB, independently of the SFTP server's
+-maxsize and any reverse-proxy upload limit. To accept 5 GB multipart
+HTTP uploads, configure the explorer with -maxsize 5120 or greater
+(and configure the proxy's body limit and timeouts accordingly).
