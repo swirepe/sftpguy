@@ -1,0 +1,28 @@
+name: Explorer checksum tests
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/explorer/main.go'
+      - 'cmd/explorer/checksum_test.go'
+      - '.github/workflows/explorer-tests.yml'
+  pull_request:
+    paths:
+      - 'cmd/explorer/main.go'
+      - 'cmd/explorer/checksum_test.go'
+      - '.github/workflows/explorer-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Test explorer including opt-in SHA-256 HEAD
+        run: go test ./cmd/explorer -count=1
