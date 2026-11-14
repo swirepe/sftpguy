@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"errors"
@@ -60,6 +61,7 @@ var (
 	eventClient         *explorerevents.Client
 	errUploadBadRequest = errors.New("upload bad request")
 	errUploadFailed     = errors.New("upload failed")
+	checksumSlots       = make(chan struct{}, 2) // Bound concurrent full-file disk reads.
 )
 
 // ── logging ───────────────────────────────────────────────────────────────────
@@ -707,6 +709,18 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		tw.progress = reporter.Progress
 	}
 
+	// SHA-256 is opt-in: HEAD /path?sha256=1. Never send file contents to
+	// the verifier; hash the stored bytes and return only the digest.
+	// Ordinary HEAD and GET requests incur no checksum disk I/O.
+	if r.Method == http.MethodHead && r.URL.Query().Get("sha256") == "1" {
+		digest, err := checksumFile(r.Context(), fullPath)
+		if err != nil {
+			reqLog.Warn("file checksum unavailable", "file", relPath, "err", err)
+			http.Error(w, "Cannot calculate checksum", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("X-Content-SHA256", digest)
+	}
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(info.Name()))
 	start := time.Now()
 
@@ -725,6 +739,42 @@ func serveFile(reqLog *slog.Logger, w http.ResponseWriter, r *http.Request, full
 		reporter.Finish(tw.bytes, dur)
 	}
 
+}
+
+// checksumFile computes a digest from the on-disk file without streaming it to
+// the client. Concurrency is capped to avoid exhausting disk I/O on a public
+// archive. Refuse to report an inconsistent snapshot during an active write.
+func checksumFile(ctx context.Context, path string) (string, error) {
+	select {
+	case checksumSlots <- struct{}{}:
+		defer func() { <-checksumSlots }()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !before.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file")
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return "", err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return "", fmt.Errorf("file changed during checksum")
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func clientLogGroup(r *http.Request) slog.Attr {
